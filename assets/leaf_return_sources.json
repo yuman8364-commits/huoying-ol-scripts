@@ -1,0 +1,80 @@
+{
+  "target": "leaf_return_current.bmp",
+  "source": "logs/live_preflight_20260912.png",
+  "box": [
+    1892,
+    78,
+    1919,
+    112
+  ],
+  "tooltip_source": "logs/return_hover_1906.png",
+  "tooltip": "无论身在何处，点击回到木叶村",
+  "reviewed": true,
+  "rooftop_variants": [
+    {
+      "template": "leaf_return_rooftop_current.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_3ed81e0fcf/194338_342997_pending_multi_solo_start_before_return.png",
+      "box": [
+        1892,
+        78,
+        1919,
+        112
+      ],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rooftop_second.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_a802d1815a/194431_809054_pending_multi_solo_start_before_return.png",
+      "box": [
+        1892,
+        78,
+        1919,
+        112
+      ],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rooftop_live.bmp",
+      "source": "logs/preflight_20260930_212936_548952_ce86f12a.png",
+      "box": [
+        1892,
+        78,
+        1919,
+        112
+      ],
+      "reviewed": true
+    }
+  ],
+  "rotation_variants": [
+    {
+      "template": "leaf_return_rotation_1.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_a802d1815a/220451_263029_pending_multi_solo_start_before_return.png",
+      "box": [1892, 78, 1919, 112],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rotation_2.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_3ed81e0fcf/220233_062832_pending_multi_solo_start_before_return.png",
+      "box": [1892, 78, 1919, 112],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rotation_3.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_72cd26215f/000158_920642_pending_multi_solo_start_before_return.png",
+      "box": [1892, 78, 1919, 112],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rotation_4.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_b76494cf2c/000345_580485_pending_multi_solo_start_before_return.png",
+      "box": [1892, 78, 1919, 112],
+      "reviewed": true
+    },
+    {
+      "template": "leaf_return_rotation_5.bmp",
+      "source": "logs/scheduler_evidence/2026-09-30/account_c9ba2069ff/000309_899615_pending_multi_solo_start_before_return.png",
+      "box": [1892, 78, 1919, 112],
+      "reviewed": true
+    }
+  ]
+}

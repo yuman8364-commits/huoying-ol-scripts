@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "mode": "shadow",
+  "format": "yolo11_raw_detection",
+  "file": "game_ui.onnx",
+  "sha256": "4395ac4ef08ab21a50780312ac6bc08f90c0ae5d8d1cf99d51941a16fed344e5",
+  "image_size": 960,
+  "classes": [
+    "leaf_return_current.bmp",
+    "daily_practice_toolbar.bmp"
+  ],
+  "thresholds": {},
+  "click_validated_targets": [],
+  "status": "candidate; live validation required"
+}

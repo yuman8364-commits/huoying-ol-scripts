@@ -1,0 +1,19 @@
+{
+  "source": "C:\\Users\\Administrator\\Desktop\\可用脚本\\火影OL组队任务\\logs\\scheduler_evidence\\2026-09-15\\account_00a0b00ccc\\203952_752161_pending_daily_client_failure.png",
+  "sha256": "1d8648db3b8691d8394fab27fc29943a2db10bf1986243b9a40f451f2763e979",
+  "purpose": "Selected character overlay: close glyph and neutral magnifier control; no account name/identity pixels",
+  "crops": {
+    "target_card_close.bmp": [
+      713,
+      96,
+      744,
+      129
+    ],
+    "target_card_actions.bmp": [
+      535,
+      155,
+      573,
+      189
+    ]
+  }
+}

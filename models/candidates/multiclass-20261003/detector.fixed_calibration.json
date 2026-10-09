@@ -1,0 +1,904 @@
+{
+  "leaf_return_current.bmp": {
+    "chosen": {
+      "threshold": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 1
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.55,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.6,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.65,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.7,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.75,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.8,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.85,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.9,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.95,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 1
+      }
+    ]
+  },
+  "daily_practice_toolbar.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 7,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 7,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 7,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 7,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 7,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 7,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 6,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.8,
+        "tp": 5,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.85,
+        "tp": 5,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.9,
+        "tp": 2,
+        "fp": 0,
+        "fn": 5
+      },
+      {
+        "threshold": 0.95,
+        "tp": 0,
+        "fp": 0,
+        "fn": 7
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 7
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 7
+      }
+    ]
+  },
+  "battle_auto_off.bmp": {
+    "chosen": {
+      "threshold": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 2
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.55,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.6,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.65,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.7,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.75,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.8,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.85,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.9,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.95,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 2
+      }
+    ]
+  },
+  "arena_result_confirm.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.9,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.95,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "survival_anchor.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.9,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.95,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.99,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "survival_result_confirm.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 2,
+        "fp": 0,
+        "fn": 1
+      },
+      {
+        "threshold": 0.9,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.95,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "ranking_page.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.9,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.95,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.99,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "ranking_result_confirm.bmp": {
+    "chosen": {
+      "threshold": 0.5,
+      "tp": 3,
+      "fp": 0,
+      "fn": 0
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 0,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.9,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.95,
+        "tp": 1,
+        "fp": 0,
+        "fn": 2
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "mail_ready_anchor.bmp": {
+    "chosen": {
+      "threshold": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 3
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.55,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.6,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.65,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.7,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.75,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.8,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.85,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.9,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.95,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "mail_warehouse_empty_disabled.bmp": {
+    "chosen": {
+      "threshold": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 3
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.55,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.6,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.65,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.7,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.75,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.8,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.85,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.9,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.95,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  },
+  "welfare_online_anchor.bmp": {
+    "chosen": {
+      "threshold": 1.0,
+      "tp": 0,
+      "fp": 0,
+      "fn": 3
+    },
+    "trials": [
+      {
+        "threshold": 0.5,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.55,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.6,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.65,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.7,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.75,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.8,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.85,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.9,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.95,
+        "tp": 3,
+        "fp": 1,
+        "fn": 0
+      },
+      {
+        "threshold": 0.99,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      },
+      {
+        "threshold": 1.0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 3
+      }
+    ]
+  }
+}
