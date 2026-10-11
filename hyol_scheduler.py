@@ -25,6 +25,7 @@ from hyol_diagnostics import Diagnostics, export_from_scheduler, mark_manual_pau
 from hyol_recognition import Detection, OnnxDetector, fuse
 from hyol_geometry import GameGeometry
 from hyol_survival_counts import GRADES as SURVIVAL_GRADES, grade_candidates, choose_grade
+from hyol_combat_watchdog import BattleWatchdog
 
 
 # A frozen GUI keeps editable configuration, visual assets, logs and state
@@ -125,6 +126,25 @@ class TargetPreconditionChanged(SafetyError):
 
 class PendingError(RuntimeError):
     pass
+
+
+class BattleStalled(PendingError):
+    """This battle exhausted its observation budget; never retry it in this run."""
+
+
+def check_battle_watchdog(scheduler, watchdog, account, frame, label, *, mode, now=None):
+    observation = watchdog.observe(frame, time.monotonic() if now is None else now)
+    if observation is None:
+        return
+    evidence = scheduler.save_raw_evidence(frame, account, label + '_stalled', 'pending')
+    reason = ('单场等待达到上限' if observation['reason'] == 'max_duration'
+              else '战斗画面持续无明显变化')
+    detail = (f"战斗卡住：{reason}；本场已等待{observation['elapsed_seconds']:.0f}秒，"
+              f"画面无变化{observation['unchanged_seconds']:.0f}秒。已中止等待并保留原场未决，"
+              f"不会自动重开或计胜；画面={evidence}")
+    scheduler.event('combat_watchdog_timeout', account, mode=mode, battle=label,
+                    evidence=str(evidence), detail=detail, **observation)
+    raise BattleStalled(detail)
 
 
 class AccountOffline(PendingError):
@@ -1081,7 +1101,19 @@ class CombatSlot:
     progress_hash: str = ""
     progress_phase: str = ""
     progress_changed_at: float = 0.0
-    queue_started_at: float = 0.0
+    queue_started_at: float | None = None
+    battle_watchdog: BattleWatchdog | None = None
+    battle_watchdog_index: int = 0
+
+
+def check_combat_slot_watchdog(scheduler, slot, frame, *, now=None):
+    watchdog = getattr(slot, 'battle_watchdog', None)
+    if watchdog is None or getattr(slot, 'battle_watchdog_index', 0) != slot.next_index:
+        watchdog = BattleWatchdog.from_config(getattr(scheduler, 'config', {}), started_at=now)
+        slot.battle_watchdog = watchdog
+        slot.battle_watchdog_index = slot.next_index
+    check_battle_watchdog(scheduler, watchdog, slot.account, frame,
+                         f'{slot.mode}_battle_{slot.next_index}', mode=slot.mode, now=now)
 
 
 class TemplateStore:
@@ -1821,7 +1853,7 @@ class Scheduler:
         self.check_input_pause()
         Win32.click(physical_x, physical_y)
         self._capture_account = account
-        self._capture_binding_probe = label.startswith('rebind_probe:')
+        self._capture_binding_probe = label.startswith(('rebind_probe:', 'observe_account:'))
         self.click_count += 1
         self.event("chrome_click", account, target=label, x=x, y=y)
 
@@ -2038,6 +2070,18 @@ class Scheduler:
         # are not sufficient and can drag the client when the page is absent.
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
             raise PendingError("offline login prompt requires manual login")
+        from hyol_managed import stopped_panel_visible
+        if stopped_panel_visible(self, frame):
+            if not self.click_template(account, 'managed_settings_close_current.bmp',
+                                       (1320,230,1450,330), 18,18,
+                                       'managed_settings_close_recover',
+                                       ['managed_settings_title_current.bmp'],
+                                       threshold=.98, anchor_threshold=.98):
+                return False
+            if not self.wait_absent('managed_settings_title_current.bmp',
+                                    (750,190,1170,290), 5, threshold=.98):
+                return False
+            return self.wait_until_main(8)
         if self.template("home_leave.bmp", (1800, 930, 1920, 1032), frame)[0]:
             if self.click_template(
                 account,
@@ -4495,7 +4539,7 @@ class Scheduler:
         return None
 
     def _combat_progress_watchdog(self, slot: CombatSlot, frame: Image.Image) -> None:
-        """Defer a stalled queue; preserve active battles and result pages."""
+        """Bound queue and battle waits without inventing an outcome."""
         if slot.mode == "arena":
             if (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
                     or self._arena_waiting_battle_visible(frame)):
@@ -4519,7 +4563,7 @@ class Scheduler:
         current = image_hash(frame.crop(VIEW))
         now = time.monotonic()
         if slot.mode == "arena" and phase in ("matching", "loading"):
-            if not slot.queue_started_at:
+            if slot.queue_started_at is None:
                 slot.queue_started_at = now
             if now - slot.queue_started_at >= 90:
                 evidence = self.save_raw_evidence(frame, slot.account,
@@ -4530,13 +4574,16 @@ class Scheduler:
                 raise PendingError(
                     f"竞技场匹配/加载已等待{int(now-slot.queue_started_at)}秒；"
                     f"保留本场未决并切换其他账号，画面={evidence}")
+            check_combat_slot_watchdog(self, slot, frame, now=now)
             if phase != slot.progress_phase:
                 slot.progress_phase = phase
                 slot.progress_hash = current
                 slot.progress_changed_at = now
                 return
             return
-        slot.queue_started_at = 0.0
+        slot.queue_started_at = None
+        if phase not in ("victory", "defeat", "result", "ready"):
+            check_combat_slot_watchdog(self, slot, frame, now=now)
         if slot.mode != "arena" or phase != "ready":
             slot.progress_phase = phase
             slot.progress_hash = current
@@ -4612,6 +4659,8 @@ class Scheduler:
         slot.defeat_confirmed = False
         slot.progress_phase = ""
         slot.progress_changed_at = 0.0
+        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
+        slot.battle_watchdog_index = slot.next_index
         transition_deadline = time.monotonic() + 90
         while time.monotonic() < transition_deadline:
             self.check_stop()
@@ -4773,6 +4822,9 @@ class Scheduler:
                 self.wait_interruptible(0.2)
             raise PendingError("arena auto-battle was not positively enabled and no result transition appeared")
         if self._battle_auto_on_visible(frame):
+            # A result banner can remain behind an unrecognized confirmation.
+            # Its repeated presence is not proof that this attempt finished.
+            check_combat_slot_watchdog(self, slot, frame)
             self.wait_interruptible(0.4)
             return
         if self._combat_ready_visible("arena", frame):
@@ -4800,6 +4852,7 @@ class Scheduler:
                 victory=self._arena_attempt_victory_confirmed(account, completed_index),
             )
             return
+        check_combat_slot_watchdog(self, slot, frame)
         self.wait_interruptible(0.4)
 
     def _finish_arena_slot(self, slot: CombatSlot) -> None:
@@ -4832,6 +4885,51 @@ class Scheduler:
         self.state.set_module(account.name, "arena", "done", f"{self.arena_victory_target} arena victories and two daily reward claims verified")
         self.event("combat_module_done", account, mode="arena", wins=self._arena_victory_count(account), target=self.arena_victory_target, claims=ARENA_DAILY_REWARD_CLAIMS)
 
+    def _observe_survival_pending_page(self, slot: CombatSlot, frame: Image.Image) -> bool:
+        """A ready page is progress evidence, never an invented battle outcome."""
+        from copy import deepcopy
+        account, index = slot.account, slot.next_index
+        if not self._combat_ready_visible('survival', frame):
+            return False
+        action = self._combat_action_name('survival', index)
+        original = self.state.accounts[account.name].get('actions', {}).get(action, {})
+        for sample in range(3):
+            if (not self._combat_ready_visible('survival', frame)
+                    or self._combat_active_visible('survival', frame)
+                    or not self.verify_identity(account, frame)[0]):
+                return False
+            if sample < 2:
+                self.wait_interruptible(.35)
+                frame = self.capture()
+        evidence = self.save_raw_evidence(frame, account, 'survival_pending_progress', 'observed')
+        candidates = grade_candidates(frame, self.templates, ASSETS)
+        score_roi = (751,769,1151,1031)
+        score = (220 if self._survival_full_score_visible(frame) else
+                 20 if self._survival_score_twenty_visible(frame) else
+                 140 if self.template('survival_score_140.bmp',score_roi,frame,threshold=.98)[0] else
+                 80 if self.template('survival_score_80.bmp',score_roi,frame,threshold=.98)[0] else
+                 0 if self.template('survival_score_0.bmp',score_roi,frame,threshold=.98)[0] else None)
+        observations = self.state.accounts[account.name].setdefault('survival_resume_observations', {})
+        observations[action] = dict(original_pending=deepcopy(original), score=score,
+                                    grades=candidates, evidence=str(evidence), observed_at=now_iso())
+        self.state.save_account(account.name)
+        self.event('survival_pending_progress_observed', account, index=index,
+                   score=score, grades=candidates, evidence=str(evidence), outcome='unknown')
+        # A crash after an audited result close may leave the battle uncommitted.
+        # Only the same operation's completed confirmation can reconcile it.
+        label = f'survival_result_confirm_{index}'
+        confirmation = self.state.accounts[account.name].get('actions', {}).get(label, {})
+        operation = original.get('operation_id')
+        expected = operation[:-len(action)]+label if isinstance(operation,str) and operation.endswith(':'+action) else None
+        if (expected and not original.get('checkpoint_conflict')
+                and confirmation.get('status') == 'done'
+                and confirmation.get('operation_id') == expected):
+            self.commit_action(account, action, '同一操作的结算确认已完成，生存页与身份三帧核实')
+            slot.running = False
+            return True
+        slot.running = False
+        return False
+
     def _prepare_survival_slot(self, slot: CombatSlot) -> None:
         account = slot.account
         slot.next_index = self._next_combat_index(account, "survival")
@@ -4841,6 +4939,8 @@ class Scheduler:
             frame = self.switch_account_for_combat(account, "survival", running=True)
             if self._combat_active_visible("survival", frame):
                 return
+            if self._observe_survival_pending_page(slot, frame) is True:
+                return self._prepare_survival_slot(slot)
             start_label = f"{action}_start"
             if self.main_ready(frame) and self.state.action_status(account.name, start_label) == "new":
                 # Older builds marked the reversible opponent-card selection
@@ -5165,6 +5265,8 @@ class Scheduler:
         if not self.wait_template("survival_fight_start_core.bmp", (751, 169, 1151, 419), 30, threshold=0.92):
             raise PendingError("survival fight-start state unknown; battle remains pending")
         self._click_survival_fight_start(slot)
+        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
+        slot.battle_watchdog_index = slot.next_index
         slot.running = True
         self.event("combat_battle_started", account, mode="survival", index=slot.next_index)
 
@@ -5228,6 +5330,7 @@ class Scheduler:
             slot.next_index += 1
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
             return
+        self._combat_progress_watchdog(slot, frame)
         if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0]:
             if not self.click_template(account, "battle_auto_off.bmp", BATTLE_AUTO_ROI, 29, 29, f"survival_battle_auto_{slot.next_index}", ["battle_auto_off.bmp"]):
                 raise PendingError("survival auto-battle control disappeared")
@@ -5504,9 +5607,17 @@ class Scheduler:
             if not transitioned:
                 raise PendingError("arena did not enter matching or battle; start remains pending")
             result_index = 0
-            battle_deadline = time.monotonic() + 600
+            watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
+            battle_deadline = watchdog.started_at + watchdog.max_seconds
             while time.monotonic() < battle_deadline:
                 self.check_stop()
+                frame = self.capture()
+                if not any(self.template(name, roi, frame)[0] for name, roi in (
+                        ('arena_result_confirm.bmp', (651, 449, 1151, 829)),
+                        ('arena_defeat_confirm.bmp', (801, 580, 1101, 760)),
+                        ('arena_rankup_confirm.bmp', (801, 600, 1101, 760)))):
+                    check_battle_watchdog(self, watchdog, account, frame,
+                                         f'arena_battle_{battle_index}', mode='arena')
                 # The arena-ready anchor remains visible behind the matching
                 # dialog.  Never treat that background anchor as a completed
                 # battle; wait for the modal to disappear first.
@@ -6498,9 +6609,15 @@ class Scheduler:
             self._ensure_team_members_auto(team, leader, spec, attempt_index)
 
         unknown_since = time.monotonic()
+        watchdog = BattleWatchdog.from_config(getattr(self, "config", {}), started_at=unknown_since)
         while True:
             self.check_stop()
             frame = self.capture()
+            if not (self._team_result_template(frame)
+                    and self.state.action_status(leader.name, result_action) != "done"
+                    or self._team_reward_result_visible(frame)
+                    and self.state.action_status(leader.name, reward_action) != "done"):
+                check_battle_watchdog(self, watchdog, leader, frame, base, mode=spec.key)
             if self._battle_auto_on_visible(frame):
                 unknown_since = time.monotonic()
             elif time.monotonic() - unknown_since >= 60:
@@ -6672,9 +6789,15 @@ class Scheduler:
             self._ensure_team_members_auto(team, leader, spec, attempt_index)
 
         unknown_since = time.monotonic()
+        watchdog = BattleWatchdog.from_config(getattr(self, "config", {}), started_at=unknown_since)
         while True:
             self.check_stop()
             frame = self.capture()
+            if not (self._team_result_template(frame)
+                    and self.state.action_status(leader.name, result_action) != "done"
+                    or self._team_reward_result_visible(frame)
+                    and self.state.action_status(leader.name, reward_action) != "done"):
+                check_battle_watchdog(self, watchdog, leader, frame, base, mode=spec.key)
             if self._battle_auto_on_visible(frame):
                 unknown_since = time.monotonic()
             elif time.monotonic() - unknown_since >= 60:
@@ -6829,9 +6952,15 @@ class Scheduler:
         result_action = f"{base}_result_confirm"
         reward_action = f"{base}_reward_confirm"
         unknown_since = time.monotonic()
+        watchdog = BattleWatchdog.from_config(getattr(self, "config", {}), started_at=unknown_since)
         while True:
             self.check_stop()
             frame = self.capture()
+            if not (self._team_result_template(frame)
+                    and self.state.action_status(leader.name, result_action) != "done"
+                    or self._team_reward_result_visible(frame)
+                    and self.state.action_status(leader.name, reward_action) != "done"):
+                check_battle_watchdog(self, watchdog, leader, frame, base, mode=spec.key)
             if self._battle_auto_on_visible(frame):
                 unknown_since = time.monotonic()
             elif time.monotonic() - unknown_since >= 60:
@@ -7745,12 +7874,17 @@ class Scheduler:
         empty_stable = 0
         member_auto_verified = self._team_members_auto_complete(team, spec, 1)
         unknown_since = None
+        battle_watchdog = None
         while time.monotonic() < deadline:
             self.check_stop()
             frame = self.capture()
             battle_visible = self._combat_active_visible('arena', frame)
             if battle_visible:
-                deadline = time.monotonic() + 1200  # Normal combat has no total duration limit.
+                if battle_watchdog is None:
+                    battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}))
+                check_battle_watchdog(self, battle_watchdog, leader, frame, action, mode="wanted")
+            elif self.main_ready(frame) or self._team_result_template(frame) or self._team_reward_result_visible(frame):
+                battle_watchdog = None
             chain_visible = (battle_visible or self._team_result_template(frame)
                              or self._team_reward_result_visible(frame)
                              or self.template('wanted_running_anchor.bmp', (790,130,1110,230), frame)[0]

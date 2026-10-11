@@ -835,14 +835,17 @@ class SixTabScheduler(hs.Scheduler):
 
     def _wait_member_result_page(self, member: hs.Account, spec: hs.TeamActivitySpec) -> None:
         unknown_since = time.monotonic()
+        watchdog = hs.BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=unknown_since)
         while True:
             self.check_stop()
             frame = self.capture()
             if (self._team_result_template(frame) or self._team_reward_result_visible(frame)
                     or spec.key == "sealed" and self.template("sealed_victory.bmp", (790,330,1160,630), frame)[0]):
                 return
+            hs.check_battle_watchdog(self, watchdog, member, frame,
+                                    f'{spec.key}_member_{member.index}', mode=spec.key)
             if self._battle_auto_on_visible(frame):
-                unknown_since = time.monotonic()  # A normal battle has no duration cutoff.
+                unknown_since = time.monotonic()
             elif self.template("battle_auto_off.bmp", hs.BATTLE_AUTO_ROI, frame)[0]:
                 raise hs.PendingError(f"第{member.index}个标签自动战斗已关闭，逐场收尾待处理")
             elif self.main_ready(frame) or self.template(spec.page_anchor, (250,80,1720,950), frame)[0]:
@@ -1026,8 +1029,12 @@ class _FormationProbe:
 
 
 class TeamRunner:
-    def __init__(self, selection: TeamSelection, event_sink=None, managed_enabled: bool = True):
+    def __init__(self, selection: TeamSelection, event_sink=None, managed_enabled: bool = True,
+                 formation: str = 'keep'):
         self.selection = selection
+        if formation not in ('keep', 'main', 'fast'):
+            raise ValueError('请选择保持不变、主力或速刷阵容')
+        self.formation = formation
         if not isinstance(managed_enabled,bool):
             raise ValueError('最后托管选项必须为开启或关闭')
         self.managed_enabled = managed_enabled
@@ -1209,6 +1216,9 @@ class TeamRunner:
                 and cls._member_evidence(dissolved.get("home_evidence"), members))
 
     def _formation(self, team: hs.Team, formation: str) -> None:
+        if formation == 'keep':
+            self.scheduler.event('generic_team_formation_preserved', detail='保持当前阵容，不进入忍者页面')
+            return
         from hyol_daily_tasks import DailyRunner
         from hyol_navigation import return_to_leaf
         for name in team.members:
@@ -1332,7 +1342,7 @@ class TeamRunner:
         resuming_battle = s.sealed_task_in_flight(leader, team) if task == "sealed" else s.team_task_in_flight(team, leader, spec)
         s.resume_completed_member_attempts(team, leader, spec)
         if not resuming_battle:
-            self._formation(team, "main" if task == "strong_approach" else "fast")
+            self._formation(team, getattr(self, 'formation', 'keep'))
         if task == "group_instance":
             s.run_verified_group_instance(team, leader, target_count=None)
         elif task == "wanted":

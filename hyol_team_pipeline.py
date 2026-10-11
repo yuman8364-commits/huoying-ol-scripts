@@ -735,6 +735,13 @@ class LeaderActivityRunner(DailyRunner):
             known_progress = (s._battle_auto_on_visible(f)
                 or self.visible('battle_auto_off.bmp',hs.BATTLE_AUTO_ROI,f)
                 or self.scene_transition(f) or self.wanted_task_present(f))
+            if (s._battle_auto_on_visible(f) or self.visible('battle_auto_off.bmp',hs.BATTLE_AUTO_ROI,f)):
+                if getattr(self, '_wanted_watchdog', None) is None:
+                    self._wanted_watchdog = hs.BattleWatchdog.from_config(s.config)
+                hs.check_battle_watchdog(s, self._wanted_watchdog, self.account, f,
+                                        'pipeline_wanted_battle', mode='wanted')
+            else:
+                self._wanted_watchdog = None
             if known_progress:
                 rec['last_progress'] = time.time()
                 self.save()
@@ -767,6 +774,12 @@ class LeaderActivityRunner(DailyRunner):
             self.samples['group'] = 0
         result = s._team_result_template(f)
         reward = s._team_reward_result_visible(f)
+        if not (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)):
+            if getattr(self, '_group_watchdog_index', None) != battle:
+                self._group_watchdog = hs.BattleWatchdog.from_config(s.config)
+                self._group_watchdog_index = battle
+            hs.check_battle_watchdog(s, self._group_watchdog, self.account, f,
+                                    f'pipeline_group_battle_{battle}', mode='group_instance')
         if self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90):
             self.send_once(rec,'group_return_game_current.bmp',GROUP_RETURN_ROI,45,20,f'group_{battle}_return')
         elif result or reward:
@@ -791,7 +804,7 @@ class LeaderActivityRunner(DailyRunner):
 
 class TeamPipelineRunner:
     def __init__(self, leaders=(), tasks=TEAM_TASKS, solo_tasks=DEFAULT_SOLO_OPTIONS,
-                 *, arena_wins=5, formation='main', managed_enabled=True, event_sink=None, root=hs.ROOT,
+                 *, arena_wins=5, formation='keep', managed_enabled=True, event_sink=None, root=hs.ROOT,
                  new_request=False):
         if (len(leaders) > 6 or len(set(leaders)) != len(leaders)
                 or any(type(slot) is not int or slot not in range(1,7) for slot in leaders)):
@@ -802,7 +815,7 @@ class TeamPipelineRunner:
             raise ValueError('请至少选择一项有效的后续单人任务')
         if type(arena_wins) is not int or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
             raise ValueError('竞技场追加胜场须为1～10')
-        if formation not in ('main','fast') or type(managed_enabled) is not bool:
+        if formation not in ('keep','main','fast') or type(managed_enabled) is not bool:
             raise ValueError('阵容或最后托管选项无效')
         if type(new_request) is not bool:
             raise ValueError('新批次选项必须为开启或关闭')

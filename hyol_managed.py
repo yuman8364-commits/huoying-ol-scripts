@@ -1,6 +1,7 @@
 """Positively disable spending in the game's managed settings before starting."""
 TITLE = 'managed_settings_title_current.bmp'
 TITLE_ROI = (750,190,1170,290)
+TITLE_ORIGIN = (875,224)
 CHECKED = 'managed_checkbox_checked_current.bmp'
 UNCHECKED = 'managed_checkbox_unchecked_current.bmp'
 OPTIONS = (
@@ -11,6 +12,18 @@ OPTIONS = (
     ('space_exchange', (662,708,690,735), (688,710,779,735)),
     ('market', (779,708,807,735), (807,710,866,735)),
 )
+
+
+def option_rois(s, checkbox_roi, label_roi, frame):
+    """Keep each label and checkbox attached to the positively identified panel."""
+    import hyol_scheduler as hs
+    ok, _score, x, y = s.template(TITLE, TITLE_ROI, frame, threshold=.98)
+    if not ok:
+        raise hs.PendingError('托管设置正文或消费选项未确认')
+    dx, dy = x-TITLE_ORIGIN[0], y-TITLE_ORIGIN[1]
+    def shifted(roi):
+        return roi[0]+dx, roi[1]+dy, roi[2]+dx, roi[3]+dy
+    return shifted(checkbox_roi), shifted(label_roi)
 
 
 def stopped_panel_visible(s, frame):
@@ -30,6 +43,7 @@ def stopped_panel_visible(s, frame):
 
 def option_state(s, key, checkbox_roi, label_roi, frame):
     import hyol_scheduler as hs
+    checkbox_roi, label_roi = option_rois(s, checkbox_roi, label_roi, frame)
     label = 'managed_spend_'+key+'_label.bmp'
     if (not s.template(TITLE, TITLE_ROI, frame, threshold=.98)[0]
             or not s.template(label, label_roi, frame, threshold=.98)[0]):
@@ -56,7 +70,8 @@ def prepare_non_spending_options(s, account):
             if state == 'checked':
                 record.update(phase='disable_'+key, requested_at=hs.now_iso())
                 s.state.save_account(account.name)
-                if not s.click_template(account, CHECKED, checkbox_roi, 7,7,
+                current_box, _ = option_rois(s, checkbox_roi, label_roi, frame)
+                if not s.click_template(account, CHECKED, current_box, 7,7,
                                         'managed_disable_'+key,
                                         ['managed_spend_'+key+'_label.bmp'],
                                         threshold=.98, anchor_threshold=.98):

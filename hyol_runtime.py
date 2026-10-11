@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.09.2'
+VERSION = '2026.10.11.1'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -25,7 +25,7 @@ class RunRequest:
     tasks: tuple[str, ...] = DEFAULT_SOLO_OPTIONS
     account_count: int = 6
     arena_wins: int = 5
-    formation: str = 'main'
+    formation: str = 'keep'
     leader: int = 1
     leaders: tuple[int, ...] = ()
     members: tuple[int, ...] = (2, 3)
@@ -41,7 +41,7 @@ class RunRequest:
             raise ValueError('请选择有效任务类型')
         if not 1 <= self.account_count <= 6 or not 1 <= self.arena_wins <= hs.ARENA_MAX_ATTEMPTS:
             raise ValueError('账号数量须为1～6，竞技场追加胜场须为1～10')
-        if self.formation not in ('main', 'fast') or not 1 <= self.bond_count <= MAX_BATTLES:
+        if self.formation not in ('keep', 'main', 'fast') or not 1 <= self.bond_count <= MAX_BATTLES:
             raise ValueError('阵容或羁绊次数无效')
         if (not isinstance(self.final_managed, bool) or not isinstance(self.new_bond_round, bool)
                 or not isinstance(self.new_pipeline_request, bool)):
@@ -155,7 +155,8 @@ def make_runner(request, event_sink, root=hs.ROOT):
     elif request.mode == 'team':
         selection = TeamSelection(request.leader, () if request.friend_shortcut else request.members,
                                   request.friend_shortcut, request.team_tasks)
-        runner = TeamRunner(selection, managed_enabled=request.final_managed, event_sink=event_sink)
+        runner = TeamRunner(selection, managed_enabled=request.final_managed,
+                            formation=request.formation, event_sink=event_sink)
     elif request.mode == 'bond':
         runner = BondRunner(request.bond_count, event_sink=event_sink,
                             config_path=root/'HYOL_Daily.ini', require_identity=True,

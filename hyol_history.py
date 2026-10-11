@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import uuid
 
-from hyol_checkpoints import read_checkpoint, source_token, action_versions, action_family
+from hyol_checkpoints import read_checkpoint, source_token, action_versions, action_family, combine_action_versions
 
 
 def fingerprint(record):
@@ -27,7 +27,10 @@ def is_isolated(manifest, path, key, record):
     # A later aggregate can contain the same original intents and share one
     # source token. Verify every flattened original rather than depending on
     # whichever aggregate last supplied that token's fingerprint.
-    for original in action_versions(record):
+    pending = [original for original in action_versions(record) if original.get('status') == 'pending']
+    if not pending:
+        return False
+    for original in pending:
         isolated = manifest.get(source_token(path, key, original), {})
         saved = isolated.get('record')
         if (isolated.get('outcome') != 'historical_unknown'
@@ -216,14 +219,36 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
     started = session_started_at(token)
     actions = current.setdefault('actions',{})
     candidates = {}
+    retained = {}
     for key,row in actions.items():
         if not isinstance(row,dict) or row.get('status') != 'pending':
             continue
         versions = action_versions(row)
         fallback = row.get('origin',{}).get('path',state.account_paths[account.name])
         versions = [(v,Path(v.get('origin',{}).get('path',fallback))) for v in versions]
-        if all(inactive(v,path,state.day,started) for v,path in versions):
-            candidates[key] = versions
+        eligible = [(v,path) for v,path in versions if v.get('status') == 'pending'
+                    and inactive(v,path,state.day,started)]
+        if eligible:
+            remaining = [v for v,path in versions if not (
+                v.get('status') == 'pending' and inactive(v,path,state.day,started))]
+            # An unidentifiable conflict child may be the same original intent.
+            # Only a durable operation id proves a distinct current attempt.
+            if any(v.get('status') == 'pending' and not v.get('operation_id') for v in remaining):
+                continue
+            candidates[key] = eligible
+            retained[key] = remaining
+    remaining_pending = {key: versions for key,row in actions.items()
+        if isinstance(row,dict) and row.get('status') == 'pending'
+        for versions in ([retained[key]] if key in candidates else [action_versions(row)])
+        if any(v.get('status') == 'pending' for v in versions)}
+    old_contexts = {key: row for key,row in actions.items()
+        if started is not None and isinstance(row,dict) and row.get('status') != 'pending'
+        and row.get('continuation_context') and not has_current_intent(row,state.day,started)
+        and inactive(dict(row,source_day=row['continuation_context']),
+                     state.account_paths[account.name],state.day,started)
+        and not any(pending_key.startswith(action_family(key)) and any(
+            v.get('status') == 'pending' and (not v.get('operation_id') or v.get('origin'))
+            for v in versions) for pending_key,versions in remaining_pending.items())}
     old_tasks = {}
     for key,row in (records or {}).items():
         if (key.startswith('_') or not isinstance(row,dict) or started is None
@@ -232,7 +257,8 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
         prefixes = {'mail':('mail_','inventory_'),'arena':('arena_','daily_arena_'),
                     'ranking':('ranking_','daily_ranking_'),'survival':('survival_','daily_survival_'),
                     'weekend':('puzzle_','daruma_','daily_weekend_')}.get(key,(key+'_','daily_'+key+'_'))
-        if any(action.startswith(prefixes) and action not in candidates
+        if any(action.startswith(prefixes) and (action not in candidates or any(
+                   version.get('status') == 'pending' for version in retained.get(action, ())))
                and isinstance(value,dict) and value.get('status') == 'pending'
                for action,value in actions.items()):
             continue
@@ -247,8 +273,9 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
         if sources and all(inactive(version,path,state.day,started)
                            for path,source in sources for version in action_versions(source)):
             old_tasks[key] = (row,sources)
-    retry_budgets = inactive_retry_budgets(state, account, actions, candidates, manifest, started)
-    if not candidates and not old_tasks and not retry_budgets:
+    budget_candidates = {key: versions for key,versions in candidates.items() if not retained[key]}
+    retry_budgets = inactive_retry_budgets(state, account, actions, budget_candidates, manifest, started)
+    if not candidates and not old_tasks and not retry_budgets and not old_contexts:
         return 0
     proof = proof or prove_idle_identity(scheduler,account)
     if (proof.get('session_token') != token or proof.get('observations') != 3
@@ -267,12 +294,16 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
             receipt = archive_bytes(path,directory)
             if receipt: archives.append(receipt)
             identifier = source_token(path,key,version)
-            entry = dict(outcome='historical_unknown',fingerprint=fingerprint(source),
+            entry = dict(outcome='historical_unknown',fingerprint=fingerprint(version),
                          account=proof['account'],action=key,record=deepcopy(version),
                          proof=proof,archives=deepcopy(archives),isolated_at=hs.now_iso())
             manifest[identifier] = entry
             history[identifier] = entry
-        del actions[key]
+        remaining = combine_action_versions(retained[key])
+        if remaining is None:
+            del actions[key]
+        else:
+            actions[key] = remaining
         count += 1
     for key,(row,sources) in old_tasks.items():
         for path,source in sources:
@@ -288,21 +319,12 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
         count += 1
     # A carried completed step belongs to the old attempt, too. Reusing it
     # after isolating that attempt would give a fresh battle false credit.
-    families = {action_family(key) for key in candidates} | {action_family(key) for key in retry_budgets}
-    for prefixes in families:
-        if any(key.startswith(prefixes) and row.get('status') == 'pending'
-               for key,row in actions.items() if isinstance(row,dict)):
-            continue
-        for key,row in list(actions.items()):
-            if (not isinstance(row,dict) or not row.get('continuation_context')
-                    or not key.startswith(prefixes) or has_current_intent(row,state.day,started)):
-                continue
-            if inactive(dict(row,source_day=row['continuation_context']),
-                        state.account_paths[account.name],state.day,started):
-                identifier = source_token(state.account_paths[account.name],key,row)
-                current.setdefault('historical_contexts',{})[identifier] = dict(
-                    record=deepcopy(row),proof=proof,archives=deepcopy(archives))
-                del actions[key]
+    for key,row in old_contexts.items():
+        identifier = source_token(state.account_paths[account.name],key,row)
+        current.setdefault('historical_contexts',{})[identifier] = dict(
+            record=deepcopy(row),proof=proof,archives=deepcopy(archives))
+        del actions[key]
+    count = max(count, int(bool(old_contexts)))
     for label, (record, sources) in retry_budgets.items():
         for path, original in sources:
             receipt = archive_bytes(path, directory)
@@ -333,7 +355,7 @@ def isolate_inactive_work(scheduler, account, *, records=None, task_path=None, p
     state.save_account(account.name)
     if old_tasks and task_path:
         hs.atomic_json(task_path,records)
-    scheduler.event('historical_work_isolated',account,count=count,proof=proof,
+    scheduler.event('historical_work_isolated',account,count=count,contexts=len(old_contexts),proof=proof,
                     detail='历史未知结果逐字节保留；当前任务使用独立操作凭据')
     return count
 

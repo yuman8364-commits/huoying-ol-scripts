@@ -27,7 +27,7 @@ LABELS.update(quiz='忍者测验（仅单人，全部选第一项）', all='单�
 LABELS.update(mail='邮件附件', welfare='在线福利', ranking='排位赛（第一位，剩余次数归零）', arena='竞技场（本次追加胜场可设置）')
 LABELS['treasure'] = '藏宝图（每账号5分钟，到时暂停并回村，默认不选）'
 LABELS['weekend'] = '周末任务（拼图三难度＋达摩，自动识别）'
-FORMATION_LABELS = {"主力阵容": "main", "速刷阵容（鲨鱼／速刷阵容）": "fast"}
+FORMATION_LABELS = {"保持不变": "keep", "主力阵容": "main", "速刷阵容（鲨鱼／速刷阵容）": "fast"}
 SPEED_ROI = (1260, 890, 1335, 975)
 GROUP_RETURN_ROI = (1110, 750, 1380, 890)
 FORMATION_MAIN_ROI = (500, 290, 580, 430)
@@ -153,8 +153,8 @@ def selected_sequence(task, selected_tasks=None):
 
 
 class DailyRunner:
-    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="main", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, managed_enabled=True):
-        if task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99 or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS or formation not in ("main", "fast"):
+    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, managed_enabled=True):
+        if task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99 or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS or formation not in ("keep", "main", "fast"):
             raise ValueError("任务无效，次数应为1—99，或0表示打到本日奖励次数归零")
         self.task, self.group_count = task, group_count
         self.arena_wins = arena_wins
@@ -184,7 +184,7 @@ class DailyRunner:
         self.wanted_selection_cancelled = False
 
     @classmethod
-    def for_bound_account(cls, scheduler, account, tasks, *, formation='main', arena_wins=5, managed_enabled=True):
+    def for_bound_account(cls, scheduler, account, tasks, *, formation='keep', arena_wins=5, managed_enabled=True):
         """Share one verified account's task ledger without creating another worker."""
         runner = object.__new__(cls)
         runner.scheduler, runner.account = scheduler, account
@@ -665,6 +665,9 @@ class DailyRunner:
         self.formation_checked = True
 
     def verify_main_formation(self):
+        if self.formation == 'keep':
+            self.event('daily_formation_preserved', detail='保持当前阵容，不进入忍者页面')
+            return
         s = self.scheduler
         page_roi = (300,270,490,345)
         if not self.visible("ninja_page_current.bmp",page_roi):
@@ -1032,7 +1035,7 @@ class DailyClient(tk.Tk):
         self.arena_wins = tk.IntVar(value=5)
         self.until_zero = tk.BooleanVar(value=True)
         self.managed_enabled = tk.BooleanVar(value=True)
-        self.formation = tk.StringVar(value="主力阵容")
+        self.formation = tk.StringVar(value="保持不变")
         self.status = tk.StringVar(value="就绪：请打开当前账号的游戏主界面")
         previous = latest_client_result(hs.ROOT, task)
         if previous:
@@ -1065,7 +1068,7 @@ class DailyClient(tk.Tk):
             self.arena_spin = ttk.Spinbox(arena_controls, from_=1, to=hs.ARENA_MAX_ATTEMPTS,
                                           textvariable=self.arena_wins, width=6)
             self.arena_spin.pack(side="left")
-        ttk.Label(body,text="开战阵容（每次启动只查询一次）：").pack(anchor="w",pady=(8,0))
+        ttk.Label(body,text="开战阵容（保持不变时不进入忍者页）：").pack(anchor="w",pady=(8,0))
         self.formation_box = ttk.Combobox(body,textvariable=self.formation,values=tuple(FORMATION_LABELS),state="readonly",width=26)
         self.formation_box.pack(anchor="w")
         if task == 'all':
@@ -1157,7 +1160,7 @@ def main(task="all", *, config_path=None, generic_current_window=True):
     parser.add_argument("--group-count",type=int,default=5)
     parser.add_argument("--arena-wins",type=int,default=5)
     parser.add_argument("--tasks",nargs='+',choices=(*TASKS,'sealed','strong',*SOLO_OPTIONS),help="只执行所选任务，例如 --tasks ranking")
-    parser.add_argument("--formation",choices=("main","fast"),default="main")
+    parser.add_argument("--formation",choices=("keep","main","fast"),default="keep")
     parser.add_argument("--task",choices=(*TASKS,*TASK_SEQUENCES,*SOLO_OPTIONS),default=task)
     args = parser.parse_args()
     task = args.task

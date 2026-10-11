@@ -1,47 +1,57 @@
 {
-  "version": "2026.10.09.2",
-  "regression_tests": 1016,
-  "regression_seconds": 314.138,
+  "version": "2026.10.11.1",
+  "regression_tests": 1064,
+  "regression_seconds": 216.2,
+  "regression_groups": [
+    {
+      "tests": 15,
+      "seconds": 0.22
+    },
+    {
+      "tests": 113,
+      "seconds": 35.545
+    },
+    {
+      "tests": 39,
+      "seconds": 3.579
+    },
+    {
+      "tests": 97,
+      "seconds": 2.146
+    },
+    {
+      "tests": 800,
+      "seconds": 150.881
+    }
+  ],
   "release_result": "PASS",
   "packages": [
     {
       "client": "team",
-      "modules": 30,
+      "modules": 31,
       "assets": 568,
-      "sha256": "10245DE01E1AD631C8111B51828780C077D77B62BAAFF03DF9769515891EE71C",
+      "sha256": "436F0BE562682D9872F8D6E15D11E471595FE5214D23678395312284EC5061A2",
       "gui_verified": true
     },
     {
       "client": "unified",
-      "modules": 29,
+      "modules": 30,
       "assets": 568,
-      "sha256": "3CE7F7FE89A6A974BE13F7D4F016A16F12A9FF2333FB0755F6D7328E31CFD698",
+      "sha256": "FF33EBDF801B65A7A602625E2E149815023FD9B0D738CF28935D7FB6569517EB",
       "gui_verified": true
     }
   ],
-  "runtime_files_preserved": 1939,
-  "root_state_files_preserved": 343,
-  "template_spectra": {
-    "cached_median_ms": 197.3447499985923,
-    "frames": 3,
-    "iterations": 18,
-    "max_bytes": 67108864,
-    "probes_per_frame": 8,
-    "reduction_percent": 15.349185855530845,
-    "reference_median_ms": 233.12799999985145,
-    "resident_bytes": 9068544,
-    "same_scores_decisions_coordinates": true
-  },
+  "runtime_files_preserved": 2475,
   "live_acceptance": "pending",
-  "whole_run_speedup": "not_measured",
   "multiplayer_tasks": "paused",
+  "combat_stall_seconds": 180,
+  "combat_max_seconds": 600,
   "fixes": [
-    "zero tokens choose casual arena",
-    "dynamic arena reward claims",
-    "survival two-run continuation",
-    "inactive mail retry budget isolation",
-    "exact historical source reconciliation",
-    "paired survival battle HUD",
-    "no repeated selected-tab input during unknown combat transition"
+    "battlefield no-change watchdog",
+    "independent per-battle hard deadline",
+    "bounded bond/team/sealed/treasure combat observation",
+    "stalled account excluded from automatic retries after positive tab verification",
+    "same joint identity context for current-account binding",
+    "managed panel offset and historical checkpoint preservation"
   ]
 }

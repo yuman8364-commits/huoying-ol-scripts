@@ -315,9 +315,14 @@ class BondRunner:
         result_seen = self.request.get("phase") == "result_confirmed" or self.result_was_observed(battle_no)
         loading_since: float | None = None
         transition_since = time.monotonic()
+        watchdog = hs.BattleWatchdog.from_config(self.scheduler.config, started_at=transition_since)
         while True:
             self.scheduler.check_stop()
             frame = self.scheduler.capture()
+            if not (self.scheduler._team_result_template(frame)
+                    or self.scheduler._team_reward_result_visible(frame) or self.ready_visible(frame)):
+                hs.check_battle_watchdog(self.scheduler, watchdog, self.account, frame,
+                                        f'bond_{run_id}_battle_{battle_no}', mode='bond')
 
             loading_visible = self.scheduler.template(
                 "arena_loading_anchor.bmp", hs.ARENA_LOADING_ROI, frame, threshold=0.90
@@ -422,6 +427,8 @@ class BondRunner:
                 if not result_seen:
                     raise hs.PendingError("bond returned without a positively confirmed result")
                 if not self.ready_visible_stable():
+                    hs.check_battle_watchdog(self.scheduler, watchdog, self.account, frame,
+                                            f'bond_{run_id}_battle_{battle_no}', mode='bond')
                     self.scheduler.wait_interruptible(0.35)
                     continue
                 self.reconcile_battle_actions(battle_no)

@@ -88,9 +88,12 @@ def run(runner):
         spec = replace(hs.TEAM_ACTIVITY_BY_KEY['group_instance'], key='sealed', label='封印忍者')
         auto_verified = bool(getattr(runner, 'team', None)
                              and s._team_members_auto_complete(runner.team, spec, index))
+        watchdog = hs.BattleWatchdog.from_config(s.config, started_at=observed_at)
         while True:
             s.check_stop()
             frame = s.capture()
+            if not (runner.visible('sealed_victory.bmp',(790,330,1160,630),frame) or s.main_ready(frame)):
+                hs.check_battle_watchdog(s, watchdog, account, frame, f'sealed_battle_{index}', mode='sealed')
             if runner.visible('sealed_victory.bmp',(790,330,1160,630),frame):
                 if getattr(runner, 'team', None) and not auto_verified:
                     raise hs.PendingError('封印已出现结果，但全队自动尚未逐一核实，保留本场结果')

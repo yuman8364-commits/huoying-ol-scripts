@@ -67,7 +67,7 @@ class UnifiedClient(tk.Tk):
         self.scope = tk.StringVar(value='当前账号')
         self.account_count = tk.StringVar(value='6')
         self.arena_wins = tk.StringVar(value='5')
-        self.formation = tk.StringVar(value='主力阵容')
+        self.formation = tk.StringVar(value='保持不变')
         self.bond_count = tk.StringVar(value='5')
         self.new_bond_round = tk.BooleanVar(value=False)
         self.new_pipeline_request = tk.BooleanVar(value=False)
@@ -85,7 +85,6 @@ class UnifiedClient(tk.Tk):
         self.status = tk.StringVar(value='就绪。选择任务后点击开始；F12立即停止并保存断点。')
         self.result = tk.StringVar(value='尚未开始。未实测功能保留待验，活动未开放或掉线均不算完成。')
         self._build()
-        self._restore_pipeline_selection()
         self.after(150, self._drain)
         self.protocol('WM_DELETE_WINDOW', self._close)
 
@@ -111,7 +110,7 @@ class UnifiedClient(tk.Tk):
         for task,variable in self.task_vars.items():
             variable.set(task in request.tasks)
         self.arena_wins.set(str(request.arena_wins))
-        self.formation.set('主力阵容' if request.formation == 'main' else '速刷阵容')
+        self.formation.set({'keep':'保持不变', 'main':'主力阵容', 'fast':'速刷阵容'}[request.formation])
         self.final_managed.set(request.final_managed)
         self.status.set('已恢复原队伍任务选项。点击“开始 / 继续”沿原断点运行。')
         self._append(self.status.get())
@@ -166,6 +165,7 @@ class UnifiedClient(tk.Tk):
         self._pipeline_auto_changed()
         self.detect_leaders_button = ttk.Button(line,text='查看当前队长',command=self._detect_leaders)
         self.detect_leaders_button.pack(side='left')
+        ttk.Button(line,text='恢复原组队选择',command=self._restore_pipeline_selection).pack(side='left',padx=8)
         line = ttk.Frame(self.pipeline_box)
         line.pack(fill='x',pady=8)
         for task,variable in self.pipeline_task_vars.items():
@@ -217,7 +217,7 @@ class UnifiedClient(tk.Tk):
         ttk.Label(common, text='竞技场追加胜场').pack(side='left')
         ttk.Spinbox(common, from_=1, to=10, width=5, textvariable=self.arena_wins).pack(side='left', padx=(8, 18))
         ttk.Label(common, text='阵容').pack(side='left')
-        ttk.Combobox(common, values=('主力阵容', '速刷阵容'), state='readonly', width=12,
+        ttk.Combobox(common, values=('保持不变', '主力阵容', '速刷阵容'), state='readonly', width=12,
                      textvariable=self.formation).pack(side='left', padx=8)
         self.managed_control = ttk.Checkbutton(common, text='最后进入托管', variable=self.final_managed)
         self.managed_control.pack(side='right')
@@ -256,7 +256,7 @@ class UnifiedClient(tk.Tk):
                    if mode == 'team_then_multi' and not self.pipeline_auto.get() else ())
         return RunRequest(mode=mode, tasks=tuple(task for task, variable in self.task_vars.items() if variable.get()),
                           account_count=6 if mode == 'team_then_multi' else int(self.account_count.get()), arena_wins=int(self.arena_wins.get()),
-                          formation='main' if self.formation.get() == '主力阵容' else 'fast',
+                          formation={'保持不变':'keep', '主力阵容':'main', '速刷阵容':'fast'}[self.formation.get()],
                           leader=int(self.leader.get()), members=tuple(index for index, variable in self.member_vars.items() if variable.get()),
                           leaders=leaders,
                           friend_shortcut=self.friend_shortcut.get(),

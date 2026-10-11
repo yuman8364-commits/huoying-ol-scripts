@@ -183,6 +183,20 @@ def dedupe_action_context(versions):
                 and clean(other) == clean(row) for other in versions))]
 
 
+def combine_action_versions(versions):
+    """Keep remaining intents distinct after exact historical versions are archived."""
+    if not versions:
+        return None
+    versions = dedupe_action_context(deepcopy(versions))
+    pending = [i for i, row in enumerate(versions) if row.get('status') == 'pending']
+    primary = pending[0] if pending else max(
+        range(len(versions)), key=lambda i: str(versions[i].get('updated_at', '')))
+    result = versions.pop(primary)
+    if versions:
+        result['checkpoint_conflict'] = versions
+    return result
+
+
 def merge_pending_action(present, carried):
     """Repeated recovery is idempotent; a conflict never becomes a new budget."""
     primary = present if present.get('status') == 'pending' else carried
@@ -481,32 +495,53 @@ def match_identity(frame, identities):
 
 
 def bind_current_identity(scheduler, anonymous):
-    """Promote an anonymous session only after the same unique name is observed twice."""
+    """Promote a session using its discovery rule and a fresh identity recheck."""
     import hyol_scheduler as hs
     directory = scheduler.state.directory
     shared = directory.parent
     identities = read_checkpoint(shared / 'account_identities.json')
-    first_name, first_mask = match_identity(scheduler.capture(), identities)
+    automatic = getattr(scheduler, 'automatic_accounts', False)
+    first_frame = scheduler.capture()
+    if automatic:
+        first_name = None
+        first_mask = current_identity_mask(first_frame, scheduler.templates)
+    else:
+        first_name, first_mask = match_identity(first_frame, identities)
     old = scheduler.state.accounts[anonymous.name]
     old_mask = old.get('identity_mask')
     if old_mask and int(first_mask.sum()) >= 30:
         if hs.mask_f1(decode_mask(old_mask, first_mask.shape), first_mask) < .92:
             raise hs.PendingError('匿名标签角色已变化，保留旧断点，禁止关联')
-    if not first_name:
+    if automatic or not first_name:
         if old.get('actions') and not old_mask:
             raise hs.PendingError('匿名旧断点没有身份素材，不能凭标签序号恢复')
-        if getattr(scheduler, 'automatic_accounts', False):
+        if automatic:
             from hyol_accounts import bind_visible_identity
             first_name = bind_visible_identity(scheduler, anonymous)
             identities = scheduler._dynamic_identity_materials
-            first_mask = current_identity_mask(scheduler.capture(), scheduler.templates)
+            first_mask = scheduler._dynamic_identity_masks[anonymous.index]
+            if old_mask and hs.mask_f1(decode_mask(old_mask, first_mask.shape), first_mask) < .92:
+                raise hs.PendingError('匿名标签角色已变化，保留旧断点，禁止关联')
         else:
             if int(first_mask.sum()) >= 30:
                 old['identity_mask'] = encode_mask(first_mask)
                 scheduler.state.save_account(anonymous.name)
             return anonymous
     scheduler.wait_interruptible(3)
-    second_name, mask = match_identity(scheduler.capture(), identities)
+    second_frame = scheduler.capture()
+    if automatic:
+        if scheduler.offline_dialog_visible(second_frame):
+            raise hs.AccountOffline(anonymous, '当前标签显示掉线弹窗')
+        if scheduler._generic_active_tab_x(second_frame) != anonymous.tab_x:
+            raise hs.PendingError('复核身份时当前标签变化，未关联断点')
+        mask = current_identity_mask(second_frame, scheduler.templates)
+        masks = {**scheduler._dynamic_identity_masks, anonymous.index: mask}
+        mapping, _scores, _gap = joint_identity_assignment(masks, identities)
+        if mapping != scheduler._dynamic_identity_names:
+            raise hs.PendingError('账号身份联合复核不一致，未关联断点')
+        second_name = mapping.get(anonymous.index)
+    else:
+        second_name, mask = match_identity(second_frame, identities)
     if second_name != first_name or hs.mask_f1(first_mask, mask) < .92:
         raise hs.PendingError('账号身份两帧不一致，未关联断点')
     if old.get('actions') and not old_mask:
@@ -538,5 +573,6 @@ def bind_current_identity(scheduler, anonymous):
         scheduler._dynamic_identity_masks = {**getattr(scheduler,'_dynamic_identity_masks',{}),account.index:mask}
         scheduler._dynamic_identity_names = {**getattr(scheduler,'_dynamic_identity_names',{}),account.index:first_name}
     scheduler.account_logs = {first_name: hs.JsonlLogger(hs.LOGS / 'accounts' / (hs.slug(first_name)+'.jsonl'))}
-    scheduler.event('current_identity_checkpoint_bound', account, session=str(directory), observations=2)
+    scheduler.event('current_identity_checkpoint_bound', account, session=str(directory),
+                    observations=4 if automatic else 2)
     return account

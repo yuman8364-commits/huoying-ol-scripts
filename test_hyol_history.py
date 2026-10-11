@@ -61,6 +61,45 @@ class HistoryTests(unittest.TestCase):
         self.original = self.source.read_bytes()
         self.s.state = hs.StateStore([self.key], directory=self.root)
 
+    def test_old_unknown_and_current_done_are_split_without_resolving_old_result(self):
+        action = 'arena_casual_battle_1'
+        done = dict(status='done', updated_at=hs.now_iso(), operation_id='current:1', detail='positive current result')
+        self.state.accounts[self.key]['actions'][action] = deepcopy(done)
+        self.state.save_account(self.key)
+        self.s.state = hs.StateStore([self.key], directory=self.root)
+        self.assertEqual('pending', self.s.state.action_status(self.key, action))
+        self.assertEqual(1, history.isolate_inactive_work(self.s, self.account, proof=self.proof))
+        restarted = hs.StateStore([self.key], directory=self.root)
+        self.assertEqual(done, restarted.action_record(self.key, action))
+        self.assertEqual(self.original, self.source.read_bytes())
+        self.assertFalse((self.root/'checkpoint_resolutions.json').exists())
+        entry = next(iter(restarted.accounts[self.key]['historical_unresolved'].values()))
+        self.assertEqual('pending', entry['record']['status'])
+
+    def test_old_unknown_is_removed_from_current_pending_conflict_only(self):
+        action = 'arena_casual_battle_1'
+        pending = dict(status='pending', updated_at=hs.now_iso(), operation_id='current:2', detail='unknown current result')
+        self.state.accounts[self.key]['actions'][action] = deepcopy(pending)
+        self.state.save_account(self.key)
+        self.s.state = hs.StateStore([self.key], directory=self.root)
+        self.assertEqual(1, history.isolate_inactive_work(self.s, self.account, proof=self.proof))
+        restarted = hs.StateStore([self.key], directory=self.root)
+        self.assertEqual(pending, restarted.action_record(self.key, action))
+        self.assertEqual(self.original, self.source.read_bytes())
+
+    def test_prior_survival_round_cannot_supply_current_completed_steps(self):
+        current = self.state.accounts[self.key]['actions']
+        current.clear()
+        current['survival_battle_step_2'] = dict(status='pending', updated_at=hs.now_iso(), operation_id='current:2')
+        current['survival_battle_step_4'] = dict(status='done', updated_at=self.stamp,
+                                             continuation_context=self.yesterday)
+        self.state.save_account(self.key)
+        history.isolate_inactive_work(self.s, self.account, proof=self.proof)
+        self.assertEqual('pending', self.state.action_status(self.key, 'survival_battle_step_2'))
+        self.assertEqual('new', self.state.action_status(self.key, 'survival_battle_step_4'))
+        archived = self.state.accounts[self.key]['historical_contexts']
+        self.assertTrue(any(row['record']['status'] == 'done' for row in archived.values()))
+
     def test_inactive_retry_budget_archives_with_original_unknown_attempt(self):
         self.seed_mail_budget()
         self.assertEqual(history.isolate_inactive_work(self.s,self.account,proof=self.proof),2)

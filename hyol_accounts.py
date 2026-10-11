@@ -335,6 +335,19 @@ def dismiss_current_final_result(scheduler, account, frame=None):
 
 def observe_accounts(scheduler):
     """Read all visible tabs before registering or binding any content action."""
+    missing = object()
+    prior = getattr(scheduler, '_capture_binding_probe', missing)
+    scheduler._capture_binding_probe = True
+    try:
+        return _observe_accounts(scheduler)
+    finally:
+        if prior is missing:
+            scheduler.__dict__.pop('_capture_binding_probe', None)
+        else:
+            scheduler._capture_binding_probe = prior
+
+
+def _observe_accounts(scheduler):
     import hyol_scheduler as hs
     from hyol_multi_solo import tab_close_positions, active_tab_centers
     first = tab_close_positions(scheduler.capture())
@@ -361,6 +374,9 @@ def observe_accounts(scheduler):
         try:
             frame = dismiss_current_final_result(scheduler, account, frame)
             observations[slot], frames[slot] = collect_current_identity(scheduler, account, frame)
+        except hs.AccountOffline:
+            unavailable[slot] = 'offline_prompt'
+            scheduler.event('account_disconnected_skipped', account, identity='unconfirmed')
         except hs.PendingError as exc:
             unavailable[slot] = str(exc)
             save = getattr(scheduler,'save_raw_evidence',None)
@@ -452,6 +468,12 @@ def bind_visible_identity(scheduler, anonymous):
             if joint_identity_assignment(current,refs)[0] != mapping:
                 raise hs.PendingError('返回原标签后身份变化，未启动任务')
         scheduler._dynamic_identity_masks = {slot:rows[-1] for slot,rows in observations.items()}
+        scheduler._dynamic_identity_masks[anonymous.index] = fresh[-1]
+        scheduler._dynamic_identity_names = mapping
+    else:
+        # A new single-role binding must not inherit an earlier tab assignment.
+        # Keep exactly the context that passed this three-frame observation.
+        scheduler._dynamic_identity_masks = {anonymous.index:masks[-1]}
         scheduler._dynamic_identity_names = mapping
     return mapping[anonymous.index]
 

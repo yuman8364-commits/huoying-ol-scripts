@@ -10,7 +10,7 @@ from datetime import datetime
 from tkinter import ttk
 
 import hyol_scheduler as hs
-from hyol_daily_tasks import DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS
+from hyol_daily_tasks import DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, FORMATION_LABELS
 from hyol_multi_solo import MultiSoloRunner
 from tools.preflight_live import run as preflight_live
 
@@ -72,6 +72,7 @@ class MultiSoloApp(tk.Tk):
         self.count = tk.StringVar(value=str(min(6, self.candidate_count)))
         self.arena_wins = tk.StringVar(value="5")
         self.managed_enabled = tk.BooleanVar(value=True)
+        self.formation = tk.StringVar(value='保持不变')
         self.status = tk.StringVar(value="选择账号数量和任务，然后点击开始。")
         self.task_vars = {task: tk.BooleanVar(value=task in DEFAULT_SOLO_OPTIONS) for task in SOLO_OPTIONS}
         frame = ttk.Frame(self, padding=18)
@@ -95,6 +96,11 @@ class MultiSoloApp(tk.Tk):
         ttk.Label(arena_line, text="每账号本次竞技场追加胜场：").pack(side="left")
         ttk.Spinbox(arena_line, from_=1, to=hs.ARENA_MAX_ATTEMPTS, width=6,
                     textvariable=self.arena_wins).pack(side="left")
+        formation_line = ttk.Frame(frame)
+        formation_line.pack(anchor='w', pady=(8,0))
+        ttk.Label(formation_line, text='阵容：').pack(side='left')
+        ttk.Combobox(formation_line, textvariable=self.formation,
+                     values=tuple(FORMATION_LABELS), state='readonly', width=26).pack(side='left')
         self.managed_control = ttk.Checkbutton(frame, text='最后进入托管',variable=self.managed_enabled)
         self.managed_control.pack(anchor='w',pady=(8,0))
         ttk.Label(frame, text="所选任务和领奖确认、回木叶后按选项进入托管。F12 急停。",
@@ -127,10 +133,12 @@ class MultiSoloApp(tk.Tk):
             return
         self.start_button.configure(state="disabled")
         self.status.set("正在只读检查游戏窗口……")
-        self.worker = threading.Thread(target=self.run_worker, args=(count, tasks, wins,self.managed_enabled.get()), daemon=False)
+        self.worker = threading.Thread(target=self.run_worker,
+            args=(count, tasks, wins, self.managed_enabled.get(), FORMATION_LABELS[self.formation.get()]), daemon=False)
         self.worker.start()
 
-    def run_worker(self, count: int, tasks: tuple[str, ...], arena_wins: int = 5, managed_enabled: bool = True):
+    def run_worker(self, count: int, tasks: tuple[str, ...], arena_wins: int = 5,
+                   managed_enabled: bool = True, formation: str = 'keep'):
         try:
             check = preflight_live()
             if not (check.get("status") == "ready" and check.get("healthy") is True
@@ -139,6 +147,7 @@ class MultiSoloApp(tk.Tk):
                 return
             self.events.put(("status", f"预检通过，开始识别最多 {count} 个账号。"))
             runner = MultiSoloRunner(tasks, account_count=count, arena_wins=arena_wins,
+                                     formation=formation,
                                      managed_enabled=managed_enabled,
                                      event_sink=lambda event: self.events.put(("event", event)))
             result = runner.run()

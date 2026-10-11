@@ -152,6 +152,7 @@ class TreasureRun:
         self.scheduler = runner.scheduler
         self.record = runner.record("treasure")
         self.clock = clock or time.time
+        self.battle_watchdog = None
 
     def save(self, phase=None, **fields):
         if phase:
@@ -328,6 +329,7 @@ class TreasureRun:
                 self.save("running",rewards=index,awaiting=None)
             return False
         if self._confirm_battle_result(frame):
+            self.battle_watchdog = None
             return False
         if transformation_visible(r, frame):
             index = rec.get('transformations', 0)+1
@@ -363,6 +365,10 @@ class TreasureRun:
             self.save("battle",traps=index,awaiting=None)
             return False
         if battle_visible(r,frame):
+            if self.battle_watchdog is None:
+                self.battle_watchdog = hs.BattleWatchdog.from_config(s.config)
+            hs.check_battle_watchdog(s, self.battle_watchdog, r.account, frame,
+                                    'treasure_battle', mode='treasure')
             if r.visible("battle_auto_off.bmp",hs.BATTLE_AUTO_ROI,frame):
                 r.click("battle_auto_off.bmp",hs.BATTLE_AUTO_ROI,29,29,
                         "treasure_battle_auto",["battle_auto_off.bmp"])
@@ -373,6 +379,8 @@ class TreasureRun:
             return False
         if not known_frame(r,frame):
             raise hs.PendingError("挖宝当前画面未知，未暂停、未重启")
+        if world_visible(r, frame):
+            self.battle_watchdog = None
         if r.visible('treasure_page_anchor.bmp', PAGE_ROI, frame, .96):
             raise hs.PendingError('挖宝启动或暂停状态未核实，保留原计时，不重新启动')
         if not expired:
