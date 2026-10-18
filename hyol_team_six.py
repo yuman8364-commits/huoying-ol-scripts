@@ -207,6 +207,8 @@ class SixTabScheduler(hs.Scheduler):
         return (patch < 105).astype(np.uint8)
 
     def verify_identity(self, account: hs.Account, frame=None):
+        if getattr(self, 'run_context', None):
+            account = self.run_context.resolve(self, account)
         frame = frame or self.capture()
         try:
             active = self._generic_active_tab_x(frame) == account.tab_x
@@ -221,6 +223,11 @@ class SixTabScheduler(hs.Scheduler):
         names = getattr(self, "_bound_identity_names", {})
         if account.index not in names:
             return True, {}, False  # Initial tab observation has no content authorization.
+        cache = getattr(frame, '_hyol_observations', None)
+        key = ('team_role', account.index, id(self._known_identity_materials),
+               id(self._bound_identity_masks), tuple(names.items()))
+        if cache is not None and key in cache:
+            return cache[key]
         from hyol_checkpoints import current_identity_mask, joint_identity_assignment
         mask = current_identity_mask(frame, getattr(self, "templates", None))
         if int(mask.sum()) < 50:
@@ -228,9 +235,15 @@ class SixTabScheduler(hs.Scheduler):
         masks = dict(self._bound_identity_masks)
         masks[account.index] = mask
         mapping, matrix, _gap = joint_identity_assignment(masks, self._known_identity_materials)
-        return mapping == names, matrix.get(account.index, {}), True
+        result = mapping == names, matrix.get(account.index, {}), True
+        if cache is not None:
+            cache[key] = result
+        return result
 
     def switch_account(self, account: hs.Account, verify: bool = True):
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing:
+            return context.select(self, account)
         self.chrome_click(account.tab_x, 10, f"switch_tab:{account.index}", account)
         self.wait_interruptible(.8)
         frame = self.capture()
@@ -518,7 +531,10 @@ class SixTabScheduler(hs.Scheduler):
         if missing and not allow_unavailable:
             raise hs.PendingError(f'所选标签{sorted(missing)}身份未确认，未开始组队')
         aliases = {self.accounts[slot-1].name:key for slot,key in self._bound_identity_names.items()}
-        self.state = hs.StateStore(list(aliases),directory=self.shared_state_directory,aliases=aliases)
+        self.available_account_names = set(aliases)
+        self.joint_identity_bound = set(aliases)
+        self.state = hs.StateStore(list(aliases),directory=self.shared_state_directory,aliases=aliases,
+                                   restore_history=getattr(self, 'run_context', None) is None)
         self.account_logs = {name:hs.JsonlLogger(hs.LOGS/'accounts'/(hs.slug(key)+'.jsonl'))
                              for name,key in aliases.items()}
         for slot,key in self._bound_identity_names.items():
@@ -534,6 +550,8 @@ class SixTabScheduler(hs.Scheduler):
         self._automatic_captain_slots = tuple(a.index for a in self.accounts
                          if a.index in self._bound_identity_names
                          and self._observed_captain_tabs.get(a.tab_x))
+        if getattr(self, 'run_context', None):
+            self.run_context.remember(centers,mapping,observations,frames,refs,unavailable)
         self.event('generic_team_checkpoints_bound',slots=list(self._bound_identity_names),
                    mapping=self._bound_identity_names,observations=3,content_clicks=self.content_click_count)
 

@@ -140,11 +140,12 @@ def run(r):
         if recover_sent_result:
             r.event('daily_ranking_result_counter_reopened', before=rec['before'],
                     detail='只重进原排位页核对次数；未重复开战或发送结算')
-    deadline = time.monotonic() + 60
+    watchdog = hs.BattleWatchdog(mode='ranking')
     main_seen_at = None
-    while time.monotonic() < deadline:
+    while True:
         s.check_stop()
         frame = s.capture()
+        hs.check_battle_watchdog(s, watchdog, r.account, frame, 'ranking', mode='ranking')
         phase = rec.get('phase', 'ready')
         index = rec.get('completed', 0) + 1
         base = f'daily_ranking_{index}'
@@ -255,10 +256,15 @@ def run(r):
                 continue
             rec['phase']='end_pending'
             r.save()
-            r.click('ranking_end_battle.bmp',END,40,32,base+'_end',
-                    ['ranking_battle_anchor.bmp','ranking_end_battle.bmp'],True)
+            try:
+                r.click('ranking_end_battle.bmp',END,40,32,base+'_end',
+                        ['ranking_battle_anchor.bmp','ranking_end_battle.bmp'],True)
+            except (hs.PendingError, hs.TargetPreconditionChanged):
+                if s.state.action_status(r.account.name,base+'_end') != 'new':
+                    raise  # Input may have been sent. Never repeat an uncertain end click.
+                s.wait_interruptible(.4)
+                continue  # Button repainted before input; observe the original attempt.
             rec['phase']='end_sent'
             r.save()
             deadline=time.monotonic()+60
         s.wait_interruptible(.4)
-    raise hs.PendingError('排位赛60秒未确认下一阶段，保留场数及未决动作')

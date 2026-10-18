@@ -1,57 +1,91 @@
 {
-  "version": "2026.10.11.1",
-  "regression_tests": 1064,
-  "regression_seconds": 216.2,
-  "regression_groups": [
-    {
-      "tests": 15,
-      "seconds": 0.22
-    },
-    {
-      "tests": 113,
-      "seconds": 35.545
-    },
-    {
-      "tests": 39,
-      "seconds": 3.579
-    },
-    {
-      "tests": 97,
-      "seconds": 2.146
-    },
-    {
-      "tests": 800,
-      "seconds": 150.881
-    }
-  ],
-  "release_result": "PASS",
+  "version": "2026.10.18.2",
+  "main_client_version": "2026.10.17.8",
+  "regression_tests": 1257,
+  "regression_seconds": 287.8,
+  "standalone_daruma_tests": 73,
+  "packaging_tests": 11,
+  "offline_result": "PASS",
   "packages": [
     {
+      "client": "daily",
+      "version": "2026.10.17.8",
+      "modules": 29,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-daily-client-2026.10.17.8.zip",
+      "sha256": "e200956c44503dcbbe719bcdeba0dceb8c9fb87de73aa5251f4d1efa507e1e5d",
+      "bytes": 79024394,
+      "crc": "PASS"
+    },
+    {
       "client": "team",
-      "modules": 31,
-      "assets": 568,
-      "sha256": "436F0BE562682D9872F8D6E15D11E471595FE5214D23678395312284EC5061A2",
-      "gui_verified": true
+      "version": "2026.10.17.8",
+      "modules": 35,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-team-client-2026.10.17.8.zip",
+      "sha256": "e49ac9b04430742056414776bcb24282ba2c22b6e85f9d70b4213a4436bf41aa",
+      "bytes": 79190659,
+      "crc": "PASS"
+    },
+    {
+      "client": "arena",
+      "version": "2026.10.17.8",
+      "modules": 29,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-arena-client-2026.10.17.8.zip",
+      "sha256": "77dc260fac57b4dbff10f9337ba07cd89a0d4db2d3a83feeabc46cfe99bf57a6",
+      "bytes": 78999036,
+      "crc": "PASS"
+    },
+    {
+      "client": "bond",
+      "version": "2026.10.17.8",
+      "modules": 29,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-bond-client-2026.10.17.8.zip",
+      "sha256": "b70988da79aae7fc7951a4bdab82f707dfb20ecba5c92062e33a23758b6e3fa8",
+      "bytes": 79020983,
+      "crc": "PASS"
     },
     {
       "client": "unified",
-      "modules": 30,
-      "assets": 568,
-      "sha256": "FF33EBDF801B65A7A602625E2E149815023FD9B0D738CF28935D7FB6569517EB",
-      "gui_verified": true
+      "version": "2026.10.17.8",
+      "modules": 34,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-unified-client-2026.10.17.8.zip",
+      "sha256": "03ceefcfd2e8c7607767d05c92734e6336e51187ed525afa073cbec316908380",
+      "bytes": 79169164,
+      "crc": "PASS"
+    },
+    {
+      "client": "daruma",
+      "version": "2026.10.18.2",
+      "modules": 39,
+      "embedded_source_matches": true,
+      "gui_verified": true,
+      "archive": "huoying-ol-daruma-client-2026.10.18.2.zip",
+      "sha256": "a0120870a148e32928c254816f3abe443f84aba6f930b56b114f88d4889dbc4c",
+      "bytes": 60643445,
+      "crc": "PASS"
     }
   ],
-  "runtime_files_preserved": 2475,
-  "live_acceptance": "pending",
-  "multiplayer_tasks": "paused",
-  "combat_stall_seconds": 180,
-  "combat_max_seconds": 600,
-  "fixes": [
-    "battlefield no-change watchdog",
-    "independent per-battle hard deadline",
-    "bounded bond/team/sealed/treasure combat observation",
-    "stalled account excluded from automatic retries after positive tab verification",
-    "same joint identity context for current-account binding",
-    "managed panel offset and historical checkpoint preservation"
-  ]
+  "daruma_desktop_shortcut_verified": true,
+  "runtime_files_preserved": 4150,
+  "protected_files_preserved": 1004,
+  "game_input_operations": 0,
+  "game_tasks_started": false,
+  "live_acceptance": "pending_user_testing",
+  "runtime_data_included": false,
+  "personal_account_config_included": false,
+  "portable_source_tests": {
+    "total": 94,
+    "passed": 90,
+    "skipped": 4,
+    "reason": "Local historical live replay files are not shipped"
+  }
 }

@@ -15,9 +15,9 @@ from tkinter import ttk
 import hyol_scheduler as hs
 
 
-VERSION = "2026.10.05.16"
+VERSION = "2026.10.17.8"
 MAX_BATTLES = 99
-BOND_NO_RESPONSE_SECONDS = 60.0
+BOND_NO_RESPONSE_SECONDS = 30.0
 BOND_ACCOUNT = hs.Account(0, "当前羁绊窗口", 0)
 BOND_READY_ROI = (1000, 200, 1500, 450)
 BOND_MATCH_ROI = (650, 700, 1050, 900)
@@ -188,26 +188,14 @@ class BondRunner:
         from hyol_checkpoints import match_identity, read_checkpoint
         s = self.scheduler
         identities = read_checkpoint(s.shared_state_directory/'account_identities.json')
-        waiting_since = time.monotonic()
-        loading_seen = False
+        watchdog = hs.BattleWatchdog(mode='bond')
         s.event('bond_identity_wait', anonymous, detail='身份暂时遮挡；观察原画面，不重复开战')
         while True:
             s.check_stop()
             frame = s.capture()
             if match_identity(frame, identities)[0]:
                 return
-            now = time.monotonic()
-            if s._battle_auto_on_visible(frame) or s._combat_active_visible('arena', frame):
-                waiting_since, loading_seen = now, False
-            else:
-                loading_seen = loading_seen or s.template('arena_loading_anchor.bmp', hs.ARENA_LOADING_ROI,
-                                                         frame, threshold=.90)[0]
-                loading_seen = loading_seen or s.template('arena_matching_anchor.bmp',
-                                                         (601,349,1201,751), frame, threshold=.92)[0]
-                limit = 90 if loading_seen else 60
-                if now-waiting_since >= limit:
-                    evidence = s.save_raw_evidence(frame, anonymous, 'bond_identity_unconfirmed', 'pending')
-                    raise hs.PendingError(f'羁绊开战前账号未唯一确认；保留原请求，不点击匹配：{evidence}')
+            hs.check_battle_watchdog(s, watchdog, anonymous, frame, 'bond_identity', mode='bond')
             s.wait_interruptible(3)
 
     def save_request(self) -> None:
@@ -328,16 +316,7 @@ class BondRunner:
                 "arena_loading_anchor.bmp", hs.ARENA_LOADING_ROI, frame, threshold=0.90
             )[0]
             if loading_visible:
-                if loading_since is None:
-                    loading_since = time.monotonic()
-                if loading_timed_out(min(loading_since, transition_since), time.monotonic()):
-                    evidence = self.scheduler.save_raw_evidence(
-                        frame, self.account, f"bond_battle_{battle_no}_loading_timeout", "game_timeout"
-                    )
-                    raise hs.PendingError(
-                        f"game timeout: no loading progress for {int(BOND_NO_RESPONSE_SECONDS)} seconds; evidence={evidence}"
-                    )
-                self.scheduler.wait_interruptible(0.35)
+                self.scheduler.wait_interruptible(.35)
                 continue
             loading_since = None
 
@@ -383,8 +362,6 @@ class BondRunner:
                     self.scheduler.state.set_action(self.account.name, auto_action, "done", "auto battle visibly enabled")
                     self.event("bond_auto_enabled", battle=battle_no)
                     transition_since = time.monotonic()
-                elif loading_timed_out(transition_since, time.monotonic()):
-                    raise hs.PendingError("game timeout: bond auto-off control remained after verified enable")
                 self.scheduler.wait_interruptible(.35)
                 continue
 
@@ -443,16 +420,7 @@ class BondRunner:
                 )
                 return
 
-            # A positively recognized active battle may exceed one minute.
-            # Unknown/matching frames (including flickering loading anchors)
-            # must not inherit the ten-minute overall battle deadline.
-            if self.scheduler._battle_auto_on_visible(frame):
-                transition_since = time.monotonic()
-            elif loading_timed_out(transition_since, time.monotonic()):
-                evidence = self.scheduler.save_raw_evidence(
-                    frame, self.account, f"bond_battle_{battle_no}_transition_timeout", "game_timeout"
-                )
-                raise hs.PendingError(f"game timeout: no recognized bond transition for 60 seconds; evidence={evidence}")
+            # Active, matching and unknown frames share the image-change rule.
             self.scheduler.wait_interruptible(0.35)
         evidence = self.scheduler.save_raw_evidence(
             self.scheduler.capture(), self.account, f"bond_battle_{battle_no}_timeout", "pending"

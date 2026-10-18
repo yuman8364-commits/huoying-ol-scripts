@@ -191,6 +191,7 @@ class HistoryTests(unittest.TestCase):
         self.s.verify_identity=Mock(return_value=(True,{}))
         self.s.main_ready=Mock(return_value=True)
         self.s._battle_auto_on_visible=Mock(return_value=False)
+        self.s._battle_hud_visible=lambda frame: hs.Scheduler._battle_hud_visible(self.s,frame)
         self.s.save_raw_evidence=Mock(return_value='idle.png')
         self.s.chrome_click=Mock()
         self.s.template=Mock(return_value=(False,0.,0,0))
@@ -201,6 +202,10 @@ class HistoryTests(unittest.TestCase):
             self.s.template.side_effect=lambda asset,*args,**kw:(asset=='treasure_auto_path_running.bmp',1.,0,0)
             with self.assertRaises(hs.PendingError):history.prove_idle_identity(self.s,self.account)
             self.s.template.side_effect=None;self.s._battle_auto_on_visible.return_value=True
+            with self.assertRaises(hs.PendingError):history.prove_idle_identity(self.s,self.account)
+            self.s._battle_auto_on_visible.return_value=False
+            self.s.template.side_effect=lambda asset,*args,**kw:(
+                asset in ('survival_battle_hud_left_current.bmp','survival_battle_hud_right_current.bmp'),1.,0,0)
             with self.assertRaises(hs.PendingError):history.prove_idle_identity(self.s,self.account)
         self.s.chrome_click.assert_not_called()
 

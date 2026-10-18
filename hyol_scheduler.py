@@ -129,22 +129,34 @@ class PendingError(RuntimeError):
 
 
 class BattleStalled(PendingError):
-    """This battle exhausted its observation budget; never retry it in this run."""
+    """Treat an unchanged step as offline for this run, preserving its result."""
+    def __init__(self, detail, account=None, evidence=''):
+        self.account, self.evidence = account, str(evidence)
+        super().__init__(detail)
 
 
 def check_battle_watchdog(scheduler, watchdog, account, frame, label, *, mode, now=None):
+    if (isinstance(frame, Image.Image) and hasattr(scheduler, 'offline_dialog_visible')
+            and scheduler.offline_dialog_visible(frame) is True):
+        evidence = scheduler.save_raw_evidence(frame, account, 'offline_prompt', 'pending')
+        scheduler.event('account_offline', account, reason='offline_prompt', evidence=str(evidence),
+                        detail='已掉线：提示确认')
+        raise AccountOffline(account, str(evidence))
+    watchdog.mode = mode
     observation = watchdog.observe(frame, time.monotonic() if now is None else now)
     if observation is None:
         return
     evidence = scheduler.save_raw_evidence(frame, account, label + '_stalled', 'pending')
-    reason = ('单场等待达到上限' if observation['reason'] == 'max_duration'
-              else '战斗画面持续无明显变化')
-    detail = (f"战斗卡住：{reason}；本场已等待{observation['elapsed_seconds']:.0f}秒，"
+    detail = (f"页面连续30秒无变化；本环节已等待{observation['elapsed_seconds']:.0f}秒，"
               f"画面无变化{observation['unchanged_seconds']:.0f}秒。已中止等待并保留原场未决，"
               f"不会自动重开或计胜；画面={evidence}")
     scheduler.event('combat_watchdog_timeout', account, mode=mode, battle=label,
                     evidence=str(evidence), detail=detail, **observation)
-    raise BattleStalled(detail)
+    unavailable = getattr(scheduler, '_stalled_accounts', None)
+    if not isinstance(unavailable, dict):
+        scheduler._stalled_accounts = unavailable = {}
+    unavailable[account.name] = detail
+    raise BattleStalled(detail, account, evidence)
 
 
 class AccountOffline(PendingError):
@@ -404,7 +416,10 @@ def wanted_task_list_is_empty(image: Image.Image) -> bool:
     task is active it contains bright green task text and many character edges;
     after the automatic chain finishes the translucent panel is nearly blank.
     """
-    roi = np.asarray(image.convert("RGB"), dtype=np.int16)[480:590, 1715:1910]
+    # The translucent left border at x=1715..1724 exposes map vegetation.
+    # Actual task text starts to its right; including that border can keep an
+    # already empty list pending solely because the map behind it is green.
+    roi = np.asarray(image.convert("RGB"), dtype=np.int16)[480:590, 1725:1910]
     green = (roi[:, :, 1] > 110) & (roi[:, :, 1] * 100 > roi[:, :, 0] * 135) & (roi[:, :, 1] * 100 > roi[:, :, 2] * 115)
     # The panel is translucent.  Once its task row disappears, grass, rocks,
     # NPCs, or animation can still produce arbitrarily many image edges.  Edge
@@ -763,8 +778,10 @@ class JsonlLogger:
 
 
 class StateStore:
-    def __init__(self, accounts: list[str], directory: Path | None = None, aliases: dict[str, str] | None = None):
+    def __init__(self, accounts: list[str], directory: Path | None = None, aliases: dict[str, str] | None = None,
+                 *, restore_history: bool = True):
         self.directory = directory if directory is not None else STATE_DIR
+        self.restore_history = restore_history
         self.aliases = aliases or {}
         self.day = date.today().isoformat()
         self.path = self.directory / f"{self.day}.json"
@@ -776,7 +793,8 @@ class StateStore:
         }
         from hyol_checkpoints import CheckpointError, restore_actions
         try:
-            restore_actions(self)
+            if restore_history:
+                restore_actions(self)
         except CheckpointError as exc:
             raise PendingError(str(exc)) from exc
 
@@ -1355,17 +1373,21 @@ class Scheduler:
         self.identity_assignment_margin = float(config.get("IdentityAssignmentMargin", "0.03"))
         self.templates = TemplateStore(self.threshold)
         from hyol_accounts import state_directory
-        self.shared_state_directory = state_directory(config, ROOT)
-        self.state = StateStore(names, directory=self.shared_state_directory)
+        from hyol_run_context import current_run
+        self.run_context = current_run()
+        self.identity_directory = (self.run_context.identity_directory if self.run_context
+                                   else state_directory(config, ROOT))
+        self.shared_state_directory = self.run_context.directory if self.run_context else self.identity_directory
+        self.state = StateStore(names, directory=self.shared_state_directory, restore_history=self.run_context is None)
         from hyol_checkpoints import register_identity_materials
         register_identity_materials(self)
-        run_name = run_id()
+        run_name = self.run_context.identifier if self.run_context else run_id()
         self.diagnostics = Diagnostics(ROOT, run_name)
         self.detector = OnnxDetector(ROOT / "models" / "detector.json")
         self.last_detection = None
         self.log = JsonlLogger(LOGS / f"HYOL_Scheduler_{run_name}.jsonl")
         self.account_logs = {name: JsonlLogger(LOGS / "accounts" / f"{slug(name)}.jsonl") for name in names}
-        self.stop = threading.Event()
+        self.stop = self.run_context.stop if self.run_context else threading.Event()
         self.hwnd = 0
         self.active: Account | None = None
         self.click_count = 0
@@ -1456,11 +1478,18 @@ class Scheduler:
         )
 
     def start_f12_monitor(self) -> None:
+        context = getattr(self, 'run_context', None)
+        if context:
+            if context.monitor_started:
+                return
+            context.monitor_started = True
         def monitor() -> None:
             was_down = False
             while not self.stop.is_set():
                 down = Win32.f12_down()
                 if down and not was_down:
+                    if context:
+                        context.interrupted = True
                     self.stop.set()
                     self.event("emergency_stop", reason="F12")
                     return
@@ -1493,6 +1522,8 @@ class Scheduler:
             if len(windows) == 1:
                 self.hwnd = windows[0]
                 if self.validate_geometry(activate=True):
+                    if getattr(self, 'run_context', None):
+                        self.run_context.bind_window(self)
                     self.event("window_bound", rect=Win32.rect(self.hwnd), pid=Win32.pid(self.hwnd))
                     return
             if deadline is not None and time.monotonic() >= deadline:
@@ -1553,6 +1584,8 @@ class Scheduler:
 
     def capture(self) -> Image.Image:
         self.check_stop()
+        if getattr(self, 'run_context', None):
+            self.run_context.check_window(self)
         # ImageGrab captures desktop coordinates, not an HWND.  A user can
         # bring Codex or another app forward during any repaint wait after the
         # last guarded click.  Never interpret that foreign foreground as a
@@ -1575,13 +1608,41 @@ class Scheduler:
         if Win32.rect(self.hwnd) != geometry.window or (adaptive and Win32.game_content_rect(self.hwnd) != geometry.content):
             raise SafetyError("game geometry changed during capture; discard stale frame")
         frame = geometry.normalize(raw)
+        frame._hyol_observations = {}
         self._capture_geometry = geometry
         self.templates.resize_scale = (1918/(geometry.content[2]-geometry.content[0]),962/(geometry.content[3]-geometry.content[1]))
         self.templates.begin_frame(frame)
         self._last_frame = frame
         self._health_checked_at = time.monotonic()
         self.check_offline_frame(frame)
+        scope = getattr(self, '_task_observation', None)
+        if (isinstance(scope, tuple) and self.active == scope[0]
+                and not getattr(self, '_capture_binding_probe', False)
+                and getattr(self, '_capture_account', None) in (None, scope[0])):
+            check_battle_watchdog(self, scope[2], scope[0], frame, scope[1], mode=scope[1])
         return frame
+
+    def begin_task_observation(self, account, task):
+        """Observe only the executing account; chrome switches never reset its timer."""
+        previous = getattr(self, '_task_observation', None)
+        if task == 'treasure':
+            # Excavation's intentional 300s goal wait is owned by its timer;
+            # battle waits still have their own watchdog and offline prompts
+            # remain checked by every capture.
+            self._task_observation = None
+            return previous
+        watches = getattr(self, '_task_watchdogs', {})
+        key = (account.name, task)
+        watch = watches.setdefault(key, BattleWatchdog(mode=task))
+        self._task_watchdogs = watches
+        self._task_observation = (account, task, watch)
+        return previous
+
+    def end_task_observation(self, previous=None, *, complete=False):
+        scope = getattr(self, '_task_observation', None)
+        if scope and (complete or self.stop.is_set()):
+            getattr(self, '_task_watchdogs', {}).pop((scope[0].name, scope[1]), None)
+        self._task_observation = previous
 
     def offline_dialog_visible(self, frame: Image.Image) -> bool:
         # Templates identify the dialog or its exact text, never a dimmed
@@ -1741,6 +1802,8 @@ class Scheduler:
         return scores
 
     def verify_identity(self, account: Account, frame: Image.Image | None = None) -> tuple[bool, dict[str, float]]:
+        if getattr(self, 'run_context', None):
+            account = self.run_context.resolve(self, account)
         frame = frame or self.capture()
         if isinstance(getattr(self, '_dynamic_identity_materials', None), dict):
             from hyol_accounts import verify_dynamic_identity
@@ -1838,7 +1901,27 @@ class Scheduler:
             raise SafetyError(f"chrome click outside trusted toolbar: {x},{y}")
         physical_x, physical_y = ((x, y) if blank_tab_chrome else
                                   (self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)))
-        hit = Win32.hit_test(self.hwnd, physical_x, physical_y)
+        for attempt in range(1, 4):
+            try:
+                hit = Win32.hit_test(self.hwnd, physical_x, physical_y)
+                break
+            except SafetyError as exc:
+                if str(exc) != "window hit test timed out or failed" or attempt == 3:
+                    raise
+                # A busy Flash/browser thread can miss one read-only WM_NCHITTEST.
+                # No input has been sent. Revalidate the window and target before
+                # observing again; an unsafe hit result is never retried.
+                self.event("chrome_hit_test_retry", account, target=label, attempt=attempt)
+                self.wait_interruptible(.2)
+                self.ensure_window()
+                self.check_input_pause()
+                if Win32.foreground() != self.hwnd:
+                    raise SafetyError("window changed during chrome target validation") from exc
+                if blank_tab_chrome:
+                    if Win32.rect(self.hwnd) != EXPECTED_WINDOW:
+                        raise SafetyError("window changed during blank-tab chrome validation") from exc
+                elif hasattr(self, "screen_point") and self.screen_point(x, y) != (physical_x, physical_y):
+                    raise SafetyError("window changed during chrome target validation") from exc
         if hit != 1:  # HTCLIENT; caption, resize edges and system buttons are unsafe.
             self.event("chrome_click_rejected", account, target=label, x=x, y=y, hit_test=hit)
             raise SafetyError(f"chrome target is not client content: hit_test={hit}")
@@ -1895,6 +1978,9 @@ class Scheduler:
         self.state.save_global()
 
     def switch_account(self, account: Account, verify: bool = True) -> Image.Image:
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing:
+            return context.select(self, account)
         # Click near the upper tab body rather than the close glyph.  The
         # browser recalculates tab widths as titles repaint; using the title
         # band keeps a fixed enrolled x-coordinate from landing on an adjacent
@@ -2112,7 +2198,8 @@ class Scheduler:
             # A matching modal can leave the arena page visible underneath;
             # never click the underlying arena X while the modal is present.
             return False
-        if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0] or self._battle_auto_on_visible(frame):
+        if (self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0]
+                or self._battle_auto_on_visible(frame) or self._battle_hud_visible(frame)):
             # Battle controls are evidence that the battle is still active;
             # never click an arena-page close button underneath them.
             return False
@@ -2220,8 +2307,8 @@ class Scheduler:
                 return self.wait_until_main(6)
             return False
         if self.template("market_anchor.bmp", (651, 69, 1251, 319), frame)[0]:
-            if self.click_template(account, "market_close.bmp", (1301, 219, 1919, 369), 15, 15, "recover_close_market", ["market_anchor.bmp"]):
-                return self.wait_until_main(6)
+            from hyol_navigation import close_black_market
+            return close_black_market(self, account, frame=frame)
         # Market navigation can fail after the world-map or South Konoha
         # screen has already been opened.  Leaving that map visible and then
         # switching tabs is unsafe: the next identity probe is no longer on a
@@ -2755,14 +2842,37 @@ class Scheduler:
         anchor_threshold: float | None = None,
     ) -> Image.Image:
         anchors = tuple(page_anchors)
-        deadline = time.monotonic() + max(0., min(5., float(self.config.get("RecognitionRetrySeconds", "1.2"))))
+        deadline = time.monotonic() + 30.
         while True:
             try:
                 return self._content_guard_once(account, anchors, anchor_threshold)
             except SafetyError as exc:
-                # Only a transient page repaint may be retried. Never relax
-                # account lease, identity, foreground or geometry failures.
-                if not str(exc).startswith("page anchor guard failed:") or time.monotonic() >= deadline:
+                message = str(exc)
+                retry = message.startswith('page anchor guard failed:')
+                if message.startswith('identity and page-anchor guard failed: scores={} '):
+                    # Modal pages hide the role strip. Observe a repaint only
+                    # while the previously named account's exact tab remains
+                    # selected; never move a tab or relax a recognition score.
+                    frame = getattr(self, '_last_frame', None)
+                    mapping = self._saved_tab_mapping()
+                    try:
+                        retry = (self.active == account and frame is not None
+                                 and isinstance(mapping, dict)
+                                 and mapping.get(account.name) == account.tab_x
+                                 and self._generic_active_tab_x(frame) == account.tab_x)
+                    except (PendingError, SafetyError):
+                        retry = False
+                if not retry or time.monotonic() >= deadline:
+                    frame = getattr(self, '_last_frame', None)
+                    if frame is not None and self.active == account:
+                        scope = getattr(self, '_task_observation', None)
+                        try:
+                            evidence = self.save_raw_evidence(frame, account, 'content_guard_failure', 'pending')
+                            self.event('content_guard_pending', account, detail=message,
+                                       task=scope[1] if scope and scope[0] == account else None,
+                                       evidence=str(evidence))
+                        except OSError:
+                            pass  # Preserve the original guard failure.
                     raise
                 self.event("page_anchor_retry", account, detail=str(exc))
                 self.wait_interruptible(.2)
@@ -2773,10 +2883,18 @@ class Scheduler:
         page_anchors: Iterable[str] = (),
         anchor_threshold: float | None = None,
     ) -> Image.Image:
+        context = getattr(self, 'run_context', None)
+        if context:
+            account = context.resolve(self, account)
+        blocked = getattr(self, '_stalled_accounts', {}).get(account.name)
+        if blocked:
+            raise BattleStalled(blocked, account)
         self.ensure_window()
         if self.active != account:
             raise SafetyError("content click attempted without active account lease")
         frame = self.capture()
+        if context and context.binding and not context.probing and not context.layout_matches(frame):
+            raise PendingError('标签布局在动作前改变，未发送内容点击')
         if self.generic_current_tab_x is not None and not self._generic_current_tab_is_active(frame):
             raise SafetyError("current browser tab changed during generic current-window run")
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
@@ -2787,6 +2905,12 @@ class Scheduler:
             require_account_tab(self, account, frame)
         anchor_ok = False
         for name in anchors:
+            if name == "arena_battle_frame_anchor.bmp" and self._battle_hud_visible(frame):
+                # The shared pair stays visible when a tooltip/animation hides
+                # the old arena frame patch. Require both on this fresh guarded
+                # frame before allowing the already scoped battle control.
+                anchor_ok = True
+                break
             if name == "target_card_actions.bmp":
                 # Recheck the full overlay at every input guard, not just its
                 # generic red X; the magnifier contains no character identity.
@@ -2854,6 +2978,8 @@ class Scheduler:
         anchor_threshold: float | None = None,
         frame_predicate: Callable[[Image.Image], bool] | None = None,
     ) -> None:
+        if getattr(self, 'run_context', None):
+            account = self.run_context.resolve(self, account)
         if self.no_content_clicks:
             raise PendingError("content clicks disabled by invocation")
         if not (0 <= x < EXPECTED_WINDOW[2] and VIEW[1] <= y < EXPECTED_WINDOW[3]):
@@ -2870,6 +2996,10 @@ class Scheduler:
         evidence = self.save_evidence(before, account, label, "before") if irreversible else None
         if irreversible:
             self.state.set_action(account.name, label, "pending", "written before click")
+            record = self.state.action_record(account.name, label)
+            if isinstance(record, dict):
+                record['before_evidence'] = str(evidence)
+                self.state.save_account(account.name)
         physical_x, physical_y = self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)
         self.check_input_pause()
         Win32.click(physical_x, physical_y)
@@ -2937,10 +3067,14 @@ class Scheduler:
             dx, dy = round(dx*(right-x)/shape[1]), round(dy*(bottom-y)/shape[0])
             x, y = round(x), round(y)
         self.event("template_match", account, template=name, score=score, x=x, y=y)
+        def target_still_current(fresh):
+            if frame_predicate is not None and not frame_predicate(fresh):
+                return False
+            ok, _score, fresh_x, fresh_y = self.active_template(name, roi, fresh, threshold=threshold)
+            return ok and (fresh_x, fresh_y) == (x, y)
         try:
-            extra = {'frame_predicate': frame_predicate} if frame_predicate is not None else {}
             self.click_point(account, x + dx, y + dy, label, anchors, irreversible,
-                             anchor_threshold=anchor_threshold, **extra)
+                             anchor_threshold=anchor_threshold, frame_predicate=target_still_current)
         except TargetPreconditionChanged:
             return False
         return True
@@ -4014,8 +4148,20 @@ class Scheduler:
                 return index
         return limit + 1
 
+    def _battle_hud_visible(self, frame: Image.Image) -> bool:
+        """Two independent battle controls prove observation may continue."""
+        return (self.template("survival_battle_hud_left_current.bmp",
+                              (410, 200, 520, 255), frame, threshold=.98)[0]
+                and self.template("survival_battle_hud_right_current.bmp",
+                                  (1390, 200, 1520, 255), frame, threshold=.98)[0])
+
     def _combat_active_visible(self, mode: str, frame: Image.Image | None = None) -> bool:
         frame = frame or self.capture()
+        # These controls belong to the shared battle shell, including arena.
+        # A skill tooltip can cover Auto for many frames. This only recognizes
+        # an active battle; it cannot prove Auto, a result, or a completed fight.
+        if self._battle_hud_visible(frame):
+            return True
         if mode == "arena" and self._arena_waiting_battle_visible(frame):
             return True
         if mode == "arena":
@@ -4056,13 +4202,6 @@ class Scheduler:
                 or self.template("arena_reward_claim.bmp", (301, 469, 521, 879), frame)[0]
             )
             return (ranked or casual) and task_state
-        if mode == "survival":
-            # Both top battle controls must match. They only keep observation
-            # alive when a preview covers Auto; they never confirm a result.
-            return (self.template("survival_battle_hud_left_current.bmp",
-                                  (410, 200, 520, 255), frame, threshold=.98)[0]
-                    and self.template("survival_battle_hud_right_current.bmp",
-                                      (1390, 200, 1520, 255), frame, threshold=.98)[0])
         return False
 
     def _arena_waiting_battle_visible(self, frame: Image.Image) -> bool:
@@ -4095,6 +4234,8 @@ class Scheduler:
         return self.template("survival_anchor.bmp", (201, 69, 601, 419), frame)[0]
 
     def switch_account_for_combat(self, account: Account, mode: str, running: bool) -> Image.Image:
+        if getattr(self, 'run_context', None):
+            account = self.run_context.resolve(self, account)
         """Switch to a combat slot with a page-specific positive gate.
 
         A battle scene hides the normal top-left identity strip.  Once the
@@ -4257,8 +4398,11 @@ class Scheduler:
         claim_index = 1
         while self._arena_reward_claim_done(account, claim_index):
             claim_index += 1
-        for _ in range(12):
+        claims_sent = 0
+        watchdog = BattleWatchdog(mode='arena')
+        while claims_sent < 12:
             frame = self.capture()
+            check_battle_watchdog(self, watchdog, account, frame, 'arena_rewards', mode='arena')
             match = self.template("arena_reward_claim.bmp", (301, 469, 521, 879), frame)
             if not match[0]:
                 ready_before = self.template('arena_ready_anchor.bmp', (851,199,1451,449), frame)[0]
@@ -4274,7 +4418,9 @@ class Scheduler:
             if not self.click_template(account, "arena_reward_claim.bmp", local, 32, 12,
                                        action, ["arena_ready_anchor.bmp", "arena_reward_claim.bmp"],
                                        irreversible=True):
-                raise PendingError("arena reward claim control repainted before click")
+                self.wait_interruptible(.4)
+                continue
+            claims_sent += 1
             deadline = time.monotonic() + 5
             absent_frames = 0
             while time.monotonic() < deadline:
@@ -4329,6 +4475,8 @@ class Scheduler:
         self.event('arena_completed_run_rewards_rechecked',account)
 
     def _wait_arena_ready_content(self, account: Account, seconds: float = 12) -> None:
+        from hyol_identity_overlays import clear_hover_preview
+        clear_hover_preview(self)
         """Continue on two stable content frames instead of an unconditional sleep."""
         started = time.monotonic()
         stable = 0
@@ -4448,6 +4596,8 @@ class Scheduler:
         self.event("combat_slot_prepared", account, mode="arena", next_index=slot.next_index)
 
     def _click_arena_mode_when_stable(self, account: Account, action: str, seconds: float = 30) -> str | None:
+        from hyol_identity_overlays import clear_hover_preview
+        clear_hover_preview(self)
         """Use ranked only with positive tokens; zero tokens selects casual."""
         deadline = time.monotonic() + seconds
         casual_only_frames = 0
@@ -4539,76 +4689,12 @@ class Scheduler:
         return None
 
     def _combat_progress_watchdog(self, slot: CombatSlot, frame: Image.Image) -> None:
-        """Bound queue and battle waits without inventing an outcome."""
-        if slot.mode == "arena":
-            if (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
-                    or self._arena_waiting_battle_visible(frame)):
-                phase = "matching"
-            elif self.template("arena_loading_anchor.bmp", ARENA_LOADING_ROI, frame)[0]:
-                phase = "loading"
-            elif self._arena_victory_visible(frame):
-                phase = "victory"
-            elif self._arena_defeat_visible(frame):
-                phase = "defeat"
-            elif self.template("arena_result_confirm.bmp", (651, 449, 1151, 829), frame)[0]:
-                phase = "result"
-            elif self._combat_ready_visible("arena", frame):
-                phase = "ready"
-            elif self._combat_active_visible("arena", frame):
-                phase = "battle"
-            else:
-                phase = "transition"
-        else:
-            phase = "active" if self._combat_active_visible(slot.mode, frame) else "transition"
-        current = image_hash(frame.crop(VIEW))
-        now = time.monotonic()
-        if slot.mode == "arena" and phase in ("matching", "loading"):
-            if slot.queue_started_at is None:
-                slot.queue_started_at = now
-            if now - slot.queue_started_at >= 90:
-                evidence = self.save_raw_evidence(frame, slot.account,
-                                                  "arena_queue_stalled", "pending")
-                self.event("arena_queue_stalled_deferred", slot.account,
-                           phase=phase, seconds=int(now-slot.queue_started_at),
-                           evidence=str(evidence))
-                raise PendingError(
-                    f"竞技场匹配/加载已等待{int(now-slot.queue_started_at)}秒；"
-                    f"保留本场未决并切换其他账号，画面={evidence}")
-            check_combat_slot_watchdog(self, slot, frame, now=now)
-            if phase != slot.progress_phase:
-                slot.progress_phase = phase
-                slot.progress_hash = current
-                slot.progress_changed_at = now
-                return
-            return
-        slot.queue_started_at = None
-        if phase not in ("victory", "defeat", "result", "ready"):
-            check_combat_slot_watchdog(self, slot, frame, now=now)
-        if slot.mode != "arena" or phase != "ready":
-            slot.progress_phase = phase
-            slot.progress_hash = current
-            slot.progress_changed_at = now
-            return
-        if phase != slot.progress_phase:
-            slot.progress_phase = phase
-            slot.progress_hash = current
-            slot.progress_changed_at = now
-            return
-        # Preserve the exact-frame check as supporting evidence, but workflow
-        # phase—not animated background pixels—is the one-minute deadline.
-        slot.progress_hash = current
-        if not slot.progress_changed_at:
-            slot.progress_changed_at = now
-            return
-        stalled = now - slot.progress_changed_at
-        if stalled < 60:
-            return
-        evidence = self.save_raw_evidence(frame, slot.account, f"{slot.mode}_network_stall", "pending")
-        detail = f"竞技场点击后仍停留在准备主界面{int(stalled)}秒，未进入匹配或战斗，判定网络卡死并暂停脚本"
-        mark_manual_pause(ROOT, self.diagnostics.identifier, detail)
-        self.event("combat_network_stall_paused", slot.account, mode=slot.mode, seconds=int(stalled), evidence=str(evidence), detail=detail)
-        self.stop_event.set()
-        raise KeyboardInterrupt(detail)
+        """One 30s image-change rule for matching, loading and active battles."""
+        if slot.mode == 'arena' and (
+                self._arena_victory_visible(frame) or self._arena_defeat_visible(frame)
+                or self.template('arena_result_confirm.bmp', (651,449,1151,829), frame)[0]):
+            return  # Settle positive results before observing a completed static page.
+        check_combat_slot_watchdog(self, slot, frame)
 
     def _start_arena_slot(self, slot: CombatSlot) -> None:
         account = slot.account
@@ -4661,7 +4747,7 @@ class Scheduler:
         slot.progress_changed_at = 0.0
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
         slot.battle_watchdog_index = slot.next_index
-        transition_deadline = time.monotonic() + 90
+        transition_deadline = time.monotonic() + 30
         while time.monotonic() < transition_deadline:
             self.check_stop()
             frame = self.capture()
@@ -4676,6 +4762,57 @@ class Scheduler:
             self._combat_progress_watchdog(slot, frame)
             self.wait_interruptible(0.2)
         raise PendingError("arena did not enter matching or battle; start remains pending")
+
+    def _arena_opening_once(self, account, index, frame):
+        """Write ahead before each opening input; a pending input is never resent."""
+        from hyol_identity_overlays import clear_hover_preview
+        known=(self.template('arena_battle_frame_anchor.bmp',VIEW,frame)[0]
+               or Scheduler._battle_hud_visible(self,frame))
+        if known and not (self.template('battle_auto_off.bmp',BATTLE_AUTO_ROI,frame)[0]
+                          or self._battle_auto_on_visible(frame)) and clear_hover_preview(self):
+            frame=self.capture()
+        if not ((self.template('arena_battle_frame_anchor.bmp', VIEW, frame)[0]
+                 or Scheduler._battle_hud_visible(self,frame))
+                and (self.template('battle_auto_off.bmp', BATTLE_AUTO_ROI, frame)[0]
+                     or self._battle_auto_on_visible(frame))):
+            return False
+        if any(self.template(name, roi, frame)[0] for name, roi in (
+                ('arena_result_confirm.bmp', (651,449,1151,829)),
+                ('arena_defeat_confirm.bmp', (801,580,1101,760)),
+                ('arena_rankup_confirm.bmp', (801,600,1101,760)))):
+            return False
+        parent = self.state.action_record(account.name, self._combat_action_name('arena', index))
+        operation = parent.get('operation_id') if isinstance(parent, dict) else None
+        token = '_' + hashlib.sha256(str(operation).encode('utf-8')).hexdigest()[:10] if operation else ''
+        skill = f'arena_opening_{index}{token}_skill2'
+        auto = f'arena_opening_{index}{token}_auto'
+        changed = False
+        if self.state.action_status(account.name, skill) == 'new':
+            if not self.template('arena_skill2_key.bmp', (890,920,920,950), frame, threshold=.96)[0]:
+                return False  # Wait for the skill HUD to paint; no fallback clicks.
+            self.click_point(account, 904, 909, skill, ['arena_battle_frame_anchor.bmp'],
+                             irreversible=True, frame_predicate=lambda f:
+                             self.template('arena_skill2_key.bmp', (890,920,920,950), f, threshold=.96)[0]
+                             and not self._arena_victory_visible(f) and not self._arena_defeat_visible(f))
+            self.commit_action(account, skill, '本场第二技能已发送一次；不再次点击')
+            changed = True
+            clear_hover_preview(self)
+            frame = self.capture()
+        if self.state.action_status(account.name, auto) == 'new':
+            changed = True
+            if (self._battle_auto_on_visible(frame)
+                    or self.state.action_status(account.name, f'battle_auto_{index}') in ('pending', 'done')):
+                self.state.set_action(account.name, auto, 'done', '自动已开启或已有发送记录，不切换')
+            elif self.template('battle_auto_off.bmp', BATTLE_AUTO_ROI, frame)[0]:
+                if not self.click_template(account, 'battle_auto_off.bmp', BATTLE_AUTO_ROI, 29,29,
+                                           auto, ['arena_battle_frame_anchor.bmp', 'battle_auto_off.bmp'],
+                                           irreversible=True):
+                    return False
+                self.commit_action(account, auto, '本场自动已发送一次；轮询/恢复不再次点击')
+        if changed:
+            self.event('arena_opening_observed', account, index=index, skill_action=skill,
+                       auto_action=auto, battle_operation_id=operation)
+        return self._combat_active_visible('arena', frame)
 
     def _poll_arena_slot(self, slot: CombatSlot) -> None:
         account = slot.account
@@ -4777,50 +4914,16 @@ class Scheduler:
             raise PendingError("arena rank-up confirmation sequence did not settle")
         if rankup_processed:
             frame = self.capture()
-        if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0]:
-            try:
-                clicked = self.click_template(
-                    account,
-                    "battle_auto_off.bmp",
-                    BATTLE_AUTO_ROI,
-                    29,
-                    29,
-                    f"battle_auto_{slot.next_index}",
-                    ["battle_auto_off.bmp"],
-                )
-            except SafetyError:
-                # An ultimate cinematic can cover the control between the
-                # first match and click_template's mandatory second guard.
-                # If a battle/result anchor is still positive, wait for the
-                # control to repaint instead of aborting the whole command.
-                frame = self.capture()
-                if self._combat_active_visible("arena", frame):
-                    self.event("arena_auto_control_temporarily_occluded", account, index=slot.next_index)
-                    self.wait_interruptible(0.4)
-                    return
-                raise
-            if not clicked:
-                raise PendingError("arena auto-battle control disappeared")
-            auto_deadline = time.monotonic() + 5
-            while time.monotonic() < auto_deadline:
-                frame = self.capture()
-                if self._battle_auto_on_visible(frame):
-                    self.event("arena_auto_enabled", account, index=slot.next_index)
-                    return
-                transitioned = (
-                    self._arena_victory_visible(frame)
-                    or self._arena_defeat_visible(frame)
-                    or self.template("arena_result_confirm.bmp", (651, 449, 1151, 829), frame)[0]
-                    or self.template("arena_rankup_confirm.bmp", (801, 600, 1101, 760), frame)[0]
-                    or self.template("arena_defeat_confirm.bmp", (801, 580, 1101, 760), frame)[0]
-                    or self.template("arena_rankdown_banner.bmp", (700, 220, 1250, 430), frame, threshold=0.90)[0]
-                    or self._combat_ready_visible("arena", frame)
-                )
-                if transitioned:
-                    self.event("arena_auto_transitioned_to_result", account, index=slot.next_index)
-                    return
-                self.wait_interruptible(0.2)
-            raise PendingError("arena auto-battle was not positively enabled and no result transition appeared")
+        try:
+            if self._arena_opening_once(account, slot.next_index, frame):
+                return
+        except SafetyError:
+            frame = self.capture()
+            if self._combat_active_visible('arena', frame):
+                self.event('arena_auto_control_temporarily_occluded', account, index=slot.next_index)
+                self.wait_interruptible(.4)
+                return
+            raise
         if self._battle_auto_on_visible(frame):
             # A result banner can remain behind an unrecognized confirmation.
             # Its repeated presence is not proof that this attempt finished.
@@ -5077,9 +5180,71 @@ class Scheduler:
         self.state.set_action(account.name, "survival_reset_confirm_yes", "new", "首轮未完成，未确认重置")
         self.event("survival_premature_reset_cancelled", account)
 
+    def _survival_partial_score(self, frame):
+        if self._survival_score_twenty_visible(frame):
+            return 20
+        for value in (80, 140):
+            if self.template(f'survival_score_{value}.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
+                return value
+        return None
+
+    def reconcile_survival_partial_reset(self, account, frame):
+        """Prove a reset from its own before image and remaining 1 -> 0, never score alone."""
+        if self.state.action_status(account.name, 'survival_reset') != 'pending':
+            return False
+        if (not self.template('survival_anchor.bmp', (201,69,601,419), frame, threshold=.92)[0]
+                or self._survival_partial_score(frame) is None
+                or not any(self.template(name, (851,769,1251,1031), frame, threshold=.98)[0]
+                           for name in ('survival_reset_zero_text.bmp', 'survival_reset_zero_current.bmp'))):
+            return False
+        actions = self.state.accounts.get(account.name, {}).get('actions', {})
+        if any(key.startswith('survival_battle_step_') and row.get('status') == 'pending'
+               for key, row in actions.items() if isinstance(row, dict)):
+            return False
+        record = self.state.action_record(account.name, 'survival_reset')
+        paths = [Path(record['before_evidence'])] if record.get('before_evidence') else []
+        if not paths:
+            # Older versions logged before-image paths without putting them in
+            # the ledger. Only the original operation's timestamp may select one.
+            from hyol_task_progress import ProgressReader
+            try:
+                stamp = datetime.fromisoformat(record['updated_at'])
+            except (ValueError, KeyError):
+                return False
+            for logs in ProgressReader(ROOT).log_roots:
+                folder = logs/'scheduler_evidence'/self.state.day/slug(account.name)
+                for path in folder.glob('*_before_survival_reset.jpg'):
+                    try:
+                        at = datetime.strptime(path.name[:13], '%H%M%S_%f').time()
+                        observed = stamp.replace(hour=at.hour, minute=at.minute, second=at.second, microsecond=at.microsecond)
+                        if 0 <= (stamp-observed).total_seconds() <= 5:
+                            paths.append(path)
+                    except ValueError:
+                        continue
+        paths = list(dict.fromkeys(paths))
+        if len(paths) != 1 or not paths[0].is_file():
+            return False
+        with Image.open(paths[0]) as image:
+            before = image.convert('RGB')
+        if not (self._survival_full_score_visible(before)
+                and self.template('survival_reset.bmp', (851,769,1251,1031), before, threshold=.98)[0]
+                and any(self.template(name, (1151,769,1451,1031), before, threshold=.98)[0]
+                        for name in ('survival_final_claimed.bmp','survival_final_claimed_current.bmp'))):
+            return False
+        after = self.save_raw_evidence(frame, account, 'survival_partial_reset', 'verified')
+        self.commit_action(account, 'survival_reset', '原重置前220/220已领奖、剩余1次；当前部分积分且剩余0次')
+        if self.state.action_status(account.name, 'survival_reset_confirm_yes') == 'pending':
+            self.commit_action(account, 'survival_reset_confirm_yes', '原重置剩余次数1→0已确认')
+        self.event('survival_partial_reset_reconciled', account, before_evidence=str(paths[0]),
+                   evidence=str(after), score=self._survival_partial_score(frame),
+                   detail='只对账原重置，不补记任何战斗次数或胜负')
+        return True
+
     def _ensure_survival_reset(self, account: Account) -> None:
         reset_action = "survival_reset"
         confirm_action = "survival_reset_confirm_yes"
+        if self.reconcile_survival_partial_reset(account, self.capture()) is True:
+            return
         confirm_visible = self.template("survival_reset_confirm_yes.bmp", (701, 469, 1151, 719), threshold=0.92)[0]
         if confirm_visible:
             # Builds before direct-flow v2 incorrectly committed the reset by
@@ -5126,9 +5291,11 @@ class Scheduler:
             # A fully completed run can reset immediately without showing the
             # loss-warning modal.  Accept only the stable 0/220 destination;
             # otherwise the irreversible reset remains pending.
-            if self.wait_template("survival_score_0.bmp", (751, 769, 1151, 1031), 20):
+            if self.wait_template("survival_score_0.bmp", (751, 769, 1151, 1031), 8):
                 self.commit_action(account, reset_action, "完成态重置后页面直接稳定为0/220")
                 self.event("survival_reset_committed_without_modal", account)
+                return
+            if self.reconcile_survival_partial_reset(account, self.capture()) is True:
                 return
             raise PendingError("生存演习重置后既无确认弹窗也未稳定为0/220")
         if not self.wait_template("survival_score_0.bmp", (751, 769, 1151, 1031), 8):
@@ -5192,7 +5359,7 @@ class Scheduler:
 
     def _select_highest_survival_grade(self, account: Account, index: int) -> dict | None:
         """Wait briefly for overlays to clear, then require a stable grade/counter."""
-        deadline = time.monotonic() + getattr(self, "survival_selection_timeout", 20.0)
+        deadline = time.monotonic() + getattr(self, "survival_selection_timeout", 30.0)
         selected = None
         signature = None
         stable = 0
@@ -5507,6 +5674,14 @@ class Scheduler:
                     self.state.set_module(slot.account.name, mode, 'pending', str(exc))
                     self.event('combat_account_offline_skipped', slot.account, mode=mode)
                     continue
+                except BattleStalled as exc:
+                    slot.unavailable = True
+                    self.state.set_module(slot.account.name, mode, 'pending', str(exc))
+                    self.state.add_pending(slot.account.name, mode, str(exc))
+                    self.event('combat_account_stalled_skipped', slot.account, mode=mode, detail=str(exc))
+                    if getattr(self, '_task_observation', None):
+                        raise  # The multi-solo owner excludes this label and releases its observation.
+                    continue
                 except (PendingError, SafetyError) as exc:
                     self.state.set_module(slot.account.name, mode, "pending", str(exc))
                     self.state.add_pending(slot.account.name, mode, str(exc))
@@ -5594,7 +5769,7 @@ class Scheduler:
             else:
                 if not self.click_template(account, "arena_casual_button_current.bmp", (760, 719, 1050, 919), 88, 29, action, ["arena_ready_anchor.bmp", "arena_casual_button_current.bmp"], irreversible=True):
                     raise PendingError("arena casual action unavailable")
-                transition_deadline = time.monotonic() + 90
+                transition_deadline = time.monotonic() + 30
                 while time.monotonic() < transition_deadline:
                     self.check_stop()
                     if self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751))[0]:
@@ -5624,11 +5799,8 @@ class Scheduler:
                 if self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751))[0]:
                     self.wait_interruptible(0.5)
                     continue
-                if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI)[0]:
-                    if not self.click_template(account, "battle_auto_off.bmp", BATTLE_AUTO_ROI, 29, 29, f"battle_auto_{battle_index}", ["battle_auto_off.bmp"]):
-                        raise PendingError("arena auto-battle control disappeared")
-                    if not self._wait_battle_auto_on(5):
-                        raise PendingError("arena auto-battle was not positively enabled")
+                if self._arena_opening_once(account, battle_index, frame):
+                    self.wait_interruptible(.4)
                     continue
                 if self.template("arena_result_confirm.bmp", (651, 449, 1151, 829))[0]:
                     result_index = self._next_arena_result_index(account, battle_index, result_index)
@@ -5976,6 +6148,11 @@ class Scheduler:
         return self.by_name[leader_name], invitees, row_templates, invite_leader_template, member_template
 
     def open_team_room(self, leader: Account, label: str) -> None:
+        core = "team_toolbar_core_current.bmp"
+        if (ASSETS / core).is_file() and self.click_template(
+                leader, core, (1685, 70, 1735, 120), 9, 6, label,
+                ["anchor_top_menu.bmp"], threshold=.98, anchor_threshold=.98):
+            return
         if not self.click_template(leader, "team_toolbar.bmp", (1685, 70, 1735, 120), 12, 11, label,
                                    ["anchor_top_menu.bmp"], threshold=0.88):
             raise PendingError("team toolbar immediately left of Friends is missing")
@@ -8865,18 +9042,11 @@ class Scheduler:
                       and key != 'start_managed' and not key.startswith('start_managed_network_')]
         if unresolved:
             raise PendingError('原操作结果尚未核实，不能开始托管：'+', '.join(unresolved))
-        self.ensure_assets(["managed_mode_button.bmp", "managed_start_button.bmp", "other_players_open.bmp", "other_players_closed.bmp"])
+        self.ensure_assets(["managed_mode_button.bmp", "managed_start_button.bmp"])
         self.prepare_main(account)
-        frame = self.capture()
-        if self.template("other_players_open.bmp", (1789, 69, 1919, 159), frame)[0]:
-            self.click_template(account, "other_players_open.bmp", (1789, 69, 1919, 159), 9, 8, "close_other_players", ["other_players_open.bmp"])
-            if not self.wait_template("other_players_closed.bmp", (1789, 69, 1919, 159), 4):
-                raise PendingError("other-player display did not close")
-        elif not self.template("other_players_closed.bmp", (1789, 69, 1919, 159), frame)[0]:
-            raise PendingError("other-player display state unknown")
         self.open_managed_panel_with_retry(account)
-        from hyol_managed import prepare_non_spending_options
-        prepare_non_spending_options(self, account)
+        from hyol_managed import preserve_existing_options
+        preserve_existing_options(self, account)
         from hyol_network_retry import run as retry_network
         hits = 0
         def active_verified():
@@ -9374,11 +9544,17 @@ class Scheduler:
                                  if 50 <= account.tab_x <= 1800})
         else:
             candidates = sorted(set(parse_int_csv(self.config.get("TabXs", "180,310,445,590,730,860"))))
+        cache = getattr(frame, '_hyol_observations', None)
+        key = ('tab_measurements', tuple(candidates))
+        if cache is not None and key in cache:
+            return cache[key]
         measurements: list[tuple[float, float, int]] = []
         for x in candidates:
             patch = np.asarray(frame.crop((x - 12, 12, x + 13, 28)).convert("RGB"), dtype=np.float64)
             luminance = patch.mean(axis=2)
             measurements.append((float((luminance >= 245).mean()), float(np.median(luminance)), x))
+        if cache is not None:
+            cache[key] = measurements
         return measurements
 
     def _generic_active_tab_x(self, frame: Image.Image) -> int:
@@ -9446,7 +9622,8 @@ class Scheduler:
         finally:
             Win32.kernel32.CloseHandle(handle)
         directory = self.shared_state_directory / f'window_{pid}_{self.hwnd}_{creation.value:x}'
-        self.state = StateStore([name], directory=directory)
+        self.state = StateStore([name], directory=directory,
+                                restore_history=getattr(self, 'run_context', None) is None)
         self.account_logs = {name: JsonlLogger(LOGS / "accounts" / f"{slug(name)}.jsonl")}
         self.current_account_only = name
         self.generic_current_tab_x = tab_x

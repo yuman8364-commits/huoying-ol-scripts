@@ -10,9 +10,11 @@ import re
 import json
 import hashlib
 from copy import deepcopy
+from datetime import datetime, timezone, timedelta
+from itertools import permutations
 
 import hyol_scheduler as hs
-from hyol_checkpoints import decode_mask, read_checkpoint
+from hyol_checkpoints import decode_mask, encode_mask, read_checkpoint
 from hyol_daily_tasks import DailyRunner, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, LABELS, PAGE_ANCHORS, PAGE_ROIS, DAILY_ROI, ROW_ROI, WANTED_SELECTED_ROI, GROUP_RETURN_ROI
 from hyol_diagnostics import manual_pause_status
 from hyol_multi_solo import MultiSoloRunner
@@ -28,9 +30,17 @@ DISSOLVE = (1060, 315, 1160, 380)
 PERSONAL_AVATAR_ROI = (0, 69, 45, 149)
 PERSONAL_LEADER_ASSETS = ('team_personal_leader_core.bmp','team_personal_leader_white_core.bmp',
                           'team_personal_leader_text_core_current.bmp')
+PARTY_NAME_ROIS = ((78,225,238,248), (292,225,452,248))
+# The party strip uses a wider font than the main account-name reference.
+PARTY_SERVER_WIDTH = 36
 # These solo receipts are carried unchanged. A new team must still pass the
 # main-page and preformed-room checks; its own unresolved actions always block.
 INDEPENDENT_PENDING_PREFIXES = ('arena_', 'survival_', 'daily_ranking_', 'ranking_', 'mail_', 'welfare_')
+
+
+def group_open_now(current=None):
+    current = current or datetime.now(timezone(timedelta(hours=8)))
+    return current.hour >= 8
 
 
 def legacy_wanted_navigation(key, row, day):
@@ -84,6 +94,59 @@ def wanted_daily_zero(scheduler, frame):
 def same_named_members(current, expected):
     return (len(current) == len(expected) == len(set(current)) == len(set(expected))
             and set(current) == set(expected))
+
+
+def group_reward_zero_confirmed(record):
+    return (type(record.get('daily_remaining')) is int and record['daily_remaining'] == 0
+            and type(record.get('friendship_remaining')) is int and record['friendship_remaining'] == 0
+            and record.get('reward_exhausted') is True and bool(record.get('zero_evidence')))
+
+
+def party_name_masks(frame):
+    if not isinstance(frame, Image.Image):
+        return []
+    masks = [hs.identity_text_mask(frame.crop(roi), 50) for roi in PARTY_NAME_ROIS]
+    return [mask for mask in masks if int(mask.sum()) >= 40
+            and int(mask[:, :PARTY_SERVER_WIDTH].sum()) >= 20]
+
+
+def party_header_matches(proof, frame, members):
+    """Compare only names enrolled alongside a three-frame verified team room."""
+    if (not isinstance(proof, dict) or proof.get('source') != 'verified_team_room'
+            or proof.get('observations') != 3 or not proof.get('evidence')
+            or not same_named_members(proof.get('members', ()), members)
+            or proof.get('owner') not in members):
+        return False
+    try:
+        refs = [decode_mask(row['mask'], tuple(row['shape'])) for row in proof['names']]
+        current = party_name_masks(frame)
+        if len(refs) != len(current) or len(refs) != len(members)-1 or len(refs) not in (1,2):
+            return False
+        scores = []
+        for order in permutations(range(len(current))):
+            pairs = []
+            for ref, index in zip(refs, order):
+                got = current[index]
+                if ref.shape != got.shape or int(ref.sum()) < 40:
+                    return False
+                server = hs.mask_f1(ref[:, :PARTY_SERVER_WIDTH], got[:, :PARTY_SERVER_WIDTH])
+                pairs.append((.6*server+.4*hs.mask_f1(ref, got), server))
+            scores.append((sum(score for score, _server in pairs), pairs))
+        scores.sort(key=lambda row: row[0], reverse=True)
+        return (all(score >= .92 and server >= .92 for score, server in scores[0][1])
+                and (len(scores) == 1 or scores[0][0]-scores[1][0] >= .08))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def enroll_party_header(frames, members, owner, evidence):
+    if len(frames) != 3 or owner not in members or len(members) not in (2,3):
+        return None
+    names = party_name_masks(frames[0])
+    proof = dict(source='verified_team_room', observations=3, owner=owner,
+                 members=list(members), evidence=evidence,
+                 names=[dict(mask=encode_mask(mask), shape=list(mask.shape)) for mask in names])
+    return proof if all(party_header_matches(proof, frame, members) for frame in frames) else None
 
 
 def pipeline_action(record,slot,name):
@@ -153,65 +216,12 @@ def detect_leaders(*, event_sink=None, stop_event=None):
 class PipelineScheduler(SixTabScheduler):
     """Keep the existing identity/foreground guards; never touch another tab to bind."""
 
-    def reassociate_captains(self, expected, completed=()):
-        """Map the saved real captains onto current tabs before binding old actions."""
-        from hyol_checkpoints import current_identity_mask, joint_identity_assignment, identity_mask_scores
-        from hyol_accounts import dismiss_current_final_result
-        self.bind_window(wait=True,timeout_seconds=15)
-        markers = tab_close_positions(self.capture())
-        self.wait_interruptible(.3)
-        if markers != tab_close_positions(self.capture()):
-            raise hs.PendingError('队长恢复时标签位置变化，保留原断点')
-        centers = active_tab_centers(markers)
-        self.accounts = [hs.Account(i,f'当前窗口标签{i}',x) for i,x in enumerate(centers,1)]
-        self.by_name = {a.name:a for a in self.accounts}
-        self.config['TabXs'] = ','.join(map(str,centers))
-        refs = read_checkpoint(self.shared_state_directory/'account_identities.json')
-        samples = [{},{},{}]
-        leaders,evidence = set(),{}
-        for account in self.accounts:
-            try:
-                frame = self.switch_account(account)
-                frame = dismiss_current_final_result(self, account, frame)
-                masks,badges = [],[]
-                for sample in range(3):
-                    self.check_stop()
-                    if self._generic_active_tab_x(frame) != account.tab_x:
-                        raise hs.PendingError('队长恢复观察时当前标签变化')
-                    masks.append(current_identity_mask(frame,getattr(self,'templates',None)))
-                    badges.append(portrait_leader_present(self,frame))
-                    if sample < 2:
-                        self.wait_interruptible(.35);frame=self.capture()
-                if max(int(m.sum()) for m in masks) < 50:
-                    continue
-                if min(int(m.sum()) for m in masks) < 50 or any(hs.mask_f1(masks[0],m) < .92 for m in masks[1:]):
-                    raise hs.PendingError('队长恢复三帧实名不一致，保留原断点')
-                if any(max(identity_mask_scores(m,refs).values(),default=0) < .92 for m in masks):
-                    continue
-                for rows,mask in zip(samples,masks):rows[account.index] = mask
-                if all(badges):leaders.add(account.index)
-                evidence[account.index] = str(self.save_raw_evidence(frame,account,'pipeline_captain_position','verified'))
-            except hs.AccountOffline:
-                continue
-        mappings = [joint_identity_assignment(rows,refs)[0] for rows in samples]
-        if not mappings[0] or any(mapping != mappings[0] for mapping in mappings[1:]):
-            raise hs.PendingError('队长恢复三帧联合实名未唯一确认，保留原断点')
-        physical = {name:index for index,name in mappings[0].items()}
-        located = {slot:physical[name] for slot,name in expected.items() if name in physical
-                   and (physical[name] in leaders or slot in completed)}
-        if len(set(located.values())) != len(located):
-            raise hs.PendingError('原队长映射重叠，保留原断点')
-        positions = {slot:centers[index-1] for slot,index in located.items()}
-        remaining = [x for x in centers if x not in positions.values()]
-        for slot in range(1,len(centers)+1):
-            if slot not in positions:positions[slot]=remaining.pop(0)
-        result = dict(physical_tabs=located,positions=positions,identity_mapping=mappings[0],
-                      evidence=evidence,unavailable=sorted(set(expected)-set(located)))
-        self.event('pipeline_captains_reassociated',mapping=located,evidence=evidence,
-                   detail='原实名队长三帧已核实；仅恢复当前标签位置，原批次及场次保留')
-        return result
 
     def switch_account(self, account, verify=True):
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing:
+            frame = context.select(self, account, allow_hidden=not verify,allow_transition=True)
+            return self.clear_pipeline_interference(self.by_name[account.name], frame)
         prior = getattr(self,'_capture_account',None)
         self._capture_account = account
         try:
@@ -546,6 +556,9 @@ class LeaderActivityRunner(DailyRunner):
         if self.visible(detail,roi,frame):
             participate = (1051,569,1351,819)
             if self.visible('daily_participate_disabled_current.bmp',participate,frame,.98):
+                if task == 'group' and not group_open_now():
+                    self.skip_closed_group(rec, frame)
+                    return
                 raise hs.PendingError('活动未开放或不可参与，队伍保持待续')
             nav['phase'] = 'arriving'
             nav.update(last_progress_at=time.time(),deferred_at_progress=nav.get('deferred_seconds',0))
@@ -602,8 +615,40 @@ class LeaderActivityRunner(DailyRunner):
             move_cursor_clear(s)
         self.save()
 
+    def skip_closed_group(self, rec, frame):
+        s = self.scheduler
+        entry = self.action(f'group_{rec.get("completed", 0)}_entry_participate')
+        if (rec.get('phase', 'ready') != 'ready' or rec.get('intent')
+                or s.state.action_status(self.account.name, entry) == 'pending'):
+            raise hs.PendingError('副本存在原入场或战斗未决，不能按未开放跳过')
+        if not s.verify_identity(self.account, frame)[0]:
+            raise hs.PendingError('未开放副本的队长实名未确认')
+        self.samples['group_not_open'] = self.samples.get('group_not_open', 0)+1
+        if self.samples['group_not_open'] < 3:
+            return
+        evidence = str(s.save_raw_evidence(frame, self.account, 'pipeline_group_not_open', 'verified'))
+        rec['availability'] = dict(status='not_open', reason='当前不在开放时间',
+            opening_hours='08:00—24:00', at=hs.now_iso(), evidence=evidence,
+            task_credit=False, original_navigation=deepcopy(rec.get('navigation', {})))
+        self.save()
+        self.click('daily_practice_close.bmp', (1360,210,1470,285), 20,20,
+                'group_not_open_close', ['daily_practice_anchor.bmp','daily_practice_title_core_current.bmp'],
+                threshold=.98, anchor_threshold=.98)
+        if not s.wait_until_main(6):
+            raise hs.PendingError('未开放副本关页回村未确认，暂不进入通缉')
+        rec.pop('navigation', None)
+        rec['availability']['home_returned'] = True
+        if not hasattr(self.owner, '_not_open_tasks'):
+            self.owner._not_open_tasks = set()
+        self.owner._not_open_tasks.add((self.slot['leader_slot'], 'group'))
+        self.save()
+        self.owner.event('pipeline_task_not_open', self.account, task='group_instance',
+            evidence=evidence, detail='组队副本当前不在开放时间（08:00—24:00），本轮跳过，继续通缉；未计完成')
+
     def finish_task(self, task, rec):
         s = self.scheduler
+        if task == 'group' and not group_reward_zero_confirmed(rec):
+            raise hs.PendingError('副本今日剩余奖励尚未正向确认归零，不能结束或解散；保留原场次')
         if task == 'group' and self.visible(PAGE_ANCHORS[task],PAGE_ROIS[task]):
             self.close_page(task)
             return
@@ -619,7 +664,15 @@ class LeaderActivityRunner(DailyRunner):
     def tick(self, task):
         s, rec = self.scheduler, self.record(task)
         self.next_poll_seconds = .6
-        f = s.switch_account(self.account)
+        if getattr(s,'run_context',None):
+            f = s.switch_account(self.account,verify=rec.get('phase','ready') in ('ready','verify_members'))
+            self.account = s.by_name[self.account.name]
+        else:
+            f = s.switch_account(self.account)
+        if task == 'group' and not (self.daily_page_present(f)
+                and self.visible('daily_group_detail_current.bmp', (1090,310,1220,350), f, .98)
+                and self.visible('daily_participate_disabled_current.bmp', (1051,569,1351,819), f, .98)):
+            self.samples['group_not_open'] = 0
         if task == 'group' and self.visible('group_solo_warning_current.bmp',(760,480,1150,540),f,.95):
             self.cancel_rejected_group_entry(rec,f)
             return
@@ -632,6 +685,11 @@ class LeaderActivityRunner(DailyRunner):
             self.finish_task(task,rec)
             return
         if rec.get('phase') == 'verify_members':
+            if task == 'group' and self.owner.group_party_verified(self.account, self.slot, f):
+                rec.update(phase='ready',last_progress=time.time())
+                self.next_poll_seconds = .05
+                self.save()
+                return
             if self.visible(PAGE_ANCHORS[task],PAGE_ROIS[task],f):
                 self.close_page(task)
                 return
@@ -677,6 +735,9 @@ class LeaderActivityRunner(DailyRunner):
                         self.save()
                     return
                 self.samples['group_zero'] = 0
+                self.event('pipeline_group_remaining', task='group', daily_remaining=daily,
+                           friendship_remaining=friend, next_battle=rec['completed']+1,
+                           detail=f'今日剩余{daily}次，友情剩余{friend}次；继续副本第{rec["completed"]+1}场')
                 rec.update(phase='running',reward_before=remaining,daily_before=daily,friend_before=friend,
                            counter_scope='daily_and_friendship',last_progress=time.time())
                 self.save()
@@ -761,17 +822,31 @@ class LeaderActivityRunner(DailyRunner):
             remaining = daily+friend
             if remaining == rec['reward_before']-1:
                 self.samples['group'] = self.samples.get('group',0)+1
+                verified = self.owner.group_party_verified(self.account, self.slot, f)
+                self.samples['group_party'] = self.samples.get('group_party',0)+1 if verified else 0
                 if self.samples['group'] >= 3:
-                    rec.update(completed=battle,phase='verify_members',last_progress=time.time())
+                    continued = self.samples.get('group_party',0) >= 3
+                    evidence = str(s.save_raw_evidence(f,self.account,f'pipeline_group_{battle}_settled','verified'))
+                    rec.update(completed=battle,phase='ready' if continued else 'verify_members',
+                               daily_remaining=daily,friendship_remaining=friend,last_progress=time.time())
+                    rec.setdefault('battle_history', []).append(dict(
+                        battle=battle,daily_remaining=daily,friendship_remaining=friend,
+                        evidence=evidence,party_verified=continued))
                     self.samples['group'] = 0
+                    self.samples['group_party'] = 0
+                    self.next_poll_seconds = .05
                     self.save()
                     self.event('pipeline_battle_complete',task='group',completed=battle,remaining=remaining,
                                daily_remaining=daily,friendship_remaining=friend,
-                               detail=f'副本第{battle}场结算；本日剩余{daily}，友情剩余{friend}')
+                               evidence=evidence,
+                               detail=f'副本第{battle}场结算；今日剩余{daily}，友情剩余{friend}；'
+                                   + ('继续下一场' if remaining else '奖励已归零，核实收尾'))
                 return
             self.samples['group'] = 0
+            self.samples['group_party'] = 0
         else:
             self.samples['group'] = 0
+            self.samples['group_party'] = 0
         result = s._team_result_template(f)
         reward = s._team_reward_result_visible(f)
         if not (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)):
@@ -805,7 +880,7 @@ class LeaderActivityRunner(DailyRunner):
 class TeamPipelineRunner:
     def __init__(self, leaders=(), tasks=TEAM_TASKS, solo_tasks=DEFAULT_SOLO_OPTIONS,
                  *, arena_wins=5, formation='keep', managed_enabled=True, event_sink=None, root=hs.ROOT,
-                 new_request=False):
+                 run_context=None):
         if (len(leaders) > 6 or len(set(leaders)) != len(leaders)
                 or any(type(slot) is not int or slot not in range(1,7) for slot in leaders)):
             raise ValueError('队长标签须互不重复；留空可自动识别')
@@ -817,14 +892,14 @@ class TeamPipelineRunner:
             raise ValueError('竞技场追加胜场须为1～10')
         if formation not in ('keep','main','fast') or type(managed_enabled) is not bool:
             raise ValueError('阵容或最后托管选项无效')
-        if type(new_request) is not bool:
-            raise ValueError('新批次选项必须为开启或关闭')
-        self.new_request = new_request
         self.leaders = tuple(leaders)
         self.tasks = tuple(t for t in TEAM_TASKS if t in tasks)
         self.solo_tasks, self.arena_wins, self.formation = tuple(solo_tasks), arena_wins, formation
         self.managed_enabled, self.root, self.sink = managed_enabled, Path(root), event_sink
-        self.scheduler = PipelineScheduler(event_sink)
+        from hyol_run_context import RunContext
+        self.run_context = run_context or RunContext.create(self.root)
+        with self.run_context.activate():
+            self.scheduler = PipelineScheduler(event_sink)
         self.scheduler.command_kind = 'team_pipeline'
         self.scheduler.config['AllowMarketPurchase'] = '0'
         self.path = self.scheduler.shared_state_directory / 'team_pipeline_latest.json'
@@ -833,6 +908,7 @@ class TeamPipelineRunner:
         self._poll_clock = time.monotonic
         self.solo = None
         self.solo_exclusions = {}
+        self._not_open_tasks = set()
 
     def save(self):
         self.record['updated_at'] = hs.now_iso()
@@ -845,88 +921,19 @@ class TeamPipelineRunner:
         return dict(leaders=list(self.leaders),team_tasks=list(self.tasks),solo_tasks=list(self.solo_tasks),
                     arena_wins=self.arena_wins,formation=self.formation,final_managed=self.managed_enabled)
 
-    def restore(self):
-        saved = read_checkpoint(self.path)
-        key = self.request_key()
-        if getattr(self, 'new_request', False) and saved:
-            original = self.path.read_bytes()
-            identifier = saved.get('id')
-            if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{32}', identifier):
-                raise hs.PendingError('原双队长批次编号无法核验，不覆盖原断点')
-            archive = self.path.parent/'team_pipeline_archive'/(
-                identifier+'_'+hashlib.sha256(original).hexdigest()[:16]+'.json')
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            if archive.exists():
-                if archive.read_bytes() != original:
-                    raise hs.PendingError('原双队长批次归档冲突，不覆盖原断点')
-            else:
-                with archive.open('xb') as handle:
-                    handle.write(original)
-            self.previous_request = dict(id=identifier, archive=str(archive), status=saved.get('phase'),
-                                         source_day=saved.get('source_day'))
-            self.event('pipeline_previous_request_preserved', detail='新批次已明确请求；原任务及未决动作保留',
-                       archive=str(archive))
-            saved = {}
-        if saved:
-            if saved.get('request') != key:
-                if saved.get('phase') != 'done':
-                    raise hs.PendingError('已有双队长流程未结束，先恢复原队长和任务选择')
-                saved = {}
-            elif saved.get('phase') == 'done' and saved.get('execution_day',saved.get('source_day')) != self.scheduler.state.day:
-                saved = {}
-            elif saved.get('phase') != 'done':
-                prior = saved.get('active_session_token',saved.get('session_token'))
-                day_changed = saved.get('execution_day',saved.get('source_day')) != self.scheduler.state.day
-                if prior != self.scheduler.session_token or day_changed:
-                    from hyol_accounts import session_is_alive
-                    from hyol_history import archive_bytes, session_started_at
-                    if (self.scheduler.config.get('HistoricalPendingPolicy') != 'isolate_inactive'
-                            or session_started_at(prior) is None or session_is_alive(prior)
-                            or session_started_at(self.scheduler.session_token) is None
-                            or session_started_at(prior) >= session_started_at(self.scheduler.session_token)):
-                        raise hs.PendingError('原游戏会话仍活跃或起点无法核实，保留跨日断点，不重新开战')
-                    confirmed = {index:slot['owner'] for index,slot in saved.get('teams',{}).items()
-                                 if slot.get('owner') and slot.get('owner') ==
-                                 self.scheduler._bound_identity_names.get(int(index))}
-                    if not confirmed:
-                        raise hs.PendingError('跨会话恢复的原队长未连续确认，保留断点')
-                    archive = archive_bytes(self.path,self.path.parent)
-                    saved.setdefault('resume_history',[]).append(dict(
-                        previous_session=prior,execution_day=self.scheduler.state.day,archive=archive,
-                        outcome='historical_unknown' if day_changed else 'resume_same_day',
-                        confirmed_captains=confirmed))
-                    for slot in saved['teams'].values():
-                        if slot.get('status') != 'done':
-                            prior_need = slot.get('needs_inactive_resume',{})
-                            slot['needs_inactive_resume'] = dict(
-                                cross_day=day_changed or prior_need.get('cross_day',False),
-                                archive=prior_need.get('archive',archive))
-                    saved['active_session_token'] = self.scheduler.session_token
-                    saved['execution_day'] = self.scheduler.state.day
-        self.record = saved or dict(id=uuid.uuid4().hex,request=key,source_day=self.scheduler.state.day,
-                                   session_token=self.scheduler.session_token,
-                                   phase='teams',teams={str(i):dict(status='new',tasks={}) for i in self.leaders})
-        self.record.setdefault('execution_day',self.record['source_day'])
-        if not saved:
-            self.record['required_account_count'] = len(self.scheduler._bound_identity_names)
-            self.record['expected_accounts'] = sorted(set(self.scheduler._bound_identity_names.values()))
-        if getattr(self, 'new_request', False):
-            self.record['required_account_count'] = len(self.scheduler._bound_identity_names)
-            self.record['expected_accounts'] = sorted(set(self.scheduler._bound_identity_names.values()))
-            if getattr(self, 'previous_request', None):
-                self.record['previous_request'] = self.previous_request
-            self.new_request = False
-        for index in self.leaders:
-            owner = self.record['teams'][str(index)].get('owner')
-            current = self.scheduler._bound_identity_names.get(index)
-            if owner and current and owner != current:
-                self.record['teams'][str(index)].update(status='pending',
-                    last_error='原队长角色未确认，整队保留断点；其他已确认队伍继续')
-        if self.record['phase'] == 'solo' and any(t.get('status') == 'pending' for t in self.record['teams'].values()):
-            self.record['phase'] = 'teams'
+
+
+    def initialize_run(self):
+        s = self.scheduler
+        self.record = dict(id=self.run_context.identifier, request=self.request_key(),
+            source_day=s.state.day, execution_day=s.state.day, session_token=s.session_token,
+            phase='teams', teams={str(i):dict(status='new',tasks={}) for i in self.leaders},
+            required_account_count=len(s._bound_identity_names),
+            expected_accounts=sorted(set(s._bound_identity_names.values())))
         self.save()
 
-    def snapshot(self, account):
+
+    def snapshot(self, account, *, leave_open=False):
         s = self.scheduler
         if not s.main_ready():
             raise hs.PendingError('队长未确认主界面，不能打开队伍覆盖战斗')
@@ -938,6 +945,8 @@ class TeamPipelineRunner:
         refs = {name:decode_mask(row['mask'],tuple(row['shape']))
                 for name,row in s._known_identity_materials.items()}
         result = None
+        observed = []
+        verified = False
         try:
             for sample in range(3):
                 s.check_stop()
@@ -952,15 +961,33 @@ class TeamPipelineRunner:
                         or result is not None and got != result):
                     raise hs.PendingError('已有队伍人数或实名成员未连续核实')
                 result = got
+                observed.append(frame)
                 if sample < 2:
                     s.wait_interruptible(.35)
             evidence = str(s.save_raw_evidence(frame,account,'pipeline_existing_team','verified'))
+            slot = self.record.get('teams', {}).get(str(account.index), {})
+            proof = enroll_party_header(observed, result, slot.get('owner'), evidence)
+            if proof is not None:
+                slot['party_header'] = proof
+            verified = True
             return result,evidence
         finally:
-            if not s.click_template(account,'team_room_close.bmp',ROOM,20,20,'pipeline_snapshot_close',['team_room_close.bmp']):
+            if leave_open and verified:
+                pass
+            elif not s.click_template(account,'team_room_close.bmp',ROOM,20,20,'pipeline_snapshot_close',['team_room_close.bmp']):
                 raise hs.PendingError('队伍房间关闭未确认')
-            if not s.wait_until_main(6):
+            if not (leave_open and verified) and not s.wait_until_main(6):
                 raise hs.PendingError('队伍房间关闭后未确认主界面')
+
+    def group_party_verified(self, account, slot, frame):
+        if not isinstance(frame, Image.Image) or not slot.get('party_header'):
+            return False
+        s = self.scheduler
+        return (s.template('group_title_current.bmp', PAGE_ROIS['group'], frame, threshold=.98)[0]
+                and s.template('team_instance_close.bmp', (1370,240,1460,330), frame, threshold=.98)[0]
+                and portrait_leader_present(s, frame)
+                and s.verify_identity(account, frame)[0]
+                and party_header_matches(slot['party_header'], frame, slot.get('members', ())))
 
     def block(self, slot, detail, offline=False):
         slot.update(status='pending',last_error=str(detail))
@@ -981,115 +1008,34 @@ class TeamPipelineRunner:
         for index in self.leaders:
             slot = self.record['teams'][str(index)]
             slot['leader_slot'] = index
-            if slot.get('status') == 'done':
-                continue
             account = s.accounts[index-1]
             try:
                 if index not in s._bound_identity_names:
-                    reason = getattr(s,'_unavailable_reasons',{}).get(index)
-                    if reason == 'offline_prompt':
-                        raise hs.AccountOffline(account, '该队长当前显示掉线弹窗')
-                    raise hs.PendingError('队长实名未唯一确认，本队待续；请查看身份核验截图')
-                owner = s._bound_identity_names[index]
-                if slot.get('owner') and slot['owner'] != owner:
-                    raise hs.PendingError('队长角色与原请求不一致')
-                slot['owner'] = owner
-                if slot.get('needs_inactive_resume',{}).get('cross_day'):
-                    from hyol_history import prove_idle_identity, isolate_inactive_work
-                    s.switch_account(account)
-                    proof = prove_idle_identity(s,account)
-                    members,evidence = self.snapshot(account)
-                    if not same_named_members(slot.get('members',[]),members):
-                        raise hs.PendingError('跨日恢复的原队伍成员改变，整队待续')
-                    if any(task != 'wanted' and rec.get('status') != 'done'
-                           for task,rec in slot['tasks'].items()):
-                        raise hs.PendingError('原副本结果未核实，保留场次，不重开副本')
-                    isolate_inactive_work(s,account,proof=proof)
-                    rec = slot['tasks'].get('wanted',{})
-                    if rec and rec.get('status') != 'done':
-                        slot.setdefault('historical_tasks',[]).append(dict(
-                            task='wanted',record=deepcopy(rec),outcome='historical_unknown',proof=proof,
-                            archive=slot['needs_inactive_resume']['archive']))
-                        slot['tasks']['wanted'] = dict(status='new',phase='ready',completed=0,
-                                                      source_day=s.state.day,attempt_id=uuid.uuid4().hex)
-                    slot.update(team_evidence=evidence,members=list(members))
-                    slot.pop('needs_inactive_resume')
-                    self.save()
-                actions = s.state.accounts[account.name].get('actions',{})
-                navigation = [key for key,row in actions.items() if isinstance(row,dict)
-                              and row.get('status') == 'pending' and 'wanted' in self.tasks
-                              and legacy_wanted_navigation(key,row,s.state.day)]
-                conflicting = [key for key,row in actions.items() if isinstance(row,dict)
-                               and row.get('status') == 'pending'
-                               and not key.startswith('pipeline_'+self.record['id']+'_')
-                               and not key.startswith(INDEPENDENT_PENDING_PREFIXES)]
-                conflicting = [key for key in conflicting if key not in navigation]
-                if conflicting:
-                    raise hs.PendingError('队长存在原队伍或未知动作未决，先按原流程对账：' + ', '.join(conflicting))
-                slot['legacy_navigation'] = navigation
-                if (slot.get('phase') == 'dissolve' or all(
-                        slot['tasks'].get(TASK_KEYS[t],{}).get('status') == 'done' for t in self.tasks)):
-                    slot['status'] = 'complete'
-                    self.save()
-                    continue
+                    if getattr(s,'_unavailable_reasons',{}).get(index) == 'offline_prompt':
+                        raise hs.AccountOffline(account,'该队长当前已掉线')
+                    raise hs.PendingError('队长身份未唯一确认，本队暂缓')
+                slot['owner'] = s._bound_identity_names[index]
                 frame = s.switch_account(account)
-                for task, rec in slot['tasks'].items():
-                    nav = rec.get('navigation')
-                    action = pipeline_action(self.record,slot,f'{task}_{rec.get("completed",0)}_entry_participate')
-                    if (nav and nav.get('phase') == 'arriving' and rec.get('phase','ready') == 'ready'
-                            and not rec.get('intent') and task == 'group'
-                            and s.state.action_status(account.name,'pipeline_'+self.record['id']+'_'
-                                +f'group_{rec.get("completed",0)+1}_select') == 'new'
-                            and daily_page_present(s,frame)
-                            and s.template('daily_group_detail_current.bmp',(1090,310,1220,350),frame,threshold=.98)[0]
-                            and s.template('daily_participate.bmp',(1051,569,1351,819),frame,threshold=.98)[0]
-                            and not s.template('daily_participate_disabled_current.bmp',(1051,569,1351,819),frame,threshold=.98)[0]):
-                        nav.update(phase='open',started_at=time.time(),last_progress_at=time.time(),scrolls=0,
-                                   deferred_seconds=0,deferred_at_progress=0,
-                                   recovered_entry_only=True)
-                        self.event('pipeline_navigation_retry',account,task=task,
-                                   detail='当前仍是未入场的副本导航页；只恢复导航，原参与记录等活动页正向核实')
-                    if (nav and nav.get('phase') == 'open' and rec.get('phase','ready') == 'ready'
-                            and not rec.get('intent') and s.state.action_status(account.name,action) == 'new'):
-                        nav.update(started_at=time.time(),last_progress_at=time.time(),scrolls=0,
-                                   deferred_seconds=0,deferred_at_progress=0)
-                        self.event('pipeline_navigation_retry',account,task=task,
-                                   detail='尚未发送参与动作，重新核验可恢复的导航')
-                if (any(rec.get('navigation',{}).get('phase') == 'open'
-                        and rec.get('phase','ready') == 'ready' and not rec.get('intent')
-                        for rec in slot['tasks'].values())
-                        and daily_page_present(s,frame)):
-                    if not s.click_template(account,'daily_practice_close.bmp',(1370,200,1460,280),
-                                            20,20,'pipeline_navigation_retry_close',
-                                            ['daily_practice_anchor.bmp','daily_practice_title_core_current.bmp'],
-                                            threshold=.98,anchor_threshold=.98):
-                        raise hs.PendingError('原导航页面关闭未确认')
-                    if not s.wait_until_main(6):
-                        raise hs.PendingError('原导航页面关闭后主界面未确认')
-                active = any(rec.get('phase') not in ('ready','done') for rec in slot['tasks'].values())
-                if not active:
-                    members,evidence = self.snapshot(account)
-                    if slot.get('members') and not same_named_members(slot['members'],members):
-                        raise hs.PendingError('已有队伍与原成员快照不同，保留整队')
-                    slot.update(members=list(members),team_evidence=evidence)
-                elif not slot.get('members'):
-                    raise hs.PendingError('原活动缺少队伍快照，不根据标签顺序补成员')
-                slot.update(status='running')
-                slot.pop('offline',None)
-                slot.pop('last_error',None)
+                account = s.by_name[account.name]
+                if not s.main_ready(frame):
+                    from hyol_navigation import return_to_leaf
+                    if return_to_leaf(s,account) is not True:
+                        raise hs.PendingError('当前页面未确认回到木叶，本队暂缓')
+                members,evidence = self.snapshot(account)
+                slot.update(members=list(members),team_evidence=evidence,status='running')
                 self.drivers[index] = LeaderActivityRunner(self,account,slot)
                 self.save()
             except hs.AccountOffline as exc:
                 self.block(slot,exc,True)
-            except hs.PendingError as exc:
+            except (hs.PendingError,hs.SafetyError) as exc:
                 self.block(slot,exc)
         occupied = set()
-        for index in self.leaders:
-            slot = self.record['teams'][str(index)]
+        for slot in self.record['teams'].values():
             members = set(slot.get('members',[]))
             if occupied & members:
                 raise hs.PendingError('队长所属队伍重叠，不能重复执行同一队伍')
             occupied.update(members)
+
 
     def defer_navigation(self,active_index,seconds):
         """Charge another team's foreground work only to unsent UI navigation."""
@@ -1125,14 +1071,16 @@ class TeamPipelineRunner:
                 entered=clock()
                 try:
                     task = next((TASK_KEYS[t] for t in self.tasks
-                                 if slot['tasks'].get(TASK_KEYS[t],{}).get('status') != 'done'),None)
+                                 if slot['tasks'].get(TASK_KEYS[t],{}).get('status') != 'done'
+                                 and (index, TASK_KEYS[t]) not in getattr(self, '_not_open_tasks', set())),None)
                     if task is not None:
                         if slot['status'] == 'complete':
                             raise hs.PendingError('原解散阶段仍有任务结果未核实，保留队伍断点')
                         driver = self.drivers[index]
                         self.event('pipeline_team_tick',driver.account,task=task)
                         driver.tick(task)
-                    if all(slot['tasks'].get(TASK_KEYS[t],{}).get('status') == 'done' for t in self.tasks):
+                    if all(slot['tasks'].get(TASK_KEYS[t],{}).get('status') == 'done'
+                           or (index, TASK_KEYS[t]) in getattr(self, '_not_open_tasks', set()) for t in self.tasks):
                         slot['status'] = 'complete'
                         self.save()
                         self.dissolve(index,slot)
@@ -1151,20 +1099,20 @@ class TeamPipelineRunner:
             self.scheduler.wait_interruptible(max(.05,min(due[index] for index in remaining)-clock()))
 
     def dissolve(self,index,slot):
+        if ('group_instance' in self.tasks and (index, 'group') not in getattr(self, '_not_open_tasks', set())
+                and not group_reward_zero_confirmed(slot.get('tasks', {}).get('group', {}))):
+            raise hs.PendingError('副本今日剩余奖励未确认归零，不解散或交接单人')
         s = self.scheduler
         account = s.accounts[index-1]
         s.switch_account(account)
         action = 'pipeline_'+self.record['id']+'_dissolve'
         status = s.state.action_status(account.name,action)
         if status == 'new':
-            members,_ = self.snapshot(account)
+            members,_ = self.snapshot(account,leave_open=True)
             if not same_named_members(members,slot['members']):
                 raise hs.PendingError('解散前队伍成员改变，整队待续')
             slot['phase'] = 'dissolve'
             self.save()
-            s.open_team_room(account,'pipeline_dissolve_open')
-            if not s.wait_template('team_room_close.bmp',ROOM,6):
-                raise hs.PendingError('解散前房间未确认')
             if not s.click_template(account,'team_dissolve_button.bmp',DISSOLVE,25,10,action,
                                     ['team_room_close.bmp'],irreversible=True,threshold=.98):
                 raise hs.PendingError('解散按钮未确认')
@@ -1189,7 +1137,7 @@ class TeamPipelineRunner:
             s.check_stop()
             try:
                 if account.name in pending_members:
-                    raise hs.PendingError('属于原待续队伍，保留队伍和任务')
+                    raise hs.PendingError('本轮组队任务尚未结束，暂缓该队单人任务')
                 s.switch_account(account)
                 evidence = verify_unteamed(s,account)
                 from hyol_navigation import return_to_leaf
@@ -1215,6 +1163,9 @@ class TeamPipelineRunner:
         self.save()
 
     def completed(self):
+        count = self.record.get('required_account_count')
+        if type(count) is not int or not 1 <= count <= 6:
+            return False
         if self.record.get('required_account_count'):
             teams = self.record.get('teams', {})
             if set(teams) != set(map(str, self.leaders)):
@@ -1238,6 +1189,10 @@ class TeamPipelineRunner:
                     if (rec.get('status') != 'done' or rec.get('task_completed') is not True
                             or rec.get('home_returned') is not True or rec.get('followup_check_due')):
                         return False
+                    if task == 'weekend':
+                        from hyol_puzzle import weekend_verified
+                        if not weekend_verified(rec):
+                            return False
                 managed = records.get(name, {}).get('managed', {})
                 if self.managed_enabled and (managed.get('status') != 'done'
                         or managed.get('task_completed') is not True or not managed.get('evidence')):
@@ -1251,6 +1206,7 @@ class TeamPipelineRunner:
                             and slot['tasks'][TASK_KEYS[t]].get('home_returned') is True
                             and slot['tasks'][TASK_KEYS[t]].get('evidence')
                             and slot['tasks'][TASK_KEYS[t]].get('zero_evidence' if t == 'group_instance' else 'empty_evidence')
+                            and (t != 'group_instance' or group_reward_zero_confirmed(slot['tasks'][TASK_KEYS[t]]))
                             for t in self.tasks)
                         for slot in self.record['teams'].values())
                 and self.record.get('solo_result') == 0)
@@ -1258,63 +1214,39 @@ class TeamPipelineRunner:
     def run(self):
         s = self.scheduler
         lease = hs.ForegroundRuntimeLease()
-        if manual_pause_status(self.root).get('paused'):
-            raise hs.PendingError('F12暂停仍在，原断点保留')
         if not lease.acquire():
+            lease.release()
             raise hs.PendingError('已有脚本占用游戏窗口')
         stop = s.stop
         try:
+            self.run_context.begin()
             s.start_f12_monitor()
-            saved = read_checkpoint(self.path)
+            s.bind_session(self.leaders,allow_unavailable=True,leaders_only=True)
             if not self.leaders:
-                if saved.get('phase') not in (None,'done') and not self.new_request:
-                    self.leaders = tuple(saved.get('request',{}).get('leaders',()))
-                else:
-                    s.bind_session((),allow_unavailable=True,leaders_only=True)
-                    self.leaders = s._automatic_captain_slots
-                    if not self.leaders:
-                        raise hs.PendingError('未识别到可核实队长，请先在游戏组成队伍')
-            expected = {i:saved.get('teams',{}).get(str(i),{}).get('owner') for i in self.leaders}
-            reassociation = None
-            if (not self.new_request and saved.get('phase') not in (None,'done')
-                    and saved.get('request') == self.request_key() and all(expected.values())):
-                completed = tuple(i for i in self.leaders if saved['teams'][str(i)].get('status') == 'done')
-                reassociation = s.reassociate_captains(expected,completed)
-                located = tuple(i for i in self.leaders if i in reassociation['physical_tabs'])
-                s.bind_session(located,allow_unavailable=True,leaders_only=True,
-                               tab_positions=reassociation['positions'])
-            else:
-                s.bind_session(self.leaders,allow_unavailable=True,leaders_only=True)
-            self.restore()
-            if reassociation:
-                self.record['captain_reassociation'] = reassociation
-                self.save()
-            if self.record['phase'] == 'done':
-                return 0 if self.completed() else 2
-            if self.record['phase'] == 'teams':
-                self.prepare_teams()
-                self.run_teams()
-                self.record['phase'] = 'solo'
-                self.save()
+                self.leaders = s._automatic_captain_slots
+            if not self.leaders:
+                raise hs.PendingError('未识别到可核实队长，请先在游戏组成队伍')
+            self.initialize_run()
+            self.prepare_teams()
+            self.run_teams()
             s.check_stop()
+            self.record['phase'] = 'solo'
+            self.save()
             self.solo = MultiSoloRunner(self.solo_tasks,config_path=self.root/'HYOL_Daily.ini',
-                                       account_count=6,arena_wins=self.arena_wins,formation=self.formation,
-                                       managed_enabled=self.managed_enabled,event_sink=self.sink)
-            self.solo.scheduler.stop = stop
-            if self.solo.scheduler.state.day != self.record.get('execution_day',self.record['source_day']):
-                raise hs.PendingError('交接期间日期改变；保留原队伍结果，后续单人任务待核实')
+                account_count=6,arena_wins=self.arena_wins,formation=self.formation,
+                managed_enabled=self.managed_enabled,event_sink=self.sink,run_context=self.run_context)
+            if self.solo.scheduler.state.day != self.record['execution_day']:
+                raise hs.PendingError('运行期间日期改变，本轮结束；请重新开始')
             self.scheduler = self.solo.scheduler
             result = self.solo.run(manage_lease=False,before_prepare=self.handoff)
-            if self.record.get('required_account_count'):
-                selected = (*self.solo_tasks, 'managed')
-                self.record['solo_records'] = {
-                    name: deepcopy({task: runner.records.get(task, {}) for task in selected})
-                    for name, runner in self.solo.runners.items()}
+            selected = (*self.solo_tasks, 'managed')
+            self.record['solo_records'] = {name:deepcopy({task:runner.records.get(task,{}) for task in selected})
+                                           for name,runner in self.solo.runners.items()}
             self.record.update(solo_result=result,solo_exclusions=self.solo_exclusions,
-                               solo_initial_unavailable=sorted(self.solo.initial_unavailable),
-                               solo_disconnected=sorted(self.solo.disconnected),
-                               phase='done' if result == 0 and not self.solo_exclusions
-                                   and all(t['status'] == 'done' for t in self.record['teams'].values()) else 'solo')
+                solo_initial_unavailable=sorted(self.solo.initial_unavailable),
+                solo_disconnected=sorted(self.solo.disconnected),
+                phase='done' if result == 0 and not self.solo_exclusions
+                    and all(t['status']=='done' for t in self.record['teams'].values()) else 'solo')
             if not self.completed():
                 self.record['phase'] = 'solo'
             self.save()
@@ -1323,7 +1255,9 @@ class TeamPipelineRunner:
             stop.set()
             lease.release()
 
+
     def summary(self):
+        from hyol_puzzle import weekend_verified
         teams = self.record.get('teams',{})
         done = sum(t.get('status') == 'done' for t in teams.values())
         pending = len(teams)-done
@@ -1333,27 +1267,43 @@ class TeamPipelineRunner:
         reasons = '；'.join(f'标签{index}：{slot["last_error"]}' for index,slot in teams.items()
                            if slot.get('status') == 'pending' and slot.get('last_error'))
         solo_pending = []
-        for account,runner in getattr(getattr(self,'solo',None),'runners',{}).items():
+        records = dict(self.record.get('solo_records', {}))
+        records.update({name: runner.records for name, runner in
+                        getattr(getattr(self, 'solo', None), 'runners', {}).items()})
+        accounts = dict.fromkeys([*self.record.get('expected_accounts', []), *records])
+        for account in accounts:
+            account_records = records.get(account, {})
             for task in self.solo_tasks:
-                rec = runner.records.get(task,{})
+                rec = account_records.get(task,{})
                 if (rec.get('status') == 'done' and rec.get('task_completed')
-                        and rec.get('home_returned') and not rec.get('followup_check_due')):
+                        and rec.get('home_returned') and not rec.get('followup_check_due')
+                        and (task != 'weekend' or weekend_verified(rec))):
                     continue
                 detail = rec.get('last_error') or ('生存补跑未结束' if rec.get('followup_check_due')
-                         else '回村尚未确认' if rec.get('task_completed') else '任务尚未完成')
+                         else '回村尚未确认' if rec.get('task_completed') and not rec.get('home_returned')
+                         else '周末拼图或达摩尚未确认' if task == 'weekend' and not weekend_verified(rec)
+                         else '任务尚未完成')
                 solo_pending.append(dict(account=account,task=task,status=rec.get('status','new'),detail=detail))
-            managed = runner.records.get('managed',{})
-            if self.managed_enabled and managed.get('status') == 'pending':
-                solo_pending.append(dict(account=account,task='managed',status='pending',
+            managed = account_records.get('managed',{})
+            if self.managed_enabled and not (managed.get('status') == 'done'
+                    and managed.get('task_completed') is True and managed.get('evidence')):
+                solo_pending.append(dict(account=account,task='managed',status=managed.get('status','new'),
                                          detail=managed.get('last_error') or '托管尚未确认'))
         solo_reasons = '；'.join(f'{row["account"]}/{LABELS.get(row["task"],row["task"])}：{row["detail"]}'
                                 for row in solo_pending[:6])
+        not_open = [dict(leader=index, task=key, **rec['availability'])
+                    for index, slot in teams.items() for key, rec in slot.get('tasks', {}).items()
+                    if rec.get('status') != 'done' and rec.get('availability', {}).get('status') == 'not_open']
+        complete = self.completed()
         return dict(teams=teams,solo_eligible=self.record.get('solo_eligible',[]),
                     solo_exclusions=self.record.get('solo_exclusions',{}),
-                    solo_pending=solo_pending,
+                    solo_pending=solo_pending,not_open=not_open,
+                    batch_status='complete' if complete else 'pending',
                     offline_skipped=offline,phase=self.record.get('phase'),
-                    detail=f'已完成并解散{done}队；整队待续{pending}队；单人可运行{eligible}号、暂缓{excluded}号、掉线或未绑定跳过{offline}号。'
+                    detail=('整批任务已确认完成。' if complete else '本轮任务未完成。')
+                           + f'组队已完成并解散{done}队；本轮暂缓{pending}队；单人已核实可运行{eligible}号、暂缓{excluded}号、掉线或未绑定跳过{offline}号。'
                            + (reasons+'。' if reasons else '')
+                           + ('组队副本当前不在开放时间，本轮已跳过并继续后续任务；未计完成。' if not_open else '')
                            + (f'单人待处理{len(solo_pending)}项：'+solo_reasons
                               +('；其余原因见运行日志。' if len(solo_pending)>6 else '。') if solo_pending else ''))
 
@@ -1364,6 +1314,13 @@ def verify_unteamed(scheduler,account):
     f=s.capture()
     if s.active!=account or s._generic_active_tab_x(f)!=account.tab_x:
         raise hs.SafetyError('无队检查标签与当前账号不一致')
+    if s.template('market_anchor.bmp', (651,69,1251,319), f, threshold=.98)[0]:
+        from hyol_navigation import close_black_market
+        if close_black_market(s, account, frame=f) is not True:
+            raise hs.PendingError('黑市关闭后的主界面尚未核实，暂不打开无队检查')
+        f = s.capture()
+        if s.active != account or s._generic_active_tab_x(f) != account.tab_x:
+            raise hs.SafetyError('黑市关闭后标签变化，未打开组队页面')
     def room_region(frame):
         if (s.template('team_public_room_title_current.bmp',(900,230,1100,315),frame,threshold=.98)[0]
                 and s.template('team_room_close.bmp',PUBLIC_ROOM,frame,threshold=.98)[0]):
@@ -1374,16 +1331,25 @@ def verify_unteamed(scheduler,account):
     known_room=room is not None and s.template('team_create_button.bmp',CREATE,f,threshold=.98)[0]
     if not known_room:
         for attempt in range(2):
+            # A panel can arrive in the final capture after wait_template
+            # expires. Inspect that fresh scene before another toolbar click.
+            room=room_region(f)
+            if room is not None:
+                if s.template('team_create_button.bmp',CREATE,f,threshold=.98)[0]:
+                    break
+                raise hs.PendingError('队伍房间内未正向确认无队，保留当前页面')
             if not s.main_ready(f):
                 raise hs.PendingError('账号不在可核实主界面，原结算/战斗保留')
             if attempt and (not s.verify_identity(account,f)[0]
-                    or not s.template('team_toolbar.bmp',(1650,69,1770,149),f,threshold=.98)[0]):
+                    or not (s.template('team_toolbar_core_current.bmp',(1685,70,1735,120),f,threshold=.98)[0]
+                            or s.template('team_toolbar.bmp',(1650,69,1770,149),f,threshold=.98)[0])):
                 raise hs.PendingError('无队检查入口重试前身份或图标未确认')
             s.open_team_room(account,'pipeline_verify_solo_open')
-            if s.wait_template('team_create_button.bmp',CREATE,6):
-                f=s.capture();room=room_region(f)
-                if room is not None:break
+            s.wait_template('team_create_button.bmp',CREATE,6)
             f=s.capture()
+            room=room_region(f)
+            if room is not None and s.template('team_create_button.bmp',CREATE,f,threshold=.98)[0]:
+                break
         else:
             raise hs.PendingError('无队检查房间未确认')
     try:

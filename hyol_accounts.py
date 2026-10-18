@@ -119,7 +119,7 @@ def collect_current_identity(scheduler, account, frame=None):
     import hyol_scheduler as hs
     from hyol_checkpoints import current_identity_mask
     masks, badges = [], []
-    for sample in range(3):
+    for sample in range(5):
         scheduler.check_stop()
         frame = frame if sample == 0 and frame is not None else scheduler.capture()
         if scheduler.offline_dialog_visible(frame):
@@ -128,7 +128,11 @@ def collect_current_identity(scheduler, account, frame=None):
             raise hs.PendingError('采集身份时当前标签变化，未注册账号')
         masks.append(current_identity_mask(frame, scheduler.templates))
         badges.append(is_captain(scheduler, frame))
-        if sample < 2:
+        if (len(masks) >= 3 and min(int(mask.sum()) for mask in masks[-3:]) >= 50
+                and all(hs.mask_f1(masks[-3],mask) >= .92 for mask in masks[-2:])):
+            masks, badges = masks[-3:], badges[-3:]
+            break
+        if sample < 4:
             scheduler.wait_interruptible(.35)
     if (min(int(mask.sum()) for mask in masks) < 50
             or any(hs.mask_f1(masks[0], mask) < .92 for mask in masks[1:])):
@@ -359,20 +363,29 @@ def _observe_accounts(scheduler):
         raise hs.PendingError('当前支持1～6个稳定游戏标签')
     scheduler.config['TabXs'] = ','.join(map(str, centers))
     scheduler._observed_captain_tabs = {}
+    scheduler.event('account_scan_started', count=len(centers))
     observations, frames, unavailable = {}, {}, {}
     for slot, x in enumerate(centers, 1):
         scheduler.check_stop()
         account = hs.Account(slot, f'当前窗口标签{slot}', x)
-        scheduler.chrome_click(x, 10, f'observe_account:{slot}', account)
-        scheduler.wait_interruptible(.8)
         frame = scheduler.capture()
+        try:
+            selected = scheduler._generic_active_tab_x(frame) == x
+        except hs.PendingError:
+            selected = False
+        if not selected:
+            scheduler.chrome_click(x, 10, f'observe_account:{slot}', account)
+            scheduler.wait_interruptible(.35)
+            frame = scheduler.capture()
         if (scheduler.offline_dialog_visible(frame)
                 or scheduler.template('offline_login_prompt.bmp',(780,450,1140,660),frame,threshold=.98)[0]):
             unavailable[slot] = 'offline_prompt'
             scheduler.event('account_disconnected_skipped', account, identity='unconfirmed')
             continue
         try:
+            from hyol_identity_overlays import dismiss_identity_overlays
             frame = dismiss_current_final_result(scheduler, account, frame)
+            frame = dismiss_identity_overlays(scheduler, account, frame)
             observations[slot], frames[slot] = collect_current_identity(scheduler, account, frame)
         except hs.AccountOffline:
             unavailable[slot] = 'offline_prompt'
@@ -388,11 +401,12 @@ def _observe_accounts(scheduler):
 def register_observations(scheduler, observations):
     from hyol_checkpoints import read_checkpoint
     import hyol_scheduler as hs
-    path = scheduler.shared_state_directory/'account_identities.json'
+    path = getattr(scheduler, 'identity_directory', scheduler.shared_state_directory)/'account_identities.json'
     original = read_checkpoint(path)
     refs = deepcopy(original)
     for key, row in refs.items():
-        row['has_unresolved_work'] = _has_unresolved_work(scheduler.shared_state_directory, key)
+        row['has_unresolved_work'] = (False if getattr(scheduler, 'run_context', None)
+                                      else _has_unresolved_work(scheduler.shared_state_directory, key))
     mapping, refs = resolve_observations(observations, refs)
     for row in refs.values():
         row.pop('has_unresolved_work', None)
@@ -414,12 +428,15 @@ def discover_accounts(scheduler):
     scheduler.accounts = accounts
     scheduler.by_name = {account.name:account for account in accounts}
     scheduler.identity_candidates = tuple(hs.Account(i+1,key,0) for i,key in enumerate(refs))
-    scheduler.state = hs.StateStore([a.name for a in accounts], directory=scheduler.shared_state_directory)
+    scheduler.state = hs.StateStore([a.name for a in accounts], directory=scheduler.shared_state_directory,
+                                    restore_history=getattr(scheduler, 'run_context', None) is None)
     scheduler.available_account_names = {a.name for a in accounts}
     scheduler.joint_identity_bound = set(scheduler.available_account_names)
     scheduler._dynamic_identity_materials = refs
     scheduler._dynamic_identity_masks = {slot:masks[-1] for slot,masks in observations.items()}
     scheduler._dynamic_identity_names = mapping
+    if getattr(scheduler, 'run_context', None):
+        scheduler.run_context.remember(centers,mapping,observations,frames,refs,unavailable)
     scheduler._unavailable_reasons = unavailable
     scheduler.config['TabAccountNames'] = ','.join(a.name for a in accounts)
     scheduler.account_logs = {a.name:hs.JsonlLogger(hs.LOGS/'accounts'/(hs.slug(a.name)+'.jsonl')) for a in accounts}
@@ -437,7 +454,9 @@ def bind_visible_identity(scheduler, anonymous):
     """Enroll the already-selected current account, preserving old anonymous guards."""
     import hyol_scheduler as hs
     from hyol_checkpoints import joint_identity_assignment
+    from hyol_identity_overlays import dismiss_identity_overlays
     frame = dismiss_current_final_result(scheduler, anonymous)
+    frame = dismiss_identity_overlays(scheduler, anonymous, frame)
     masks, _frame = collect_current_identity(scheduler, anonymous, frame)
     try:
         mapping, _refs = register_observations(scheduler, {anonymous.index:masks})
@@ -482,11 +501,19 @@ def verify_dynamic_identity(scheduler, account, frame):
     from hyol_checkpoints import current_identity_mask, joint_identity_assignment
     refs = scheduler._dynamic_identity_materials
     expected = scheduler.state.aliases.get(account.name, account.name)
+    bound = getattr(scheduler, '_dynamic_identity_names', {})
+    cache = getattr(frame, '_hyol_observations', None)
+    key = ('dynamic_identity', expected, account.index, account.tab_x, id(refs),
+           id(getattr(scheduler,'_dynamic_identity_masks',None)), tuple(bound.items()))
+    if cache is not None and key in cache:
+        return cache[key]
     mask = current_identity_mask(frame, scheduler.templates)
     masks = dict(getattr(scheduler, '_dynamic_identity_masks', {}))
     masks[account.index] = mask
     mapping, matrix, _gap = joint_identity_assignment(masks, refs)
-    bound = getattr(scheduler, '_dynamic_identity_names', {})
-    return (mapping.get(account.index) == expected
+    result = (mapping.get(account.index) == expected
             and all(mapping.get(slot) == key for slot,key in bound.items())
             and scheduler._generic_active_tab_x(frame) == account.tab_x), matrix.get(account.index, {})
+    if cache is not None:
+        cache[key] = result
+    return result

@@ -1,4 +1,4 @@
-"""Positively disable spending in the game's managed settings before starting."""
+"""Start managed mode with the user's existing in-game settings unchanged."""
 TITLE = 'managed_settings_title_current.bmp'
 TITLE_ROI = (750,190,1170,290)
 TITLE_ORIGIN = (875,224)
@@ -55,52 +55,18 @@ def option_state(s, key, checkbox_roi, label_roi, frame):
     return 'checked' if checked else 'unchecked'
 
 
-def prepare_non_spending_options(s, account):
-    """Only click positively checked boxes; never toggle an unchecked option."""
+def preserve_existing_options(s, account):
+    """Observe the start panel; never inspect/toggle settings as an execution gate."""
     import hyol_scheduler as hs
-    s.ensure_assets([TITLE, CHECKED, UNCHECKED] + ['managed_spend_'+key+'_label.bmp' for key,_,_ in OPTIONS])
-    record = s.state.accounts[account.name].setdefault('managed_settings', {})
-    record.update(status='pending', started_at=record.get('started_at', hs.now_iso()))
     frame = s.capture()
-    try:
-        for key, checkbox_roi, label_roi in OPTIONS:
-            s.check_stop()
-            frame = s.capture()
-            state = option_state(s, key, checkbox_roi, label_roi, frame)
-            if state == 'checked':
-                record.update(phase='disable_'+key, requested_at=hs.now_iso())
-                s.state.save_account(account.name)
-                current_box, _ = option_rois(s, checkbox_roi, label_roi, frame)
-                if not s.click_template(account, CHECKED, current_box, 7,7,
-                                        'managed_disable_'+key,
-                                        ['managed_spend_'+key+'_label.bmp'],
-                                        threshold=.98, anchor_threshold=.98):
-                    raise hs.PendingError('消费选项点击前状态变化：'+key)
-                s.wait_interruptible(.35)
-            # Independent captures prove off after both a new click and restart.
-            for sample in range(2):
-                frame = s.capture()
-                if option_state(s, key, checkbox_roi, label_roi, frame) != 'unchecked':
-                    raise hs.PendingError('托管消费选项尚未关闭：'+key)
-                if sample == 0:
-                    s.wait_interruptible(.35)
-            record.setdefault('options', {})[key] = {'status':'disabled', 'verified_at':hs.now_iso()}
-            s.state.save_account(account.name)
-        # Check the complete panel again so an intervening repaint cannot turn
-        # an earlier option back on while a later one was being processed.
-        for _ in range(2):
-            frame = s.capture()
-            for key, checkbox_roi, label_roi in OPTIONS:
-                if option_state(s, key, checkbox_roi, label_roi, frame) != 'unchecked':
-                    raise hs.PendingError('托管最终禁用复核失败：'+key)
-            s.wait_interruptible(.35)
-        evidence = s.save_raw_evidence(frame, account, 'managed_spending_disabled', 'verified')
-        record.update(status='done', phase='verified', evidence=str(evidence), verified_at=hs.now_iso())
-        s.state.save_account(account.name)
-        s.event('managed_spending_disabled', account, evidence=str(evidence), options=[key for key,_,_ in OPTIONS])
-        return record
-    except (Exception, KeyboardInterrupt) as exc:
-        evidence = s.save_raw_evidence(frame, account, 'managed_settings_pending', 'pending')
-        record.update(status='pending', last_error=str(exc), pending_evidence=str(evidence))
-        s.state.save_account(account.name)
-        raise
+    if not stopped_panel_visible(s, frame):
+        raise hs.PendingError('托管面板标题或开始按钮未确认；未更改任何设置')
+    evidence = s.save_raw_evidence(frame, account, 'managed_settings_preserved', 'observed')
+    s.event('managed_settings_preserved', account, evidence=str(evidence),
+            detail='沿用游戏内现有设置，仅开始托管；设置修改点击0')
+    return {'policy': 'preserve', 'evidence': str(evidence), 'settings_clicks': 0}
+
+
+def prepare_non_spending_options(s, account):
+    """Compatibility entrypoint: the current user policy always preserves settings."""
+    return preserve_existing_options(s, account)

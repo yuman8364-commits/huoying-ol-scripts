@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.11.1'
+VERSION = '2026.10.17.8'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -34,7 +34,6 @@ class RunRequest:
     bond_count: int = 5
     new_bond_round: bool = False
     final_managed: bool = True
-    new_pipeline_request: bool = False
 
     def __post_init__(self):
         if self.mode not in MODES:
@@ -43,11 +42,8 @@ class RunRequest:
             raise ValueError('账号数量须为1～6，竞技场追加胜场须为1～10')
         if self.formation not in ('keep', 'main', 'fast') or not 1 <= self.bond_count <= MAX_BATTLES:
             raise ValueError('阵容或羁绊次数无效')
-        if (not isinstance(self.final_managed, bool) or not isinstance(self.new_bond_round, bool)
-                or not isinstance(self.new_pipeline_request, bool)):
+        if not isinstance(self.final_managed, bool) or not isinstance(self.new_bond_round, bool):
             raise ValueError('最后托管选项必须为开启或关闭')
-        if self.new_pipeline_request and self.mode != 'team_then_multi':
-            raise ValueError('新批次只适用于已有队伍的多人单人流程')
         if self.mode in ('solo', 'multi', 'team_then_multi'):
             if (not self.tasks or len(set(self.tasks)) != len(self.tasks)
                     or any(task not in SOLO_OPTIONS for task in self.tasks)):
@@ -139,19 +135,30 @@ def bond_legacy_paths(root):
     return tuple(dict.fromkeys(paths))
 
 
-def make_runner(request, event_sink, root=hs.ROOT):
+def make_runner(request, event_sink, root=hs.ROOT, *, run_context=None):
+    from contextlib import nullcontext
+    from hyol_run_context import RunContext
+    if request.mode == 'bond':
+        run_context = None  # The independent bond client owns its separate round journal.
+    if run_context is None and request.mode != 'bond':
+        run_context = RunContext.create(root)
+    with run_context.activate() if run_context else nullcontext():
+        return _make_runner(request,event_sink,root,run_context)
+
+
+def _make_runner(request, event_sink, root, run_context):
     """Construct an existing runner, not its GUI and not another worker."""
     root = Path(root)
     if request.mode == 'team_then_multi':
         runner = TeamPipelineRunner(request.leaders, request.team_tasks, request.tasks,
                                     arena_wins=request.arena_wins, formation=request.formation,
                                     managed_enabled=request.final_managed, event_sink=event_sink, root=root,
-                                    new_request=request.new_pipeline_request)
+                                    run_context=run_context)
     elif request.mode == 'multi':
         runner = MultiSoloRunner(request.tasks, config_path=root/'HYOL_Daily.ini',
                                  account_count=request.account_count, arena_wins=request.arena_wins,
                                  formation=request.formation, managed_enabled=request.final_managed,
-                                 event_sink=event_sink)
+                                 event_sink=event_sink, run_context=run_context)
     elif request.mode == 'team':
         selection = TeamSelection(request.leader, () if request.friend_shortcut else request.members,
                                   request.friend_shortcut, request.team_tasks)
@@ -223,6 +230,7 @@ class RuntimeController:
         self.cancel = threading.Event()
         self.lock = threading.Lock()
         self.identifier = ''
+        self.run_context = None
 
     @property
     def busy(self):
@@ -269,22 +277,22 @@ class RuntimeController:
         finally:
             self.emit('unified_idle')
 
-    def resume(self):
-        # This is reached only from the user's explicitly named resume button.
-        return self._launch('resume', self._resume)
 
     def stop(self):
         if not self.busy:
             return False
         self.cancel.set()
+        if self.run_context is not None:
+            self.run_context.interrupted = True
+            self.run_context.stop.set()
         if self.scheduler is not None:
             self.scheduler.stop.set()
         mark_manual_pause(self.root, self.identifier, '用户点击统一客户端停止')
-        self.emit('unified_stop_requested', detail='正在停止；原任务及未决动作保留。')
+        self.emit('unified_stop_requested', detail='正在结束本轮运行。')
         return True
 
     def _not_cancelled(self, *, check_pause=False):
-        if self.cancel.is_set():
+        if self.cancel.is_set() or (self.run_context is not None and self.run_context.interrupted):
             raise KeyboardInterrupt('用户停止')
         if check_pause and manual_pause_status(self.root)['paused']:
             raise KeyboardInterrupt('人工暂停仍在，停止交接并保留断点')
@@ -300,25 +308,6 @@ class RuntimeController:
         finally:
             self.emit('unified_idle')
 
-    def _resume(self):
-        try:
-            self._not_cancelled()
-            before = manual_pause_status(self.root)
-            paths = clear_manual_pause(self.root, '用户点击完整客户端恢复F12暂停')
-            self._not_cancelled()
-            after = manual_pause_status(self.root)
-            if after['paused']:
-                raise hs.PendingError(after.get('reason', '暂停尚未恢复'))
-            hs.atomic_json(self.root/'logs/unified_resume_latest.json',
-                           {'before': before, 'cleared': paths, 'after': after, 'at': hs.now_iso()})
-            self.emit('unified_resumed', detail='暂停已明确恢复；点击开始可续接原断点。')
-        except KeyboardInterrupt:
-            mark_manual_pause(self.root, self.identifier, '用户停止恢复F12暂停')
-            self.emit('unified_error', detail='恢复已停止，暂停保留。')
-        except Exception as exc:
-            self.emit('unified_error', detail=f'恢复待处理：{exc}')
-        finally:
-            self.emit('unified_idle')
 
     def _finish_bond(self, runner, *, managed_enabled=True):
         """A new lease after the battle runner releases; no nested lease or blind exit."""
@@ -376,21 +365,31 @@ class RuntimeController:
                 lease.release()
 
     def _run(self, request):
+        if not self.identifier:
+            self.identifier = run_id()
         code, complete, detail = 2, False, ''
+        exception_type, exception_traceback = '', ''
         self.runner = None
         evidence = ''
+        lease = hs.ForegroundRuntimeLease()
+        context = None
         try:
             self._not_cancelled()
-            pause = manual_pause_status(self.root)
-            if pause['paused']:
-                raise hs.PendingError('F12暂停仍在；请先点击恢复F12暂停。'+pause.get('reason', ''))
+            if not lease.acquire():
+                raise hs.PendingError('已有脚本占用游戏窗口')
+            from hyol_run_context import RunContext
+            context = RunContext.create(self.root,identifier=self.identifier)
+            self.run_context = context
+            context.begin()
+            self.emit('unified_run_started',state_directory=str(context.directory))
             self.emit('unified_status', detail='只读检查游戏窗口与当前页面……')
-            check = preflight_live()
+            with context.activate():
+                check = preflight_live()
             if not (check.get('status') == 'ready' and check.get('healthy') is True
                     and check.get('content_clicks') == 0):
                 raise hs.PendingError('游戏窗口检查未通过：'+str(check.get('reason', check.get('status'))))
             self._not_cancelled(check_pause=True)
-            self.runner = make_runner(request, self.sink, self.root)
+            self.runner = make_runner(request, self.sink, self.root, run_context=context)
             self.scheduler = self.runner.scheduler
             self._not_cancelled(check_pause=True)
             self.emit('unified_status', detail='执行所选任务；最后逐账号核实木叶回村'
@@ -434,20 +433,27 @@ class RuntimeController:
                     if source_day != self.runner.scheduler.state.day:
                         detail = f'已核实{source_day}原队伍收尾；本日任务尚未实机确认，保留待验。'
         except KeyboardInterrupt:
-            code, complete, detail = 130, False, '脚本已停止，断点和未决动作保留。'
+            code, complete, detail = 130, False, '本轮已停止；再次开始将按当前画面和选择创建新运行。'
             mark_manual_pause(self.root, self.identifier, 'F12或用户停止统一客户端')
         except Exception as exc:
             code, complete, detail = 2, False, str(exc)
+            import traceback
+            exception_type, exception_traceback = type(exc).__name__, traceback.format_exc()
         finally:
+            if context:
+                context.stop.set()
+            lease.release()
             pipeline_summary = self.runner.summary() if request.mode == 'team_then_multi' and self.runner is not None else {}
             runner_summary = getattr(self.runner, 'last_summary', None) if self.runner is not None else None
             if isinstance(runner_summary, dict) and code != 0 and not detail:
                 detail = str(runner_summary.get('detail') or '')
             if code != 0 and not detail and not pipeline_summary:
-                detail = '本轮任务仍未完成，请查看对应账号的原任务记录与运行日志。'
+                detail = '本轮任务未完成，请查看对应账号的原因与运行日志。'
             if pipeline_summary:
-                detail = pipeline_summary['detail'] + (' '+detail if detail else '')
+                detail = (detail+' ' if detail else '') + pipeline_summary['detail']
             receipt = {'version': VERSION, 'run_id': self.identifier, 'request': asdict(request),
+                       'state_directory': str(context.directory) if context else '',
+                       'error_type': exception_type, 'error_traceback': exception_traceback,
                        'result': code, 'status': 'complete' if complete else 'stopped' if code == 130 else 'pending',
                        'detail': detail, 'final_managed_evidence': evidence if request.final_managed else '',
                        'home_evidence': evidence if not request.final_managed else '', 'at': hs.now_iso(),
@@ -463,4 +469,5 @@ class RuntimeController:
                 receipt['save_error'] = str(exc)
             self.emit('unified_finished', **receipt)
             self.scheduler = None
+            self.run_context = None
             self.emit('unified_idle')

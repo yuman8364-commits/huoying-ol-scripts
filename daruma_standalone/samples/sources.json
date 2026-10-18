@@ -1,0 +1,55 @@
+{
+  "daruma_chance_digit_3.bmp": {
+    "value": 3,
+    "source": "D:\\火影ol脚本\\daruma_standalone\\runtime\\observations\\20261017_212425_383016.png",
+    "roi": [
+      1258,
+      328,
+      1288,
+      358
+    ],
+    "verification": "Visually confirmed current Daruma ready page: three chances; zero content clicks"
+  },
+  "daruma_chance_digit_2.bmp": {
+    "value": 2,
+    "source": "D:\\火影ol脚本\\daruma_standalone\\runtime\\observations\\20261017_213608_946780.png",
+    "roi": [
+      1263,
+      333,
+      1277,
+      353
+    ],
+    "verification": "Visually confirmed chance 2; tight neutral glyph crop matches both playing and game-over dimming"
+  },
+  "daruma_reward_digit_2.bmp": {
+    "value": 2,
+    "source": "D:\\火影ol脚本\\daruma_standalone\\runtime\\observations\\20261017_215453_559741.png",
+    "roi": [
+      1295,
+      637,
+      1309,
+      655
+    ],
+    "verification": "Visually confirmed Daruma third row reward 3 -> 2 after six tiles and game-over; top two activities still 3"
+  },
+  "daruma_reward_digit_0.bmp": {
+    "source": "D:\\火影ol脚本\\daruma_standalone\\runtime\\observations\\20261017_220305_170929.png",
+    "roi": [
+      1295,
+      637,
+      1309,
+      655
+    ],
+    "verification": "Visually confirmed Daruma reward 0 and gray completed badge after three six-layer rounds"
+  },
+  "daruma_reward_completed.bmp": {
+    "source": "D:\\火影ol脚本\\daruma_standalone\\runtime\\observations\\20261017_220305_170929.png",
+    "roi": [
+      1208,
+      660,
+      1317,
+      699
+    ],
+    "verification": "Visually confirmed Daruma reward 0 and gray completed badge after three six-layer rounds"
+  }
+}

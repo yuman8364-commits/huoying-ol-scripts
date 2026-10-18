@@ -11,7 +11,7 @@ from tkinter import ttk
 
 import hyol_scheduler as hs
 
-VERSION = "2026.10.05.16"
+VERSION = "2026.10.17.8"
 RESULT_PATH = hs.ROOT / "arena_client_result.json"
 CONFIG_PATH = hs.ROOT / "ARENA_Client.ini"
 

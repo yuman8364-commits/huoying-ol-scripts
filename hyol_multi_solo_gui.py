@@ -12,6 +12,7 @@ from tkinter import ttk
 import hyol_scheduler as hs
 from hyol_daily_tasks import DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, FORMATION_LABELS
 from hyol_multi_solo import MultiSoloRunner
+from hyol_progress_view import ProgressView
 from tools.preflight_live import run as preflight_live
 
 
@@ -62,8 +63,9 @@ class MultiSoloApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("火影OL多账号单人脚本")
-        self.geometry("720x500")
-        self.resizable(False, False)
+        self.geometry("1060x850")
+        self.minsize(900, 700)
+        self.resizable(True, True)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.worker: threading.Thread | None = None
         config = hs.read_config(hs.ROOT/'HYOL_Daily.ini')
@@ -108,7 +110,13 @@ class MultiSoloApp(tk.Tk):
         self.start_button = ttk.Button(frame, text="开始运行", command=self.start)
         self.start_button.pack(anchor="w")
         ttk.Label(frame, textvariable=self.status, wraplength=535).pack(anchor="w", pady=(12, 6))
-        self.log = tk.Text(frame, height=9, width=68, state="disabled")
+        history = ttk.Notebook(frame)
+        history.pack(fill='both', expand=True)
+        self.progress_view = ProgressView(history, hs.ROOT, current_only=True)
+        history.add(self.progress_view, text='完成情况')
+        logbox = ttk.Frame(history)
+        history.add(logbox, text='运行日志')
+        self.log = tk.Text(logbox, height=9, width=68, state="disabled")
         self.log.pack(fill="both", expand=True)
         self.after(200, self.drain)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -131,16 +139,26 @@ class MultiSoloApp(tk.Tk):
         except ValueError as exc:
             self.status.set(str(exc))
             return
+        from hyol_run_context import RunContext
+        self.run_context = RunContext.create(hs.ROOT)
+        self.progress_view.set_run(self.run_context.identifier)
         self.start_button.configure(state="disabled")
         self.status.set("正在只读检查游戏窗口……")
         self.worker = threading.Thread(target=self.run_worker,
-            args=(count, tasks, wins, self.managed_enabled.get(), FORMATION_LABELS[self.formation.get()]), daemon=False)
+            args=(count, tasks, wins, self.managed_enabled.get(), FORMATION_LABELS[self.formation.get()], self.run_context), daemon=False)
         self.worker.start()
 
     def run_worker(self, count: int, tasks: tuple[str, ...], arena_wins: int = 5,
-                   managed_enabled: bool = True, formation: str = 'keep'):
+                   managed_enabled: bool = True, formation: str = 'keep', run_context=None):
+        from hyol_run_context import RunContext
+        context = run_context or RunContext.create(hs.ROOT)
+        lease = hs.ForegroundRuntimeLease()
         try:
-            check = preflight_live()
+            if not lease.acquire():
+                raise hs.PendingError('已有脚本占用游戏窗口')
+            context.begin()
+            with context.activate():
+                check = preflight_live()
             if not (check.get("status") == "ready" and check.get("healthy") is True
                     and check.get("content_clicks") == 0):
                 self.events.put(("finished", "预检未通过：游戏窗口不健康或只读检查异常；未执行任务点击。"))
@@ -148,17 +166,21 @@ class MultiSoloApp(tk.Tk):
             self.events.put(("status", f"预检通过，开始识别最多 {count} 个账号。"))
             runner = MultiSoloRunner(tasks, account_count=count, arena_wins=arena_wins,
                                      formation=formation,
-                                     managed_enabled=managed_enabled,
+                                     managed_enabled=managed_enabled,run_context=context,
                                      event_sink=lambda event: self.events.put(("event", event)))
             result = runner.run()
             self.events.put(("finished", "所选账号任务已核实完成。" if result == 0
-                             else "部分任务待续；详情见下方事件及 state/multi_solo_latest.json。"))
+                             else "本轮有待处理项；详情见本轮进度和运行日志。"))
         except BaseException as exc:
             try:
                 path = record_gui_error(exc)
                 self.events.put(("finished", f"启动或运行失败：{type(exc).__name__}: {exc}；诊断日志：{path}"))
             except Exception:
                 self.events.put(("finished", f"启动或运行失败：{type(exc).__name__}: {exc}"))
+
+        finally:
+            context.stop.set()
+            lease.release()
 
     def drain(self):
         try:
@@ -181,7 +203,7 @@ class MultiSoloApp(tk.Tk):
 
     def close(self):
         if self.worker and self.worker.is_alive():
-            self.status.set("脚本正在运行；需要停止时按 F12，保存断点后再关闭。")
+            self.status.set("脚本正在运行；需要停止时按 F12，结束本轮后再关闭。")
             return
         self.destroy()
 

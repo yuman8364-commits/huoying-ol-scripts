@@ -45,7 +45,8 @@ def run():
         s.event('stage_pending', detail=result['reason'])
         result['diagnostic_path'] = str(s.diagnostics.last_path) if s.diagnostics.last_path else None
     finally:
-        s.stop.set()
+        if not getattr(s, 'run_context', None):
+            s.stop.set()
         lease.release()
         result.update(hwnd=s.hwnd, content_clicks=s.content_click_count)
         hs.atomic_json(hs.LOGS/f'preflight_{s.diagnostics.identifier}.json', result)

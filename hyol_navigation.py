@@ -8,6 +8,8 @@ SPRING_PROMPT_ROI = (600, 350, 1300, 800)
 HOME_LEAVE_ROI = (1800, 930, 1920, 1032)
 LEAF_NAME_ROI = (1690, 110, 1920, 148)
 LEAF_RETURN_ROI = (1870, 69, 1920, 125)
+MARKET_TITLE_ROI = (651, 69, 1251, 319)
+MARKET_CLOSE_ROI = (1301, 219, 1919, 369)
 
 
 def move_cursor_clear(scheduler):
@@ -55,6 +57,61 @@ def _stable_world(s, account, frame):
             s.wait_interruptible(.35)
             frame = s.capture()
     return frame
+
+
+def close_black_market(s, account, *, frame=None, timeout=12):
+    """Close only the verified market X, preserving every task/action record."""
+    import hyol_scheduler as hs
+    frame = frame if frame is not None else s.capture()
+    visible = s.template('market_anchor.bmp', MARKET_TITLE_ROI, frame, threshold=.98)[0]
+    previous = s.state.accounts[account.name].get('navigation', {}).get('black_market_exit', {})
+    pending_close = previous.get('status') == 'pending' and previous.get('phase') == 'close_requested'
+    if not visible and not pending_close:
+        return False
+    record = _record(s, account, 'black_market_exit')
+    deadline = time.monotonic() + timeout
+    if visible and not pending_close:
+        expected = None
+        for sample in range(3):
+            s.check_stop()
+            close = s.template('market_close.bmp', MARKET_CLOSE_ROI, frame, threshold=.98)
+            if (not s.verify_identity(account, frame)[0]
+                    or not s.template('market_anchor.bmp', MARKET_TITLE_ROI, frame, threshold=.98)[0]
+                    or not close[0] or s._combat_active_visible('arena', frame)
+                    or s._combat_active_visible('survival', frame)):
+                raise hs.PendingError('黑市身份、标题或关闭X未连续确认，未点击关闭')
+            position = close[2:4]
+            if expected is not None and position != expected:
+                raise hs.PendingError('黑市关闭X位置变化，未点击关闭')
+            expected = position
+            if sample < 2:
+                s.wait_interruptible(.35)
+                frame = s.capture()
+        record.update(status='pending')
+        _step(s, account, record, 'close_requested', frame, '黑市身份、标题和X连续三帧确认，仅关闭页面')
+        if not s.click_template(account, 'market_close.bmp', MARKET_CLOSE_ROI, 15, 15,
+                                'navigation_black_market_close', ['market_anchor.bmp', 'market_close.bmp'],
+                                threshold=.98, anchor_threshold=.98,
+                                frame_predicate=lambda fresh: (
+                                    s.verify_identity(account, fresh)[0]
+                                    and s.template('market_anchor.bmp', MARKET_TITLE_ROI, fresh, threshold=.98)[0]
+                                    and not s._combat_active_visible('arena', fresh)
+                                    and not s._combat_active_visible('survival', fresh))):
+            raise hs.PendingError('黑市关闭X点击前变化，保留请求，不重复点击')
+    while time.monotonic() < deadline:
+        s.check_stop()
+        s.wait_interruptible(.35)
+        frame = s.capture()
+        if not s.template('market_anchor.bmp', MARKET_TITLE_ROI, frame, threshold=.98)[0]:
+            stable = _stable_world(s, account, frame)
+            if stable is not None:
+                _step(s, account, record, 'main_verified', stable, '黑市X已关闭，实名主界面连续三帧确认')
+                record.update(status='done')
+                s.state.save_account(account.name)
+                s.event('black_market_exit_verified', account, evidence=record['steps'][-1]['evidence'],
+                        detail='仅关闭黑市；原任务、次数和未决操作保留')
+                return True
+    raise hs.PendingError('黑市关闭后主界面未确认，保留原关闭请求，不重复点击')
 
 
 def leave_hot_spring(s, account, *, timeout=60):
@@ -187,6 +244,8 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
         # identity and Leaf across three frames, without sending navigation.
         move_cursor_clear(s)
         frame = s.capture()
+        if close_black_market(s, account, frame=frame):
+            frame = s.capture()
         for sample in range(3):
             audit['frame'] = frame
             if (not s.main_ready(frame)
@@ -211,6 +270,7 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
     leave_hot_spring(s, account)
     deadline = time.monotonic() + timeout
     close_controls = (
+        ('friends_panel_close.bmp', (1870,260,1920,350), 'friends_panel_close.bmp'),
         ('ninja_close_current.bmp', (1570,100,1640,175), 'ninja_page_current.bmp'),
         ('mail_warehouse_close.bmp', (1174,259,1275,359), 'mail_warehouse_anchor.bmp'),
         ('mail_close.bmp', (1301,249,1401,349), 'mail_ready_anchor.bmp'),
@@ -239,6 +299,9 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
         s.check_stop()
         frame = s.capture()
         audit['frame'] = frame
+        if close_black_market(s, account, frame=frame):
+            move_cursor_clear(s)
+            continue
         main_ready = s.main_ready(frame)
         if main_ready and not s.verify_identity(account, frame)[0]:
             raise hs.PendingError('回村账号身份未确认，保留原导航和动作')

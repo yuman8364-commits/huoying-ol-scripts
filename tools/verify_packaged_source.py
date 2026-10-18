@@ -29,7 +29,10 @@ def normalized_code(code):
 
 
 def compare_source(root, module, embedded):
-    path = Path(root).joinpath(*module.split('.')).with_suffix('.py')
+    base = Path(root).joinpath(*module.split('.'))
+    path = base.with_suffix('.py')
+    if not path.is_file() and base.is_dir():
+        path = base/'__init__.py'
     if not path.is_file():
         return dict(module=module, source_path=str(path), source_exists=False,
                     code_matches_current_source=False)
@@ -46,10 +49,13 @@ def verify_package(root, executable, *, archive_factory=None):
         archive_factory = CArchiveReader
     archive = archive_factory(str(executable))
     pyz = archive.open_embedded_archive('PYZ.pyz')
+    def project_module(module):
+        return (module.startswith('hyol_') or module == 'daruma_standalone_gui'
+                or module == 'daruma_standalone' or module.startswith('daruma_standalone.'))
     checks = [dict(compare_source(root, module, pyz.extract(module)), location='PYZ')
-              for module in sorted(pyz.toc) if module.startswith('hyol_')]
+              for module in sorted(pyz.toc) if project_module(module)]
     for module, row in sorted(archive.toc.items()):
-        if module.startswith('hyol_') and row[-1] == 's':
+        if project_module(module) and row[-1] == 's':
             checks.append(dict(compare_source(root, module, marshal.loads(archive.extract(module))),
                                location='entrypoint'))
     if not any(row['location'] == 'entrypoint' for row in checks):

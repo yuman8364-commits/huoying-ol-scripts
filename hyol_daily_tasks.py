@@ -8,17 +8,18 @@ import sys
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 import numpy as np
 
 import hyol_scheduler as hs
 
-VERSION = "2026.10.09.2"
+VERSION = "2026.10.17.8"
 TASKS = ("group", "survival", "wanted")
 TEAM_OPTIONS = ("group", "wanted", "strong", "sealed")
 SOLO_OPTIONS = ('mail', 'welfare', 'ranking', 'survival', 'quiz', 'arena', 'weekend', 'treasure')
-DEFAULT_SOLO_OPTIONS = ('mail', 'welfare', 'ranking', 'survival', 'quiz', 'arena', 'weekend')
+DEFAULT_SOLO_OPTIONS = ('mail', 'welfare', 'ranking', 'survival', 'quiz', 'arena')
 TASK_SEQUENCES = {"all": DEFAULT_SOLO_OPTIONS, "team": ("group", "wanted")}
 LABELS = {"group": "组队副本", "survival": "生存演习", "wanted": "通缉任务", "all": "日常三合一", "team": "组队副本＋通缉任务"}
 LABELS.update(team="组队任务自选", sealed="击败被封印的忍者（每日最多2次）")
@@ -70,6 +71,9 @@ class DailyScheduler(hs.Scheduler):
         return result
 
     def switch_account(self, account, verify=True):
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing:
+            return super().switch_account(account, verify=verify)
         if self.generic_current_tab_x is not None:
             frame = self.content_guard(account)
             self.dismiss_unsolicited_team_invite(account, frame)
@@ -129,16 +133,8 @@ class DailyScheduler(hs.Scheduler):
         self.event('combat_module_done', account, mode='survival')
 
     def _poll_survival_slot(self, slot):
-        key = (slot.account.name,slot.next_index,self.state.action_status(slot.account.name,"survival_second_run_started"))
-        if getattr(self,"daily_survival_poll_key",None) != key:
-            self.daily_survival_poll_key = key
-            self.daily_survival_poll_started = time.monotonic()
         frame = self.capture()
-        if (time.monotonic()-self.daily_survival_poll_started >= 60
-                and not self._combat_active_visible('survival', frame)):
-            raise hs.PendingError('生存演习未知过渡60秒未核实，保留原战斗')
-        if self._combat_active_visible('survival', frame):
-            self.daily_survival_poll_started = time.monotonic()
+        hs.check_combat_slot_watchdog(self, slot, frame)
         return super()._poll_survival_slot(slot, frame)
 
 
@@ -170,7 +166,11 @@ class DailyRunner:
         self.formation_checked = False
         self.generic_current_window = generic_current_window
         config_path = config_path or (hs.ROOT / "DAILY_Client.ini")
-        self.scheduler = DailyScheduler(hs.read_config(config_path), "daily_client", False, False, event_sink=event_sink)
+        from hyol_run_context import RunContext, current_run
+        config = hs.read_config(config_path)
+        self.run_context = current_run() or RunContext.create(Path(config_path).parent,config)
+        with self.run_context.activate():
+            self.scheduler = DailyScheduler(config, "daily_client", False, False, event_sink=event_sink)
         # Single-person daily completion explicitly includes starting managed mode.
         # The gate still requires the live toolbar, start control and active badge.
         if task == 'all' and managed_enabled:
@@ -220,7 +220,22 @@ class DailyRunner:
 
     def wait(self, name, roi, seconds=12):
         if not self.scheduler.wait_template(name, roi, seconds, threshold=.90):
-            raise hs.PendingError(f"页面未确认：{name}")
+            detail = f"页面未确认：{name}"
+            # Keep the final observed frame. A second capture could already
+            # show another page or replace the original failure with a pause.
+            frame = getattr(self.scheduler, '_last_frame', None)
+            evidence = None
+            if frame is not None:
+                try:
+                    evidence = self.scheduler.save_raw_evidence(
+                        frame, self.account, 'daily_page_wait_'+Path(name).stem, 'pending')
+                    detail += f'；截图={evidence}'
+                except OSError as exc:
+                    detail += f'；截图保存失败：{exc}'
+            task = next((key for key, value in PAGE_ANCHORS.items() if value == name), None)
+            self.event('daily_page_wait_pending', task=task, template=name,
+                       evidence=str(evidence) if evidence else None, detail=detail)
+            raise hs.PendingError(detail)
 
     def close_page(self, task):
         name, roi = {"group": ("team_instance_close.bmp", (1370, 240, 1460, 330)),
@@ -902,6 +917,8 @@ class DailyRunner:
             owned = lease.acquire()
             if not owned:
                 raise hs.PendingError("已有脚本占用游戏窗口，请等其结束")
+            if getattr(self, 'run_context', None):
+                self.run_context.begin()
             self.scheduler.start_f12_monitor()
             self.bind()
             self.prepare_request()
@@ -931,6 +948,7 @@ class DailyRunner:
                     self.scheduler.reconcile_survival_result_confirmations(self.account)
                 if not task_already_finished:
                     try:
+                        observation = self.scheduler.begin_task_observation(self.account, task)
                         getattr(self,task)()
                     except hs.WelfareNotReady as exc:
                         rec.update(status='pending', last_error=str(exc))
@@ -938,6 +956,8 @@ class DailyRunner:
                         self.save()
                         self.event('daily_task_pending', task=task, detail=str(exc))
                         continue
+                    finally:
+                        self.scheduler.end_task_observation(observation, complete=rec.get('task_completed', False))
                     rec.update(task_completed=True)
                     if task != 'treasure':
                         rec['home_returned'] = False
@@ -1037,9 +1057,6 @@ class DailyClient(tk.Tk):
         self.managed_enabled = tk.BooleanVar(value=True)
         self.formation = tk.StringVar(value="保持不变")
         self.status = tk.StringVar(value="就绪：请打开当前账号的游戏主界面")
-        previous = latest_client_result(hs.ROOT, task)
-        if previous:
-            self.status.set("上次完成" if previous.get("result") == 0 else "上次未完成："+str(previous.get("detail","")))
         body = ttk.Frame(self,padding=16)
         body.pack(fill="both",expand=True)
         ttk.Label(body,text=LABELS[task],font=("Microsoft YaHei UI",20,"bold")).pack(anchor="w")

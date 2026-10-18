@@ -17,13 +17,13 @@ def frame(color=60):
 
 
 class BattleWatchdogTests(unittest.TestCase):
-    def test_frozen_battle_stops_at_three_minutes_including_zero_start(self):
+    def test_frozen_battle_stops_at_thirty_seconds_including_zero_start(self):
         monitor = BattleWatchdog()
         self.assertIsNone(monitor.observe(frame(), 0))
-        self.assertIsNone(monitor.observe(frame(), 179.999))
-        result = monitor.observe(frame(), 180)
+        self.assertIsNone(monitor.observe(frame(), 29.999))
+        result = monitor.observe(frame(), 30)
         self.assertEqual('unchanged_frame', result['reason'])
-        self.assertEqual((180, 180), (result['elapsed_seconds'], result['unchanged_seconds']))
+        self.assertEqual((30, 30), (result['elapsed_seconds'], result['unchanged_seconds']))
 
     def test_chrome_chat_auto_badge_and_tiny_cursor_changes_do_not_extend_wait(self):
         original = frame()
@@ -41,38 +41,40 @@ class BattleWatchdogTests(unittest.TestCase):
         monitor.observe(frame(60), 0)
         self.assertEqual('unchanged_frame', monitor.observe(frame(63), 180)['reason'])
 
-    def test_real_progress_extends_idle_budget_without_resetting_total(self):
+    def test_real_progress_extends_idle_budget_beyond_old_total_limit(self):
         monitor = BattleWatchdog()
         for moment, color in ((0, 60), (170, 140), (340, 60), (510, 140), (599, 60)):
             self.assertIsNone(monitor.observe(frame(color), moment))
-        result = monitor.observe(frame(140), 600)
-        self.assertEqual('max_duration', result['reason'])
-        self.assertEqual(600, result['elapsed_seconds'])
+        self.assertIsNone(monitor.observe(frame(140), 600))
+        self.assertIsNone(monitor.observe(frame(60), 1200))
+        self.assertEqual('unchanged_frame', monitor.observe(frame(60), 1230)['reason'])
 
-    def test_total_limit_still_applies_when_no_battlefield_sample_is_available(self):
+    def test_missing_samples_do_not_invent_an_offline_result(self):
         monitor = BattleWatchdog(started_at=10)
         self.assertIsNone(monitor.observe(None, 609))
-        self.assertEqual('max_duration', monitor.observe(None, 610)['reason'])
+        self.assertIsNone(monitor.observe(None, 610))
 
     def test_tabs_have_independent_monotonic_deadlines(self):
         first = BattleWatchdog(started_at=0)
         second = BattleWatchdog(started_at=590)
-        self.assertEqual('max_duration', first.observe(frame(), 600)['reason'])
+        first.observe(frame(), 0)
+        self.assertEqual('unchanged_frame', first.observe(frame(), 600)['reason'])
         self.assertIsNone(second.observe(frame(), 600))
 
     def test_invalid_configuration_cannot_disable_protection(self):
         for value in ('', 'nan', 'inf', '-1', '0', 'bad', None):
             with self.subTest(value=value):
                 monitor = BattleWatchdog.from_config(dict(CombatStallSeconds=value, CombatMaxSeconds=value))
-                self.assertEqual((180, 600), (monitor.idle_seconds, monitor.max_seconds))
+                self.assertEqual((30, float("inf")), (monitor.idle_seconds, monitor.max_seconds))
 
     def test_configuration_is_bounded(self):
         monitor = BattleWatchdog.from_config(dict(CombatStallSeconds='1', CombatMaxSeconds='999999'))
-        self.assertEqual((30, 1200), (monitor.idle_seconds, monitor.max_seconds))
+        self.assertEqual((30, float("inf")), (monitor.idle_seconds, monitor.max_seconds))
 
     def scheduler(self):
         s = object.__new__(hs.Scheduler)
         s.config = {}
+        s.offline_dialog_visible = Mock(return_value=False)
         s.template = Mock(return_value=(False, 0, 0, 0))
         s._arena_waiting_battle_visible = Mock(return_value=False)
         s._arena_victory_visible = Mock(return_value=False)
@@ -90,7 +92,7 @@ class BattleWatchdogTests(unittest.TestCase):
     def test_repeated_active_markers_do_not_reset_arena_timer_or_change_results(self):
         s = self.scheduler()
         slot = hs.CombatSlot(hs.Account(1, 'example', 180), 'arena', running=True)
-        with patch.object(hs.time, 'monotonic', side_effect=(0, 90, 179, 180)):
+        with patch.object(hs.time, 'monotonic', side_effect=(0, 10, 29, 30)):
             for _ in range(3):
                 s._combat_progress_watchdog(slot, frame())
             with self.assertRaises(hs.BattleStalled):
@@ -130,7 +132,8 @@ class BattleWatchdogTests(unittest.TestCase):
         s._battle_auto_on_visible = Mock(return_value=True)
         slot = hs.CombatSlot(hs.Account(1, 'example', 180), 'arena', running=True,
                              battle_watchdog=BattleWatchdog(started_at=0), battle_watchdog_index=1)
-        with patch.object(hs.time, 'monotonic', return_value=600):
+        slot.battle_watchdog.observe(frame(), 0)
+        with patch.object(hs.time, 'monotonic', return_value=30):
             with self.assertRaises(hs.BattleStalled):
                 s._poll_arena_slot(slot)
         s.click_template.assert_not_called()
@@ -138,7 +141,7 @@ class BattleWatchdogTests(unittest.TestCase):
     def test_survival_battle_also_stops_before_any_retry_click(self):
         s = self.scheduler()
         slot = hs.CombatSlot(hs.Account(1, 'example', 180), 'survival', running=True)
-        with patch.object(hs.time, 'monotonic', side_effect=(0, 180)):
+        with patch.object(hs.time, 'monotonic', side_effect=(0, 30)):
             s._poll_survival_slot(slot, frame())
             with self.assertRaises(hs.BattleStalled):
                 s._poll_survival_slot(slot, frame())
@@ -157,6 +160,7 @@ class BattleWatchdogTests(unittest.TestCase):
         c.event = Mock()
         c.save_progress = Mock()
         c.excluded = set()
+        c.disconnected = set()
         c.exclusion_reasons = {}
         c.deferred = {}
         c.deferred_at = {}
@@ -171,11 +175,11 @@ class BattleWatchdogTests(unittest.TestCase):
         c._run_task(r, 'arena')
         self.assertEqual('pending', record['status'])
         self.assertEqual({'example'}, c.excluded)
-        self.assertEqual({'example': 'combat_watchdog'}, c.exclusion_reasons)
+        self.assertEqual({'example': 'unchanged_30s'}, c.exclusion_reasons)
         self.assertEqual({}, c.deferred)
         c.scheduler.ensure_account_main_before_release.assert_not_called()
         c.scheduler.commit_action.assert_not_called()
-        c.save_progress.assert_called_once_with('combat_watchdog')
+        c.save_progress.assert_called_once_with('account_stalled')
         next_runner = Mock(account=c.scheduler.accounts[1])
         next_record = {'status': 'new'}
         next_runner.record.return_value = next_record

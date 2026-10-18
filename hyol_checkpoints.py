@@ -60,6 +60,10 @@ def merge_records(records):
 
 
 def load_tasks(state, name):
+    if not getattr(state, 'restore_history', True):
+        account_path = state.account_paths[name]
+        path = account_path.with_name(account_path.stem + '_tasks.json')
+        return path, read_checkpoint(path)
     from hyol_history import is_isolated
     isolated = read_checkpoint(state.directory / 'historical_isolations.json')
     account_path = state.account_paths[name]
@@ -115,6 +119,8 @@ def action_family(action):
 
 def guard_legacy_local_unresolved(scheduler):
     """Changing the shared ledger must never abandon unidentifiable local intent."""
+    if getattr(scheduler, 'run_context', None):
+        return
     import hyol_scheduler as hs
     shared = Path(getattr(scheduler, 'shared_state_directory', hs.STATE_DIR)).resolve()
     local = hs.STATE_DIR.resolve()
@@ -364,7 +370,7 @@ def register_identity_materials(scheduler):
     import hyol_scheduler as hs
     if getattr(scheduler, 'automatic_accounts', False):
         return
-    path = scheduler.state.directory / 'account_identities.json'
+    path = getattr(scheduler, 'identity_directory', scheduler.state.directory) / 'account_identities.json'
     identities = read_checkpoint(path)
     for account in scheduler.accounts:
         if account.identity_path.exists():
@@ -499,7 +505,7 @@ def bind_current_identity(scheduler, anonymous):
     import hyol_scheduler as hs
     directory = scheduler.state.directory
     shared = directory.parent
-    identities = read_checkpoint(shared / 'account_identities.json')
+    identities = read_checkpoint(getattr(scheduler,'identity_directory',shared) / 'account_identities.json')
     automatic = getattr(scheduler, 'automatic_accounts', False)
     first_frame = scheduler.capture()
     if automatic:
@@ -547,7 +553,8 @@ def bind_current_identity(scheduler, anonymous):
     if old.get('actions') and not old_mask:
         raise hs.PendingError('唯一账号已确认，但匿名旧动作缺身份证据，须先对账')
     account = hs.Account(anonymous.index, first_name, anonymous.tab_x)
-    state = hs.StateStore([first_name], directory=shared)
+    state = hs.StateStore([first_name], directory=shared,
+                          restore_history=getattr(scheduler,'run_context',None) is None)
     # The session glyph and current unique account must both agree before copying.
     if old_mask and old.get('actions'):
         actions = state.accounts[first_name].setdefault('actions', {})
