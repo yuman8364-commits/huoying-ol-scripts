@@ -13,10 +13,12 @@ from hyol_runtime import RuntimeController, RunRequest, VERSION
 from hyol_progress_view import ProgressView
 from hyol_daily_tasks import SOLO_OPTIONS, DEFAULT_SOLO_OPTIONS
 from hyol_team_six import TASKS as TEAM_TASKS, DEFAULT_TASKS, TASK_LABELS as TEAM_LABELS
+from hyol_team_pipeline import TEAM_TASKS as PIPELINE_DEFAULTS, SUPPORTED_TEAM_TASKS
 
 SOLO_LABELS = {'mail': '邮件', 'welfare': '在线福利', 'ranking': '排位赛',
                'survival': '生存演习', 'quiz': '忍者测验', 'arena': '竞技场',
                'weekend': '周末（拼图＋达摩）', 'treasure': '挖宝（每号5分钟）'}
+SOLO_LABELS['daruma'] = '达摩'
 INDEPENDENT = {'竞技场': 'arena', '羁绊': 'bond', '周末任务': 'weekend', '挖宝（5分钟）': 'treasure'}
 EVENT_LABELS = {'daily_task_started': '任务开始', 'daily_task_complete': '任务与回村已确认',
                 'daily_task_pending': '任务待处理', 'generic_team_task_started': '组队任务开始',
@@ -47,6 +49,9 @@ EVENT_LABELS.update(pipeline_team_tick='轮换队长', pipeline_team_pending='�
 EVENT_LABELS['pipeline_task_not_open'] = '当前不在开放时间，继续下一项'
 EVENT_LABELS['pipeline_reformed_teams'] = '先执行当前已组好的队伍'
 EVENT_LABELS['pipeline_group_remaining'] = '继续多人副本'
+EVENT_LABELS['pipeline_round_started'] = '两队开始本轮'
+EVENT_LABELS['pipeline_round_focus'] = '固定检查当前队伍'
+EVENT_LABELS['pipeline_round_completed'] = '两队本轮已完成'
 
 
 def format_task_event(event, mode):
@@ -78,7 +83,7 @@ class UnifiedClient(tk.Tk):
         self.team_mode = tk.StringVar(value='自动建队')
         self.pipeline_leaders = (tk.StringVar(value='1'),tk.StringVar(value='6'))
         self.pipeline_auto = tk.BooleanVar(value=True)
-        self.pipeline_task_vars = {t:tk.BooleanVar(value=True) for t in ('group_instance','wanted')}
+        self.pipeline_task_vars = {t:tk.BooleanVar(value=t in PIPELINE_DEFAULTS) for t in SUPPORTED_TEAM_TASKS}
         self.friend_shortcut = tk.BooleanVar(value=False)
         self.member_vars = {index: tk.BooleanVar(value=index in (2, 3)) for index in range(1, 7)}
         self.task_vars = {task: tk.BooleanVar(value=task in DEFAULT_SOLO_OPTIONS) for task in SOLO_OPTIONS}
@@ -147,7 +152,7 @@ class UnifiedClient(tk.Tk):
         line.pack(fill='x',pady=8)
         for task,variable in self.pipeline_task_vars.items():
             ttk.Checkbutton(line,text=TEAM_LABELS[task],variable=variable).pack(side='left',padx=(0,20))
-        ttk.Label(self.pipeline_box,text='沿用已有队伍，自动发现时无需填写队长标签。只操作队长并交替推进。',
+        ttk.Label(self.pipeline_box,text='沿用已有队伍，只操作队长。两队开战后固定等待一队结算，再等待另一队；两队完成后开始下一轮。',
                   wraplength=840).pack(anchor='w')
         next_tasks = ttk.LabelFrame(self.pipeline_box,text='解散后：所有可运行的在线标签执行单人任务',padding=5)
         next_tasks.pack(fill='x',pady=8)

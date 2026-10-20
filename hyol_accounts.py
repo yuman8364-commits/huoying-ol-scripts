@@ -158,6 +158,18 @@ def is_captain(scheduler, frame):
 def _final_result(scheduler, frame):
     """Require both the finished-battle scroll and its acknowledgement control."""
     import hyol_scheduler as hs
+    header = 'team_reward_result_header_current.bmp'
+    reward = scheduler.template(header, (700,300,1200,500), frame, threshold=.98)
+    if reward[0]:
+        button = scheduler.template(hs.TEAM_REWARD_RESULT_TEMPLATE, hs.TEAM_REWARD_RESULT_ROI, frame, threshold=.98)
+        if button[0]:
+            return hs.TEAM_REWARD_RESULT_TEMPLATE, button[2], button[3], (header,reward[2],reward[3])
+    rankdown = scheduler.template('arena_rankdown_banner.bmp', (700,220,1250,430), frame, threshold=.98)
+    if rankdown[0]:
+        for asset in ('arena_rankdown_confirm.bmp','arena_rankdown_confirm_idle_current.bmp'):
+            button = scheduler.template(asset, (800,600,1150,760), frame, threshold=.98)
+            if button[0]:
+                return asset, button[2], button[3], ('arena_rankdown_banner.bmp',rankdown[2],rankdown[3])
     banner = next(((asset, x, y) for asset, roi in (
         ('arena_victory_banner.bmp', hs.ARENA_VICTORY_ROI),
         ('arena_defeat_banner.bmp', (780, 300, 1150, 650)))
@@ -179,7 +191,10 @@ def _tab_title_mask(frame, tab_x):
 
 def _same_tab_title(left, right):
     import hyol_scheduler as hs
-    return np.array_equal(left, right) or hs.mask_f1(left, right) >= .95
+    # Native tab tooltips start at y=28 and add a dark border to this
+    # 5..30 crop. Keep every title glyph through y=25 and ignore that edge.
+    # Preserve the mask shape and receipt hashes; only comparison is trimmed.
+    return np.array_equal(left, right) or hs.mask_f1(left[:21], right[:21]) >= .95
 
 
 def _reconcile_result_cleanup(scheduler, account, frame):
@@ -229,7 +244,7 @@ def _reconcile_result_cleanup(scheduler, account, frame):
     return frame
 
 
-def dismiss_current_final_result(scheduler, account, frame=None):
+def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0):
     """Close a normal member result before its hidden name can be identified.
 
     This is only a UI acknowledgement. Its separate receipt never credits a
@@ -245,13 +260,16 @@ def dismiss_current_final_result(scheduler, account, frame=None):
     expected = _final_result(scheduler, frame)
     if expected is None:
         return _reconcile_result_cleanup(scheduler,account,frame)
+    if _layers >= 3:
+        raise hs.PendingError('已确认的结算层数超过安全上限，未继续确认')
     title = _tab_title_mask(frame,account.tab_x)
 
     def require_result(current):
+        result = _final_result(scheduler,current)
         if (scheduler.offline_dialog_visible(current)
                 or scheduler._generic_active_tab_x(current) != account.tab_x
                 or not _same_tab_title(_tab_title_mask(current,account.tab_x),title)
-                or _final_result(scheduler, current) != expected):
+                or result is None or result[0] != expected[0] or result[3][0] != expected[3][0]):
             raise hs.PendingError('队员结算或当前标签变化，未点击确认')
 
     for sample in range(3):
@@ -296,8 +314,9 @@ def dismiss_current_final_result(scheduler, account, frame=None):
         scheduler.current_account_only = account.name
         scheduler._verified_current_mask = None
         scheduler.content_guard = result_guard
+        dx, dy = (62,15) if expected[3][0] == 'arena_rankdown_banner.bmp' else (55,18)
         if not scheduler.click_template(account, expected[0], hs.TEAM_BATTLE_RESULT_ROI,
-                55, 18, 'normal_member_result_confirm_'+identifier, [expected[0]],
+                dx, dy, 'normal_member_result_confirm_'+identifier, [expected[0]],
                 threshold=.98, anchor_threshold=.98):
             raise hs.PendingError('队员结算确认按钮已变化')
     finally:
@@ -320,6 +339,25 @@ def dismiss_current_final_result(scheduler, account, frame=None):
                 or not _same_tab_title(_tab_title_mask(frame,account.tab_x),title)
                 or scheduler.offline_dialog_visible(frame)):
             raise hs.PendingError('队员结算确认后标签或在线状态变化，凭据保留')
+        from hyol_identity_overlays import dismiss_identity_overlays
+        frame = dismiss_identity_overlays(scheduler,account,frame,only_kind='arena_trial_notice')
+        following = _final_result(scheduler,frame)
+        if following and following[3][0] != expected[3][0]:
+            # Arena defeat and strong loot can each paint a second known
+            # acknowledgement. Every layer has its own UI receipt, no credit.
+            frame = dismiss_current_final_result(scheduler,account,frame,_layers=_layers+1)
+            # The nested reward acknowledgement has its own bounded wait.
+            # Give this outer receipt fresh time to observe the returned page.
+            deadline = time.monotonic()+12
+            stable = 0
+        if (expected[3][0] == 'arena_rankdown_banner.bmp' and following is None
+                and not scheduler.template('arena_rankdown_banner.bmp',(700,220,1250,430),frame,threshold=.95)[0]):
+            from hyol_identity_overlays import inspect, dismiss_identity_overlays
+            parent = inspect(scheduler,frame)
+            if parent is not None and parent[0] == 'arena_lobby':
+                frame = dismiss_identity_overlays(scheduler,account,frame)
+                deadline = time.monotonic()+12
+                stable = 0
         if scheduler.main_ready(frame) and _final_result(scheduler, frame) is None:
             stable += 1
             if stable == 3:
@@ -384,9 +422,28 @@ def _observe_accounts(scheduler):
             continue
         try:
             from hyol_identity_overlays import dismiss_identity_overlays
-            frame = dismiss_current_final_result(scheduler, account, frame)
-            frame = dismiss_identity_overlays(scheduler, account, frame)
-            observations[slot], frames[slot] = collect_current_identity(scheduler, account, frame)
+            for repaint in range(4):
+                clicks_before = scheduler.content_click_count
+                try:
+                    frame = dismiss_identity_overlays(scheduler,account,frame,only_kind='arena_trial_notice')
+                    frame = dismiss_current_final_result(scheduler, account, frame)
+                    frame = dismiss_identity_overlays(scheduler, account, frame)
+                    observations[slot], frames[slot] = collect_current_identity(scheduler, account, frame)
+                    break
+                except hs.PendingError:
+                    fresh = scheduler.capture()
+                    # Server broadcasts briefly cover the victory banner. Wait
+                    # on this same tab for its positive banner/button pair;
+                    # never repeat a receipt after any content input was sent.
+                    if (repaint == 3 or scheduler.content_click_count != clicks_before
+                            or scheduler._generic_active_tab_x(fresh) != x
+                            or scheduler.offline_dialog_visible(fresh)
+                            or not any(scheduler.template(asset,hs.TEAM_BATTLE_RESULT_ROI,fresh,threshold=.98)[0]
+                                       for asset in ('team_result_confirm.bmp','arena_result_confirm.bmp'))):
+                        raise
+                    scheduler.event('account_result_repaint_wait',account,attempt=repaint+1,content_clicks=0)
+                    scheduler.wait_interruptible(.75)
+                    frame = scheduler.capture()
         except hs.AccountOffline:
             unavailable[slot] = 'offline_prompt'
             scheduler.event('account_disconnected_skipped', account, identity='unconfirmed')

@@ -9,13 +9,13 @@ import threading
 import hyol_scheduler as hs
 from hyol_daily_tasks import DailyRunner, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS
 from hyol_multi_solo import MultiSoloRunner
-from hyol_team_pipeline import TeamPipelineRunner, TEAM_TASKS as PIPELINE_TEAM_TASKS, detect_leaders
+from hyol_team_pipeline import TeamPipelineRunner, SUPPORTED_TEAM_TASKS as PIPELINE_TEAM_TASKS, detect_leaders
 from hyol_team_six import TeamRunner, TeamSelection, TASKS as TEAM_TASKS, DEFAULT_TASKS
 from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.17.8'
+VERSION = '2026.10.20.1'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -56,7 +56,7 @@ class RunRequest:
                     or any(type(slot) is not int or slot not in range(1,7) for slot in self.leaders)):
                 raise ValueError('队长标签须互不重复；留空可自动识别')
             if not self.team_tasks or len(set(self.team_tasks)) != len(self.team_tasks) or any(t not in PIPELINE_TEAM_TASKS for t in self.team_tasks):
-                raise ValueError('双队长衔接请勾选副本或通缉')
+                raise ValueError('已有队伍衔接请勾选副本、通缉或强者')
 
 
 def prohibit_purchase(scheduler):
@@ -186,12 +186,14 @@ def completion_verified(request, runner, result):
         return runner.completed()
     if request.mode in ('solo', 'arena', 'weekend', 'treasure'):
         from hyol_puzzle import weekend_verified
+        from hyol_daruma_task import verified as daruma_verified
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
         records = runner.records
         return all(records.get(task, {}).get('status') == 'done'
                    and records[task].get('task_completed') is True
                    and records[task].get('home_returned') is True
                    and (task != 'weekend' or weekend_verified(records[task]))
+                   and (task != 'daruma' or daruma_verified(records[task]))
                    and not records[task].get('followup_check_due') for task in tasks) and (
                        not request.final_managed or records.get('managed', {}).get('status') == 'done'
                        and records['managed'].get('task_completed') is True

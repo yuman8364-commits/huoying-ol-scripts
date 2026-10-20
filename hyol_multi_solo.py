@@ -17,6 +17,7 @@ from PIL import Image, ImageGrab
 
 import hyol_scheduler as hs
 from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json
+from hyol_daruma_task import verified as daruma_verified
 
 TAB_MARKER_CORE = "microclient_tab_close_core.bmp"
 TAB_CHROME_ROI = (0, 0, 1800, 39)
@@ -599,6 +600,7 @@ class MultiSoloRunner:
         rec = runner.record(task)
         if (rec.get("status") == "done" and rec.get("task_completed")
                 and rec.get("home_returned") and not rec.get('followup_check_due')
+                and (task != 'daruma' or daruma_verified(rec))
                 and (task != 'arena' or account.name in getattr(self,'arena_rewards_audited',set()))):
             self.event("multi_solo_task_skip_done", account, task=task)
             return
@@ -616,6 +618,8 @@ class MultiSoloRunner:
                 return
             if task == 'arena' and rec.get('task_completed'):
                 s.recheck_arena_rewards(account)
+            if task == 'daruma' and rec.get('task_completed') and not daruma_verified(rec):
+                raise hs.PendingError('达摩完成标记缺少奖励归零证据，保留待处理')
             if not rec.get('task_completed'):
                 if (task == 'survival' and runner.visible(
                         'survival_anchor.bmp', (201,69,601,419))
@@ -882,7 +886,8 @@ class MultiSoloRunner:
         for prefixes, task in ((('arena_', 'daily_arena_'), 'arena'),
                                (('ranking_', 'daily_ranking_'), 'ranking'),
                                (('survival_', 'daily_survival_'), 'survival'),
-                               (('puzzle_', 'daruma_', 'daily_weekend_'), 'weekend')):
+                               (('daruma_',), 'daruma' if 'daruma' in getattr(self, 'tasks', ()) else 'weekend'),
+                               (('puzzle_', 'daily_weekend_'), 'weekend')):
             if any(key.startswith(prefixes) and isinstance(record, dict)
                    and record.get('status') == 'pending' for key, record in actions.items()):
                 return task
@@ -974,6 +979,7 @@ class MultiSoloRunner:
                 or not runner.record(task).get('task_completed')
                 or not runner.record(task).get('home_returned')
                 or runner.record(task).get('followup_check_due')
+                or task == 'daruma' and not daruma_verified(runner.record(task))
                 for task in self.tasks
             ):
                 self.event('multi_solo_managed_pending', account,
@@ -1146,6 +1152,7 @@ class MultiSoloRunner:
                 and self.runner_for(account).record(task).get('task_completed') is True
                 and self.runner_for(account).record(task).get('home_returned') is True
                 and not self.runner_for(account).record(task).get("followup_check_due")
+                and (task != 'daruma' or daruma_verified(self.runner_for(account).record(task)))
                 for account in s.accounts for task in self.tasks
             ) and (not getattr(self, 'managed_enabled', True) or all(
                 self.runner_for(account).record('managed').get('status') == 'done'

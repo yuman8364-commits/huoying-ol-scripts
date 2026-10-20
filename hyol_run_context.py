@@ -234,7 +234,10 @@ class RunContext:
             frame = self.stable_layout_frame(scheduler,frame)
             account = self.resolve(scheduler,account)
             scheduler._capture_account = account
-        if account.name not in scheduler.available_account_names:
+        available = getattr(scheduler, 'available_account_names', None)
+        if available is None:
+            raise hs.PendingError('本轮账号映射尚未初始化，请重新点击开始')
+        if account.name not in available:
             raise hs.PendingError('本轮账号已不在可核实标签中')
         try:
             selected = scheduler._generic_active_tab_x(frame) == account.tab_x

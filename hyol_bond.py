@@ -15,7 +15,7 @@ from tkinter import ttk
 import hyol_scheduler as hs
 
 
-VERSION = "2026.10.17.8"
+VERSION = '2026.10.20.1'
 MAX_BATTLES = 99
 BOND_NO_RESPONSE_SECONDS = 30.0
 BOND_ACCOUNT = hs.Account(0, "当前羁绊窗口", 0)

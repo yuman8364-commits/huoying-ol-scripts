@@ -1,0 +1,62 @@
+{
+  "assets": [
+    {
+      "asset": "leaf_return_core_desert_current.bmp",
+      "source": "logs\\multiplayer_expansion_return_hover_before_20261018.png",
+      "sha256": "164e8c3a8641d1164cb426343897d33ce1426cd50d3ea11583f12eb3b950d0e4",
+      "crop": [
+        1899,
+        85,
+        1917,
+        105
+      ]
+    },
+    {
+      "asset": "leaf_return_core_desert2_current.bmp",
+      "source": "logs\\scheduler_evidence\\2026-10-18\\account_754d57d56d\\232029_124255_pending_return_leaf_pending.png",
+      "sha256": "16413ac3d710b83dac509e48ee001bd326005bae76c3f732b4b7c4c30424decc",
+      "crop": [
+        1899,
+        85,
+        1917,
+        105
+      ]
+    }
+  ],
+  "tooltip": "无论身在何处，点击回到木叶村",
+  "hover_evidence": "logs/multiplayer_expansion_return_hover_after_20261018.png",
+  "replay": [
+    {
+      "source": "logs\\multiplayer_expansion_return_hover_before_20261018.png",
+      "expected": true,
+      "scores": [
+        1.0,
+        0.9486662085757689
+      ]
+    },
+    {
+      "source": "logs\\scheduler_evidence\\2026-10-18\\account_754d57d56d\\232029_124255_pending_return_leaf_pending.png",
+      "expected": true,
+      "scores": [
+        0.9486662085757689,
+        0.9999999999999999
+      ]
+    },
+    {
+      "source": "logs\\multiplayer_expansion_observe_2300.png",
+      "expected": false,
+      "scores": [
+        0.1469814946855494,
+        0.19794722169886894
+      ]
+    },
+    {
+      "source": "logs\\multiplayer_expansion_gui_review_20261018.png",
+      "expected": false,
+      "scores": [
+        -1.0,
+        -1.0
+      ]
+    }
+  ]
+}

@@ -82,7 +82,7 @@ class DynamicAccountTests(unittest.TestCase):
                 frame.info['tab_x'] = selected[0]
                 return frame
             s = SimpleNamespace(shared_state_directory=Path(folder),no_content_clicks=False,
-                config={},capture=capture,check_stop=Mock(),wait_interruptible=Mock(),
+                config={},capture=capture,check_stop=Mock(),wait_interruptible=Mock(),content_click_count=0,
                 hwnd=123,account_logs={},log=Mock(last_error=''),event_sink=None,
                 chrome_click=lambda x,*args:selected.__setitem__(0,x),
                 offline_dialog_visible=lambda f:f.info['tab_x']==450,

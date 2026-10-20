@@ -897,7 +897,7 @@ class InterfaceTests(unittest.TestCase):
 
     def test_invalid_leaders_tasks_and_empty_solo_are_rejected(self):
         for extra in ({'leaders':(1,1)},{'leaders':(True,4)},
-                      {'leaders':(1,7)},{'team_tasks':('strong_approach',)},{'tasks':()}):
+                      {'leaders':(1,7)},{'team_tasks':('rescue_jinchuriki',)},{'tasks':()}):
             options=dict(mode='team_then_multi',leaders=(1,4),team_tasks=pipeline.TEAM_TASKS,tasks=('mail',))
             options.update(extra)
             with self.assertRaises(ValueError): runtime.RunRequest(**options)

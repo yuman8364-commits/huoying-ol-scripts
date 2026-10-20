@@ -281,6 +281,7 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
         ('team_instance_close.bmp', (1370,240,1460,330), 'team_instance_close.bmp'),
         ('survival_close.bmp', (1585,77,1685,177), 'survival_anchor.bmp'),
         ('wanted_close_current.bmp', (1310,290,1400,390), 'wanted_team_anchor.bmp'),
+        ('team_activity_close.bmp', (1300,280,1420,390), 'strong_reward_label_core_current.bmp'),
     )
     clicked = set()
     record = _record(s, account, 'return_leaf')
@@ -326,6 +327,8 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
                     for name, dx, dy, threshold in (
                             ('leaf_return_core_current.bmp', 10, 10, .98),
                             ('leaf_return_core_forest2_current.bmp', 10, 10, .98),
+                            ('leaf_return_core_desert_current.bmp', 9, 10, .98),
+                            ('leaf_return_core_desert2_current.bmp', 9, 10, .98),
                             ('leaf_return_current.bmp', 13, 17, .92),
                             ('leaf_return_hover.bmp', 13, 17, .92)):
                         if s.template(name, LEAF_RETURN_ROI, frame, threshold=threshold)[0]:

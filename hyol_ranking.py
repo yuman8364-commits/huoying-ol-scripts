@@ -6,7 +6,7 @@ import numpy as np
 import hyol_scheduler as hs
 
 PAGE = (790, 95, 1080, 195)
-TOOLBAR = (980, 69, 1130, 150)
+TOOLBAR = (930, 69, 1130, 150)
 COUNTER = (1470, 153, 1586, 184)
 DIGIT = (1563, 156, 1585, 183)
 CURRENT_COUNTER = (1560, 156, 1586, 184)

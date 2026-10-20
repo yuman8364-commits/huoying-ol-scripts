@@ -397,9 +397,9 @@ def _identity_layout(frame, templates=None):
     if _identity_templates is None:
         _identity_templates = hs.TemplateStore(.98)
     templates = templates or _identity_templates
-    def matches(name, roi):
+    def matches(name, roi, threshold=.98):
         path = hs.ASSETS / name
-        return path.exists() and templates.match(frame, path, roi, threshold=.98)[0]
+        return path.exists() and templates.match(frame, path, roi, threshold=threshold)[0]
     spring = (matches('hot_spring_title_current.bmp', (780, 230, 1100, 430))
               and matches('hot_spring_panel_close.bmp', (550, 70, 1650, 450)))
     managed = (matches('managed_settings_title_current.bmp', (750, 190, 1170, 290))
@@ -418,6 +418,8 @@ def _identity_layout(frame, templates=None):
              and matches('team_instance_close.bmp', (1370,240,1460,330)))
     wanted = (matches('wanted_team_anchor.bmp', (500,200,1450,850))
               and matches('wanted_close_current.bmp', (1310,290,1400,390)))
+    strong = (matches('strong_reward_label_core_current.bmp', (700,800,960,850))
+              and matches('team_activity_close.bmp', (1300,280,1420,390), .95))
     daily = ((matches('daily_practice_anchor.bmp', (951,119,1501,369))
               or matches('daily_practice_title_core_current.bmp',(1190,140,1420,275)))
              and matches('daily_practice_close.bmp', (1370,200,1460,280)))
@@ -428,7 +430,7 @@ def _identity_layout(frame, templates=None):
     if any(matches(name, (106,75,139,105)) for name in (
             'identity_team_badge_core_current.bmp', 'identity_team_badge_core_forest_current.bmp')):
         roi = (roi[0]+15, roi[1], roi[2]+15, roi[3])
-    return roi, 56 if welfare or weekend or puzzle or group or wanted or daily or public_room else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
+    return roi, 56 if welfare or weekend or puzzle or group or wanted or strong or daily or public_room else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
 
 
 def current_identity_crop(frame, templates=None):
