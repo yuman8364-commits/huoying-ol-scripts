@@ -20,6 +20,7 @@ TASK_LABELS = {
     "mail": "邮件", "welfare": "在线福利", "ranking": "排位赛",
     "survival": "生存演习", "quiz": "忍者测验", "arena": "竞技场",
     "weekend": "周末（拼图＋达摩）",
+    "daruma": "达摩",
     "treasure": "挖宝（每号5分钟）",
 }
 

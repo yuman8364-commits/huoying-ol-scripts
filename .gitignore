@@ -1,0 +1,23 @@
+# Local Python environments and generated caches
+/.build-env/
+/.venv/
+/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime state, personal account/session history and diagnostic evidence
+/logs/
+/state/
+/daruma_standalone/runtime/
+*.tmp
+*.log
+/*_state.json
+/*_result.json
+/*_failure.json
+
+# Generated desktop packages (source build scripts stay tracked)
+/build*/
+/dist*/
+/releases/

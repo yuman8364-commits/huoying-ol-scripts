@@ -85,16 +85,22 @@ def load_tasks(state, name):
         sources = [source for source in sources if source.exists()]
         if not sources:
             continue
+        # Parse every historical entry at most once. The old code re-opened
+        # all sources for each task when checking isolated action provenance.
         canonical = sources[0] if sources[0].name.endswith('_tasks.json') else None
-        previous = read_checkpoint(canonical) if canonical else merge_records(
-            [(source, read_checkpoint(source)) for source in sources])
+        # A canonical task journal supersedes alternate entrances; never open
+        # those secondary ledgers (which could be stale or partially written).
+        selected_sources = [canonical] if canonical else sources
+        snapshots = [(source, read_checkpoint(source)) for source in selected_sources]
+        previous = snapshots[0][1] if canonical else merge_records(snapshots)
         for task, rec in previous.items():
             if task in seen or not isinstance(rec, dict) or task.startswith('_'):
                 continue
             seen.add(task)
-            task_sources = [canonical] if canonical else [source for source in sources if task in read_checkpoint(source)]
-            if task_sources and all(is_isolated(isolated,source,'task:'+task,read_checkpoint(source)[task])
-                                    for source in task_sources):
+            task_sources = snapshots[:1] if canonical else [
+                (source, ledger) for source, ledger in snapshots if task in ledger]
+            if task_sources and all(is_isolated(isolated, source, 'task:'+task, ledger[task])
+                                    for source, ledger in task_sources):
                 continue
             if complete(rec) or rec.get('status', 'new') == 'new':
                 continue
@@ -391,9 +397,9 @@ def _identity_layout(frame, templates=None):
     if _identity_templates is None:
         _identity_templates = hs.TemplateStore(.98)
     templates = templates or _identity_templates
-    def matches(name, roi):
+    def matches(name, roi, threshold=.98):
         path = hs.ASSETS / name
-        return path.exists() and templates.match(frame, path, roi, threshold=.98)[0]
+        return path.exists() and templates.match(frame, path, roi, threshold=threshold)[0]
     spring = (matches('hot_spring_title_current.bmp', (780, 230, 1100, 430))
               and matches('hot_spring_panel_close.bmp', (550, 70, 1650, 450)))
     managed = (matches('managed_settings_title_current.bmp', (750, 190, 1170, 290))
@@ -412,6 +418,8 @@ def _identity_layout(frame, templates=None):
              and matches('team_instance_close.bmp', (1370,240,1460,330)))
     wanted = (matches('wanted_team_anchor.bmp', (500,200,1450,850))
               and matches('wanted_close_current.bmp', (1310,290,1400,390)))
+    strong = (matches('strong_reward_label_core_current.bmp', (700,800,960,850))
+              and matches('team_activity_close.bmp', (1300,280,1420,390), .95))
     daily = ((matches('daily_practice_anchor.bmp', (951,119,1501,369))
               or matches('daily_practice_title_core_current.bmp',(1190,140,1420,275)))
              and matches('daily_practice_close.bmp', (1370,200,1460,280)))
@@ -422,7 +430,7 @@ def _identity_layout(frame, templates=None):
     if any(matches(name, (106,75,139,105)) for name in (
             'identity_team_badge_core_current.bmp', 'identity_team_badge_core_forest_current.bmp')):
         roi = (roi[0]+15, roi[1], roi[2]+15, roi[3])
-    return roi, 56 if welfare or weekend or puzzle or group or wanted or daily or public_room else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
+    return roi, 56 if welfare or weekend or puzzle or group or wanted or strong or daily or public_room else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
 
 
 def current_identity_crop(frame, templates=None):

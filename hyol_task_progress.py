@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TASK_LABELS = dict(mail='邮件', welfare='福利', ranking='排位', survival='生存',
-                   quiz='测验', arena='竞技场', weekend='周末', treasure='挖宝', managed='托管')
+                   quiz='测验', arena='竞技场', daruma='达摩', weekend='周末', treasure='挖宝', managed='托管')
 STATUSES = dict(new='未执行', running='执行中', done='已完成', pending='待核实',
                 skipped='跳过', unselected='未选择', offline='掉线')
 
@@ -48,6 +48,9 @@ def complete(task, rec):
         return False
     if task == 'managed':
         return bool(rec.get('evidence'))
+    if task == 'daruma':
+        from hyol_daruma_task import verified
+        return rec.get('home_returned') is True and verified(rec)
     return rec.get('home_returned') is True and (task != 'ranking' or rec.get('zero_verified') is True)
 
 

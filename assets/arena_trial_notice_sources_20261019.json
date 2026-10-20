@@ -1,0 +1,26 @@
+{
+  "source": "D:\\火影ol脚本\\logs\\multiplayer_live_20261019\\current_after_defeat_click.png",
+  "source_sha256": "59cd8c3b61474569337b1bea62c2b006029960e36c77e1a4fe3882cc3b864494",
+  "title": {
+    "asset": "arena_trial_notice_title_current.bmp",
+    "roi": [
+      823,
+      303,
+      1118,
+      364
+    ],
+    "score": 1.0
+  },
+  "close": {
+    "asset": "arena_trial_notice_close_current.bmp",
+    "roi": [
+      1233,
+      327,
+      1256,
+      350
+    ],
+    "sha256": "3efbb474579c4ea64ee0ea3a2da4b20106c4a3f19844dc94ebeac0a24d474c44",
+    "score": 1.0
+  },
+  "behavior": "UI notice X only; no formation, win, battle or task credit."
+}

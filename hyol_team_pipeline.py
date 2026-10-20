@@ -22,7 +22,8 @@ from hyol_multi_solo import tab_close_positions, active_tab_centers
 from hyol_team_six import SixTabScheduler, room_member_assignment
 
 TEAM_TASKS = ('group_instance', 'wanted')
-TASK_KEYS = {'group_instance': 'group', 'wanted': 'wanted'}
+SUPPORTED_TEAM_TASKS = (*TEAM_TASKS, 'strong_approach')
+TASK_KEYS = {'group_instance': 'group', 'wanted': 'wanted', 'strong_approach': 'strong'}
 ROOM = (1200, 260, 1280, 340)
 PUBLIC_ROOM = (1360, 250, 1450, 340)
 CREATE = (951, 650, 1301, 850)
@@ -100,6 +101,29 @@ def group_reward_zero_confirmed(record):
     return (type(record.get('daily_remaining')) is int and record['daily_remaining'] == 0
             and type(record.get('friendship_remaining')) is int and record['friendship_remaining'] == 0
             and record.get('reward_exhausted') is True and bool(record.get('zero_evidence')))
+
+
+def strong_reward_zero_confirmed(record, captain):
+    return (bool(captain) and record.get('captain') == captain
+            and type(record.get('captain_remaining')) is int and record['captain_remaining'] == 0
+            and record.get('captain_observations') == 3
+            and record.get('reward_exhausted') is True and bool(record.get('zero_evidence')))
+
+
+def strong_stop_confirmed(record, captain):
+    return (strong_reward_zero_confirmed(record, captain)
+            or (bool(captain) and record.get('captain') == captain
+                and record.get('stop_reason') == 'stamina_exhausted'
+                and record.get('stamina_exhausted') is True
+                and record.get('stamina_observations') == 3
+                and bool(record.get('stamina_evidence'))
+                and record.get('refused_start_resolved') is True))
+
+
+class StrongStaminaExhausted(hs.PendingError):
+    def __init__(self, frame):
+        super().__init__('强者页面明确提示体力不足，停止继续挑战')
+        self.frame = frame
 
 
 def party_name_masks(frame):
@@ -216,11 +240,151 @@ def detect_leaders(*, event_sink=None, stop_event=None):
 class PipelineScheduler(SixTabScheduler):
     """Keep the existing identity/foreground guards; never touch another tab to bind."""
 
+    def template(self, name, roi=hs.VIEW, frame=None, threshold=None):
+        if name in ('strong_approach_anchor.bmp','team_activity_start.bmp') and frame is None:
+            frame = self.capture()
+        result = super().template(name, roi, frame, threshold=threshold)
+        if name == 'strong_approach_anchor.bmp' and not result[0]:
+            result = super().template('strong_mirror_anchor.bmp', roi, frame, threshold=threshold)
+            if not result[0]:
+                footer = super().template('strong_reward_label_core_current.bmp', (700,800,960,850), frame, threshold=.98)
+                close = super().template('team_activity_close.bmp', (1300,280,1420,390), frame, threshold=.90)
+                if footer[0] and close[0]:
+                    return footer
+        if name == 'team_activity_start.bmp' and not result[0]:
+            if self.template('strong_approach_anchor.bmp', frame=frame)[0]:
+                return super().template('strong_mirror_start.bmp', roi, frame, threshold=threshold)
+        return result
+
+    def click_template(self, account, name, roi, dx, dy, label, anchors, **kwargs):
+        if name != 'team_activity_start.bmp' or '_strong_approach_attempt_' not in label:
+            return super().click_template(account, name, roi, dx, dy, label, anchors, **kwargs)
+        # The animated entrance shifts its detected border. Recheck the same
+        # known button and page while keeping the point inside the button.
+        before = self.content_click_count
+        for attempt in range(5):
+            if self.content_click_count != before or self.state.action_status(account.name,label) != 'new':
+                return False
+            frame = self.content_guard(account, anchors, anchor_threshold=kwargs.get('anchor_threshold'))
+            match = self.template(name, roi, frame, threshold=kwargs.get('threshold', .90))
+            if match[0] and self.template('strong_approach_anchor.bmp', frame=frame)[0]:
+                _ok, _score, x, y = match
+                def still_same_button(fresh):
+                    got = self.template(name, roi, fresh, threshold=kwargs.get('threshold', .90))
+                    return (got[0] and abs(got[2]-x) <= 12 and abs(got[3]-y) <= 8
+                            and self.template('strong_approach_anchor.bmp', frame=fresh)[0])
+                try:
+                    self.click_point(account,x+dx,y+dy,label,anchors,kwargs.get('irreversible',False),
+                                     anchor_threshold=kwargs.get('anchor_threshold'),frame_predicate=still_same_button)
+                    return True
+                except hs.TargetPreconditionChanged:
+                    pass  # Retrying is allowed only if the next iteration proves no input/intent.
+            if attempt < 4:
+                self.wait_interruptible(.2)
+        return False
+
+    def strong_battle_owned(self, account):
+        scope = getattr(self, '_strong_scope', None)
+        if not scope:
+            return False
+        team, leader, spec = scope
+        attempt = self._next_team_attempt_index(team, leader, spec)
+        return (account.name == leader.name and spec.key == 'strong_approach'
+                and self.state.action_status(leader.name, self._team_attempt_base(team,spec,attempt)+'_start')
+                    in ('pending','done'))
+
+    def _read_team_reward_remaining(self, account, spec, frame=None):
+        try:
+            return super()._read_team_reward_remaining(account, spec, frame)
+        except hs.PendingError as error:
+            if spec.key != 'strong_approach':
+                raise
+            # No input while the counter is unknown. A newly enrolled local
+            # asset may be used only on a fresh, identity-verified page.
+            def inventory():
+                return tuple(sorted((p.name,p.stat().st_mtime_ns) for p in hs.ASSETS.glob(spec.reward_counter_prefix+'*.bmp')))
+            previous = inventory()
+            self.event('pipeline_strong_counter_pending', account, detail=str(error), observation_seconds=30)
+            deadline = time.monotonic()+30
+            while time.monotonic() < deadline:
+                self.wait_interruptible(.25)
+                current = inventory()
+                if current == previous:
+                    continue
+                previous = current
+                fresh = self.capture()
+                if (not self.verify_identity(account, fresh)[0]
+                        or not self.template(spec.page_anchor, (250,80,1720,950), fresh)[0]):
+                    raise hs.PendingError('强者次数待核实期间页面或身份改变，保留原动作')
+                try:
+                    return super()._read_team_reward_remaining(account, spec, fresh)
+                except hs.PendingError:
+                    pass
+            raise error
+
+    def strong_stamina_warning(self, frame):
+        asset = 'strong_stamina_insufficient_current.bmp'
+        return ((hs.ASSETS / asset).is_file()
+                and self.template('strong_approach_anchor.bmp', (250,80,1720,950), frame)[0]
+                and self.template(asset, (500,250,1450,850), frame, threshold=.98)[0])
+
+    def strong_battle_visible(self, frame):
+        # Strong approach has a different battle shell from solo survival.
+        # These two controls authorize observation only, never a click or win.
+        return (self._battle_hud_visible(frame)
+                or (self.template('strong_battle_round_label_current.bmp', (880,130,1050,210), frame, threshold=.95)[0]
+                    and self.template('strong_battle_retreat_core_current.bmp', (1510,870,1630,980), frame, threshold=.98)[0]))
+
+    def capture(self):
+        frame = super().capture()
+        if getattr(self, '_watch_strong_stamina', False) and self.strong_stamina_warning(frame):
+            self._watch_strong_stamina = False
+            raise StrongStaminaExhausted(frame)
+        return frame
+
+    def _strong_all_member_rewards_zero(self, team, leader, spec):
+        # The pipeline operates only the captain. Member counters and battle
+        # pages are deliberately not visited during strong approach.
+        samples = []
+        for sample in range(3):
+            frame = self.capture()
+            if (not self.template(spec.page_anchor, (250,80,1720,950), frame)[0]
+                    or not self.verify_identity(leader, frame)[0]):
+                raise hs.PendingError('强者队长奖励检查的页面或实名未确认')
+            samples.append(self._read_team_reward_remaining(leader, spec, frame))
+            if sample < 2:
+                self.wait_interruptible(.2)
+        if samples != [0,0,0]:
+            raise hs.PendingError('强者队长奖励次数未连续三帧确认归零，保留队伍')
+        evidence = str(self.save_raw_evidence(frame, leader, 'pipeline_strong_captain_zero', 'verified'))
+        self.state.global_state.setdefault('generic_strong_counts', {})[str(team.index)] = dict(
+            captain=self.state.aliases.get(leader.name,leader.name), captain_remaining=0,
+            zero_evidence=evidence, checked_at=hs.now_iso(), captain_observations=3)
+        self.state.save_global()
+        self.event('pipeline_strong_captain_zero', leader, remaining=0, evidence=evidence)
+        return True
+
+    def _resume_generic_team_battle(self, team, leader, spec, frame=None, start_action=None, attempt_index=None):
+        if spec.key == 'strong_approach':
+            return hs.Scheduler._resume_generic_team_battle(self,team,leader,spec,frame,start_action,attempt_index)
+        return super()._resume_generic_team_battle(team,leader,spec,frame,start_action,attempt_index)
+
+    def _poll_generic_team_activity(self, team, leader, spec, attempt_index=None):
+        if spec.key == 'strong_approach':
+            return hs.Scheduler._poll_generic_team_activity(self,team,leader,spec,attempt_index)
+        return super()._poll_generic_team_activity(team,leader,spec,attempt_index)
+
+    def _next_team_attempt_index(self, team, leader, spec):
+        if spec.key == 'strong_approach':
+            return hs.Scheduler._next_team_attempt_index(self,team,leader,spec)
+        return super()._next_team_attempt_index(team,leader,spec)
+
 
     def switch_account(self, account, verify=True):
         context = getattr(self, 'run_context', None)
         if context and context.binding and not context.probing:
-            frame = context.select(self, account, allow_hidden=not verify,allow_transition=True)
+            frame = context.select(self, account,
+                allow_hidden=not verify or self.strong_battle_owned(account),allow_transition=True)
             return self.clear_pipeline_interference(self.by_name[account.name], frame)
         prior = getattr(self,'_capture_account',None)
         self._capture_account = account
@@ -649,8 +813,13 @@ class LeaderActivityRunner(DailyRunner):
         s = self.scheduler
         if task == 'group' and not group_reward_zero_confirmed(rec):
             raise hs.PendingError('副本今日剩余奖励尚未正向确认归零，不能结束或解散；保留原场次')
+        if task == 'strong' and not strong_stop_confirmed(rec, self.slot.get('owner')):
+            raise hs.PendingError('强者队长尚未确认体力不足或奖励归零，不能结束或解散')
         if task == 'group' and self.visible(PAGE_ANCHORS[task],PAGE_ROIS[task]):
             self.close_page(task)
+            return
+        if task == 'strong' and self.visible('strong_approach_anchor.bmp',(250,80,1720,950)):
+            s._close_team_activity_page(self.account,hs.TEAM_ACTIVITY_BY_KEY['strong_approach'])
             return
         from hyol_navigation import return_to_leaf
         return_to_leaf(s,self.account,allow_pending_navigation=True)
@@ -661,9 +830,180 @@ class LeaderActivityRunner(DailyRunner):
                    evidence=evidence, finished_at=hs.now_iso(), evidence_scope='captain')
         self.save()
 
+    def finish_strong_stamina(self, rec, team, spec, first_frame):
+        s = self.scheduler
+        frames = [first_frame]
+        for _ in range(2):
+            s.wait_interruptible(.1)
+            frames.append(s.capture())
+        if not all(s.strong_stamina_warning(frame) for frame in frames):
+            raise hs.PendingError('体力不足提示未连续三帧确认，保留强者未决动作')
+        evidence = str(s.save_raw_evidence(frames[-1], self.account, 'pipeline_strong_no_stamina', 'verified'))
+        attempt = rec['completed']+1
+        start = self.action(s._team_attempt_base(team, spec, attempt) + '_start')
+        # The same verified activity page plus its explicit refusal proves
+        # this pending start never became a battle. No battle is credited.
+        if s.state.action_status(self.account.name, start) == 'pending':
+            s.commit_action(self.account, start, '明确体力不足拒绝开战；battle_credit=false：' + evidence)
+        rec.update(captain=self.slot.get('owner'), stop_reason='stamina_exhausted', stamina_exhausted=True,
+                   stamina_observations=3, stamina_evidence=evidence,
+                   refused_start_resolved=True, reward_exhausted=False, phase='finishing')
+        self.save()
+        self.finish_task('strong', rec)
+        self.event('pipeline_strong_stamina_stop', task='strong_approach', evidence=evidence,
+                   battle_credit=False, detail='体力不足已确认，停止强者；未将奖励次数记为0')
+
+    def tick_strong(self, rec):
+        s = self.scheduler
+        bound = {s.state.aliases.get(a.name, a.name): a for a in s.accounts}
+        team = hs.Team(self.account.index, tuple(bound[name].name if name in bound else name
+                                                for name in self.slot['members']))
+        spec = replace(hs.TEAM_ACTIVITY_BY_KEY['strong_approach'], return_anchor='strong_approach_anchor.bmp',
+                       require_all_member_auto=False, require_reward_confirmation=True)
+        frame = s.switch_account(self.account,verify=rec.get('phase','ready') == 'ready')
+        self.account = s.by_name[self.account.name]
+        if s.strong_stamina_warning(frame):
+            self.finish_strong_stamina(rec,team,spec,frame)
+            return
+        if rec.get('phase') == 'finishing':
+            self.finish_task('strong',rec)
+            return
+        if self.absent_intent(rec,frame):
+            return
+        battle = rec['completed']+1
+        base = s._team_attempt_base(team,spec,battle)
+        on_page = self.visible(spec.page_anchor,(250,80,1720,950),frame)
+        if rec.get('phase','ready') == 'ready':
+            if not on_page:
+                s.open_strong_approach(team,self.account,spec)
+                return
+            if (not s.verify_identity(self.account,frame)[0]
+                    or not portrait_leader_present(s,frame)
+                    or not party_header_matches(self.slot.get('party_header'),frame,self.slot['members'])):
+                raise hs.PendingError('强者当前队长或原队伍头像栏未核实，不开始下一场')
+            remaining = s._read_team_reward_remaining(self.account,spec,frame)
+            if remaining == 0:
+                self.samples['strong_zero'] = self.samples.get('strong_zero',0)+1
+                if self.samples['strong_zero'] >= 3:
+                    evidence = str(s.save_raw_evidence(frame,self.account,'pipeline_strong_captain_zero','verified'))
+                    rec.update(captain=self.slot['owner'],captain_remaining=0,captain_observations=3,
+                               reward_exhausted=True,zero_evidence=evidence,phase='finishing')
+                    self.save()
+                return
+            self.samples['strong_zero'] = 0
+            if battle > spec.reward_counter_max+1:  # One collaboration reward can leave the normal count unchanged.
+                raise hs.PendingError('强者已达到本轮免费场次上限，保留次数与原队伍')
+            rec.update(status='running',phase='running',reward_before=remaining,
+                       captain_remaining=remaining,last_progress=time.time())
+            self.save()
+            self.send_once(rec,spec.start_template,(600,500,1450,1000),55,18,base+'_start')
+            return
+
+        result = s._team_result_template(frame)
+        reward = s._team_reward_result_visible(frame)
+        fighting = s.strong_battle_visible(frame)
+        if result or reward or fighting or s._battle_auto_on_visible(frame):
+            rec['launched_battle'] = battle
+            self.save()
+        if result:
+            self.send_once(rec,result,hs.TEAM_BATTLE_RESULT_ROI,
+                           55 if result.startswith('team_') else 64,
+                           18 if result.startswith('team_') else 19,base+'_result_confirm')
+            return
+        if reward:
+            self.send_once(rec,hs.TEAM_REWARD_RESULT_TEMPLATE,hs.TEAM_REWARD_RESULT_ROI,
+                           64,19,base+'_reward_confirm')
+            return
+        acknowledged = all(s.state.action_status(self.account.name,self.action(base+suffix)) == 'done'
+                           for suffix in ('_result_confirm','_reward_confirm'))
+        if on_page and acknowledged:
+            if not s.verify_identity(self.account,frame)[0]:
+                raise hs.PendingError('强者结算返回后的队长实名未确认')
+            remaining = s._read_team_reward_remaining(self.account,spec,frame)
+            if remaining not in (rec['reward_before'],rec['reward_before']-1):
+                raise hs.PendingError('强者结算后的普通奖励次数与本场不符，保留原场次')
+            previous = self.samples.get('strong_settled')
+            count = previous[1]+1 if previous and previous[0] == remaining else 1
+            self.samples['strong_settled'] = (remaining,count)
+            if count >= 3:
+                evidence = str(s.save_raw_evidence(frame,self.account,f'pipeline_strong_{battle}_settled','verified'))
+                rec.update(completed=battle,phase='ready',captain_remaining=remaining,last_progress=time.time())
+                rec.setdefault('battle_history',[]).append(dict(battle=battle,remaining=remaining,evidence=evidence,
+                    result_action=self.action(base+'_result_confirm'),reward_action=self.action(base+'_reward_confirm')))
+                self.samples.pop('strong_settled',None)
+                self.save()
+                self.event('pipeline_battle_complete',task='strong',completed=battle,remaining=remaining,evidence=evidence,
+                           detail='队长结果、通关奖励及返回活动页均已核实，等待另一队完成本轮')
+            return
+        self.samples.pop('strong_settled',None)
+        if s.main_ready(frame) and acknowledged:
+            s.open_strong_approach(team,self.account,spec)
+            return
+        if fighting and not self.visible('battle_auto_off.bmp',hs.BATTLE_AUTO_ROI,frame):
+            if getattr(self,'_strong_watchdog_index',None) != battle:
+                self._strong_watchdog = hs.BattleWatchdog.from_config(s.config)
+                self._strong_watchdog_index = battle
+            hs.check_battle_watchdog(s,self._strong_watchdog,self.account,frame,base,mode='strong_approach')
+            rec['last_progress'] = time.time()
+            self.next_poll_seconds = 4
+            self.save()
+        elif s._team_battle_start_visible(frame):
+            label = base+'_battle_start'
+            clicks_before = s.content_click_count
+            try:
+                self.send_once(rec,hs.TEAM_BATTLE_START_TEMPLATE,hs.TEAM_BATTLE_START_ROI,65,23,label)
+            except (hs.SafetyError, hs.PendingError):
+                # The countdown may start the battle between detection and the
+                # input guard. Only withdraw an unsent intent on positive live
+                # battle/result evidence; never claim that an input was sent.
+                if (s.content_click_count != clicks_before
+                        or s.state.action_status(self.account.name,self.action(label)) != 'new'):
+                    raise
+                fresh = s.switch_account(self.account,verify=False)
+                if (not s.strong_battle_visible(fresh) and not s._team_result_template(fresh)
+                        and not s._team_reward_result_visible(fresh)):
+                    raise
+                rec.pop('intent')
+                rec.update(launched_battle=battle,last_progress=time.time())
+                evidence = str(s.save_raw_evidence(fresh,self.account,'pipeline_strong_automatic_start','verified'))
+                self.save()
+                self.event('pipeline_strong_automatic_start',evidence=evidence,content_clicks=0,battle_credit=False)
+        elif spec.leader_start_template and self.visible(spec.leader_start_template,(650,400,1250,850),frame):
+            self.send_once(rec,spec.leader_start_template,(650,400,1250,850),55,18,base+'_leader_start')
+        elif self.visible('battle_auto_off.bmp',hs.BATTLE_AUTO_ROI,frame):
+            self.send_once(rec,'battle_auto_off.bmp',hs.BATTLE_AUTO_ROI,29,29,base+'_auto')
+        elif s._battle_auto_on_visible(frame):
+            if getattr(self,'_strong_watchdog_index',None) != battle:
+                self._strong_watchdog = hs.BattleWatchdog.from_config(s.config)
+                self._strong_watchdog_index = battle
+            hs.check_battle_watchdog(s,self._strong_watchdog,self.account,frame,base,mode='strong_approach')
+            rec['last_progress'] = time.time()
+            self.next_poll_seconds = 4
+            self.save()
+        elif time.time()-rec.get('last_progress',time.time()) >= 60:
+            raise hs.PendingError('强者60秒未确认战斗或结算进展，保留本场，不重复开战')
+
+    def round_settled(self, task, completed_before):
+        rec = self.record(task)
+        return (rec.get('status') == 'done' or (rec.get('completed',0) > completed_before
+                and not rec.get('intent') and rec.get('phase') in ('ready','verify_members','finishing','done')))
+
+    def round_started(self, task, completed_before):
+        rec = self.record(task)
+        if self.round_settled(task,completed_before):
+            return True
+        if rec.get('intent'):
+            return False
+        if task == 'wanted':
+            return rec.get('phase') in ('running','checking_empty','finishing','done') and not rec.get('navigation')
+        return rec.get('launched_battle',0) > completed_before
+
     def tick(self, task):
         s, rec = self.scheduler, self.record(task)
         self.next_poll_seconds = .6
+        if task == 'strong':
+            self.tick_strong(rec)
+            return
         if getattr(s,'run_context',None):
             f = s.switch_account(self.account,verify=rec.get('phase','ready') in ('ready','verify_members'))
             self.account = s.by_name[self.account.name]
@@ -849,6 +1189,9 @@ class LeaderActivityRunner(DailyRunner):
             self.samples['group_party'] = 0
         result = s._team_result_template(f)
         reward = s._team_reward_result_visible(f)
+        if result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90) or s._battle_auto_on_visible(f):
+            rec['launched_battle'] = battle
+            self.save()
         if not (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)):
             if getattr(self, '_group_watchdog_index', None) != battle:
                 self._group_watchdog = hs.BattleWatchdog.from_config(s.config)
@@ -884,8 +1227,8 @@ class TeamPipelineRunner:
         if (len(leaders) > 6 or len(set(leaders)) != len(leaders)
                 or any(type(slot) is not int or slot not in range(1,7) for slot in leaders)):
             raise ValueError('队长标签须互不重复；留空可自动识别')
-        if not tasks or len(set(tasks)) != len(tasks) or any(t not in TEAM_TASKS for t in tasks):
-            raise ValueError('双队长衔接仅支持副本和通缉')
+        if not tasks or len(set(tasks)) != len(tasks) or any(t not in SUPPORTED_TEAM_TASKS for t in tasks):
+            raise ValueError('已有队伍衔接支持副本、通缉和强者')
         if not solo_tasks or len(set(solo_tasks)) != len(solo_tasks) or any(t not in SOLO_OPTIONS for t in solo_tasks):
             raise ValueError('请至少选择一项有效的后续单人任务')
         if type(arena_wins) is not int or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
@@ -893,7 +1236,7 @@ class TeamPipelineRunner:
         if formation not in ('keep','main','fast') or type(managed_enabled) is not bool:
             raise ValueError('阵容或最后托管选项无效')
         self.leaders = tuple(leaders)
-        self.tasks = tuple(t for t in TEAM_TASKS if t in tasks)
+        self.tasks = tuple(t for t in SUPPORTED_TEAM_TASKS if t in tasks)
         self.solo_tasks, self.arena_wins, self.formation = tuple(solo_tasks), arena_wins, formation
         self.managed_enabled, self.root, self.sink = managed_enabled, Path(root), event_sink
         from hyol_run_context import RunContext
@@ -1056,52 +1399,103 @@ class TeamPipelineRunner:
         if changed:self.save()
 
     def run_teams(self):
-        # Poll only unfinished teams. Due times are transient observation
-        # scheduling; persisted action deadlines and counters stay untouched.
-        clock = getattr(self,'_poll_clock',time.monotonic)
-        due = {index: 0 for index in self.leaders}
-        while True:
-            for index in self.leaders:
-                self.scheduler.check_stop()
-                slot = self.record['teams'][str(index)]
-                if slot['status'] not in ('running','complete'):
-                    continue
-                if clock() < due[index]:
-                    continue
-                entered=clock()
-                try:
-                    task = next((TASK_KEYS[t] for t in self.tasks
-                                 if slot['tasks'].get(TASK_KEYS[t],{}).get('status') != 'done'
-                                 and (index, TASK_KEYS[t]) not in getattr(self, '_not_open_tasks', set())),None)
-                    if task is not None:
-                        if slot['status'] == 'complete':
-                            raise hs.PendingError('原解散阶段仍有任务结果未核实，保留队伍断点')
-                        driver = self.drivers[index]
-                        self.event('pipeline_team_tick',driver.account,task=task)
-                        driver.tick(task)
-                    if all(slot['tasks'].get(TASK_KEYS[t],{}).get('status') == 'done'
-                           or (index, TASK_KEYS[t]) in getattr(self, '_not_open_tasks', set()) for t in self.tasks):
-                        slot['status'] = 'complete'
+        # Launch both captains, then keep one selected until its round settles.
+        # No team can enter the following round before every participant settles.
+        for selected in self.tasks:
+            task = TASK_KEYS[selected]
+            while True:
+                participants = [index for index in self.leaders
+                    if self.record['teams'][str(index)]['status'] == 'running'
+                    and self.record['teams'][str(index)]['tasks'].get(task,{}).get('status') != 'done'
+                    and (index,task) not in self._not_open_tasks]
+                if not participants:
+                    break
+                before = {index:self.drivers[index].record(task).get('completed',0) for index in participants}
+                sequence = self.record.get('team_round',{}).get('sequence',0)+1
+                current = dict(task=task,sequence=sequence,participants=participants,completed_before=before,
+                               phase='launch',settled=[])
+                self.record['team_round'] = current
+                self.save()
+                self.event('pipeline_round_started',task=task,round=sequence,leaders=participants)
+                failed = []
+                for index in participants:
+                    if not self.drive_team_round(index,task,before[index],launch=True):
+                        failed.append(index)
+                        break
+                current['phase'] = 'settle'
+                current['settle_order'] = list(reversed(participants))
+                self.save()
+                # The last launched captain is already selected. Stay there,
+                # then check the other captain once, without a round-trip switch.
+                for index in reversed(participants):
+                    if index in failed:
+                        continue
+                    driver = self.drivers[index]
+                    # On a launch failure, only settle battles already launched.
+                    if failed and not driver.round_started(task,before[index]):
+                        continue
+                    if self.drive_team_round(index,task,before[index],launch=False):
+                        current['settled'].append(index)
                         self.save()
-                        self.dissolve(index,slot)
                     else:
-                        due[index] = clock()+getattr(self.drivers[index],'next_poll_seconds',.6)
-                except hs.AccountOffline as exc:
-                    self.block(slot,exc,True)
-                except hs.PendingError as exc:
-                    self.block(slot,exc)
-                finally:
-                    self.defer_navigation(index,max(0,clock()-entered))
-            remaining = [index for index in self.leaders
-                         if self.record['teams'][str(index)]['status'] in ('running','complete')]
-            if not remaining:
-                return
-            self.scheduler.wait_interruptible(max(.05,min(due[index] for index in remaining)-clock()))
+                        failed.append(index)
+                if failed:
+                    current.update(phase='pending',failed=failed)
+                    for index in participants:
+                        slot = self.record['teams'][str(index)]
+                        if slot['status'] == 'running':
+                            self.block(slot,'另一队本轮结果尚未核实；本队原场次保留，不开始下一轮')
+                    self.save()
+                    return
+                current['phase'] = 'complete'
+                self.save()
+                self.event('pipeline_round_completed',task=task,round=sequence,leaders=participants)
+        for index in self.leaders:
+            slot = self.record['teams'][str(index)]
+            if slot['status'] != 'running':
+                continue
+            try:
+                slot['status'] = 'complete'
+                self.save()
+                self.dissolve(index,slot)
+            except hs.AccountOffline as exc:
+                self.block(slot,exc,True)
+            except hs.PendingError as exc:
+                self.block(slot,exc)
+
+    def drive_team_round(self,index,task,completed_before,*,launch):
+        driver = self.drivers[index]
+        slot = self.record['teams'][str(index)]
+        ready = driver.round_started if launch else driver.round_settled
+        self.event('pipeline_round_focus',driver.account,task=task,phase='launch' if launch else 'settle')
+        clock = getattr(self,'_poll_clock',time.monotonic)
+        while True:
+            self.scheduler.check_stop()
+            if (index,task) in self._not_open_tasks or ready(task,completed_before):
+                return True
+            entered = clock()
+            try:
+                self.event('pipeline_team_tick',driver.account,task=task)
+                driver.tick(task)
+                if (index,task) in self._not_open_tasks or ready(task,completed_before):
+                    return True
+                self.scheduler.wait_interruptible(max(.05,min(8,driver.next_poll_seconds)))
+            except hs.AccountOffline as exc:
+                self.block(slot,exc,True)
+                return False
+            except hs.PendingError as exc:
+                self.block(slot,exc)
+                return False
+            finally:
+                self.defer_navigation(index,max(0,clock()-entered))
 
     def dissolve(self,index,slot):
         if ('group_instance' in self.tasks and (index, 'group') not in getattr(self, '_not_open_tasks', set())
                 and not group_reward_zero_confirmed(slot.get('tasks', {}).get('group', {}))):
             raise hs.PendingError('副本今日剩余奖励未确认归零，不解散或交接单人')
+        if ('strong_approach' in self.tasks
+                and not strong_stop_confirmed(slot.get('tasks', {}).get('strong', {}), slot.get('owner'))):
+            raise hs.PendingError('强者队长未确认体力不足或奖励归零，不解散或交接单人')
         s = self.scheduler
         account = s.accounts[index-1]
         s.switch_account(account)
@@ -1138,6 +1532,27 @@ class TeamPipelineRunner:
             try:
                 if account.name in pending_members:
                     raise hs.PendingError('本轮组队任务尚未结束，暂缓该队单人任务')
+                # Captains finish strong approach without visiting members.
+                # Dismiss their finished scrolls at this boundary, on the
+                # already bound tab, before requiring the visible role again.
+                # This acknowledges UI only and never adds battle/task credit.
+                frame = s.capture()
+                if not self.run_context.layout_matches(frame):
+                    frame = self.run_context.stable_layout_frame(s,frame)
+                    account = s.by_name[account.name]
+                if s._generic_active_tab_x(frame) != account.tab_x:
+                    s.chrome_click(account.tab_x,10,f'pipeline_handoff:{account.index}',account)
+                    s.wait_interruptible(.35)
+                    frame = s.capture()
+                from hyol_accounts import dismiss_current_final_result
+                for repaint in range(8):
+                    frame = dismiss_current_final_result(s,account,frame)
+                    if (s.main_ready(frame) or not any(
+                            s.template(asset,hs.TEAM_BATTLE_RESULT_ROI,frame,threshold=.98)[0]
+                            for asset in ('team_result_confirm.bmp','arena_result_confirm.bmp'))):
+                        break
+                    s.wait_interruptible(.75)
+                    frame = s.capture()
                 s.switch_account(account)
                 evidence = verify_unteamed(s,account)
                 from hyol_navigation import return_to_leaf
@@ -1193,6 +1608,10 @@ class TeamPipelineRunner:
                         from hyol_puzzle import weekend_verified
                         if not weekend_verified(rec):
                             return False
+                    if task == 'daruma':
+                        from hyol_daruma_task import verified as daruma_verified
+                        if not daruma_verified(rec):
+                            return False
                 managed = records.get(name, {}).get('managed', {})
                 if self.managed_enabled and (managed.get('status') != 'done'
                         or managed.get('task_completed') is not True or not managed.get('evidence')):
@@ -1205,8 +1624,11 @@ class TeamPipelineRunner:
                             and slot['tasks'][TASK_KEYS[t]].get('task_completed') is True
                             and slot['tasks'][TASK_KEYS[t]].get('home_returned') is True
                             and slot['tasks'][TASK_KEYS[t]].get('evidence')
-                            and slot['tasks'][TASK_KEYS[t]].get('zero_evidence' if t == 'group_instance' else 'empty_evidence')
+                            and (slot['tasks'][TASK_KEYS[t]].get('empty_evidence' if t == 'wanted' else 'zero_evidence')
+                                 or t == 'strong_approach' and slot['tasks'][TASK_KEYS[t]].get('stamina_evidence'))
                             and (t != 'group_instance' or group_reward_zero_confirmed(slot['tasks'][TASK_KEYS[t]]))
+                            and (t != 'strong_approach' or strong_stop_confirmed(
+                                slot['tasks'][TASK_KEYS[t]], slot.get('owner')))
                             for t in self.tasks)
                         for slot in self.record['teams'].values())
                 and self.record.get('solo_result') == 0)
@@ -1344,7 +1766,17 @@ def verify_unteamed(scheduler,account):
                     or not (s.template('team_toolbar_core_current.bmp',(1685,70,1735,120),f,threshold=.98)[0]
                             or s.template('team_toolbar.bmp',(1650,69,1770,149),f,threshold=.98)[0])):
                 raise hs.PendingError('无队检查入口重试前身份或图标未确认')
-            s.open_team_room(account,'pipeline_verify_solo_open')
+            try:
+                s.open_team_room(account,'pipeline_verify_solo_open')
+            except hs.PendingError:
+                # The public room may paint during the toolbar's own fresh
+                # guard. Classify that new frame before treating it as a
+                # missing entry; no dissolve or create input is repeated.
+                f = s.capture()
+                room = room_region(f)
+                if room is not None and s.template('team_create_button.bmp',CREATE,f,threshold=.98)[0]:
+                    break
+                raise
             s.wait_template('team_create_button.bmp',CREATE,6)
             f=s.capture()
             room=room_region(f)

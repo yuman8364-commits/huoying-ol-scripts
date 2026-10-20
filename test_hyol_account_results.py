@@ -120,6 +120,35 @@ class MemberResultTests(unittest.TestCase):
         self.assertEqual(self.s.clicks,0)
         self.assertFalse((Path(self.directory.name)/'normal_result_cleanup.json').exists())
 
+    def test_strong_result_then_loot_acknowledgement_have_separate_zero_credit_receipts(self):
+        original=self.s.click_template
+        def acknowledge(*args,**kwargs):
+            done=original(*args,**kwargs)
+            if self.s.clicks==1:
+                self.s.page='result'
+                self.s.banner='team_reward_result_header_current.bmp'
+                self.s.button=hs.TEAM_REWARD_RESULT_TEMPLATE
+            return done
+        self.s.click_template=acknowledge
+        frame=accounts.dismiss_current_final_result(self.s,self.account)
+        self.assertTrue(self.s.main_ready(frame))
+        self.assertEqual(self.s.clicks,2)
+        rows=json.loads((Path(self.directory.name)/'normal_result_cleanup.json').read_text())
+        self.assertEqual(len(rows),2)
+        self.assertTrue(all(row['status']=='done' and not row['battle_credit'] and not row['task_credit'] for row in rows.values()))
+        self.assertEqual(self.s.battle_ledger,{'completed':5,'actions':{'old_battle':{'status':'pending'}}})
+        self.assert_guards_restored()
+
+    def test_existing_loot_page_requires_its_header_and_button(self):
+        self.s.button=hs.TEAM_REWARD_RESULT_TEMPLATE
+        self.s.banner='unknown'
+        accounts.dismiss_current_final_result(self.s,self.account)
+        self.assertEqual(self.s.clicks,0)
+        self.s.banner='team_reward_result_header_current.bmp'
+        accounts.dismiss_current_final_result(self.s,self.account)
+        self.assertEqual(self.s.clicks,1)
+        self.assert_guards_restored()
+
     def test_read_only_and_joint_identity_probe_never_confirm(self):
         for attribute in ('no_content_clicks','_identity_observation_only'):
             setattr(self.s,attribute,True)

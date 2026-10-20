@@ -193,6 +193,27 @@ class ModelAuthorizationTests(unittest.TestCase):
             self.assertTrue(bad.error)
             self.assertFalse(bad.enabled_for(self.classes[0]))
 
+    def test_detector_filters_all_raw_rows_before_box_deduplication(self):
+        detector = detector_stub(dict(classes=['a', 'b'], image_size=32,
+                                      thresholds={'a': .85, 'b': .85},
+                                      disabled_calibration_targets=['b']))
+        detector.cached_frame, detector.cached_predictions = None, []
+        detector.session = Mock()
+        detector.session.get_inputs.return_value = [Mock(name='images')]
+        rows = np.array([[16, 16, 8, 8, .95, .01],
+                         [16, 16, 8, 8, .88, .01],
+                         [18, 18, 8, 8, .01, .99],
+                         [18, 18, 8, 8, float('nan'), .01],
+                         [16, 16, 8, 8, .50, .01]], dtype=np.float32)
+        detector.session.run.return_value = [rows.T[None, :, :]]
+        frame = Image.new('RGB', (32, 32))
+        first = detector.predict(frame)
+        self.assertEqual(1, len(first))
+        self.assertEqual('a', first[0].target)
+        self.assertAlmostEqual(.95, first[0].score, places=5)
+        self.assertIs(first, detector.predict(frame))
+        detector.session.run.assert_called_once()
+
     def test_disabled_class_score_one_still_produces_no_prediction(self):
         target = self.classes[0]
         detector = detector_stub(dict(classes=[target], image_size=32, thresholds={target: 1.0},

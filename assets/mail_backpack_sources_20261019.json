@@ -1,0 +1,24 @@
+{
+  "asset": "mail_backpack_full_current.bmp",
+  "roi": [
+    794,
+    485,
+    922,
+    496
+  ],
+  "source": "D:\\火影ol脚本\\logs\\scheduler_evidence\\2026-10-19\\account_b76494cf2c\\183438_674974_observed_mail_claim_all_network_3_response.png",
+  "source_sha256": "42a31f33646aa61a0e8f0b5d7aa2333cd94c1a0cca2b6afeba748076a9249929",
+  "asset_sha256": "5dd067b883a62c871fae94c2db2761ae66ad5b988518f87215139a7c85cf2b17",
+  "verified_against": "D:\\火影ol脚本\\logs\\scheduler_evidence\\2026-10-19\\account_72cd26215f\\183321_459248_observed_mail_claim_all_network_3_response.png",
+  "observations": [
+    {
+      "source": "D:\\火影ol脚本\\logs\\scheduler_evidence\\2026-10-19\\account_b76494cf2c\\183438_674974_observed_mail_claim_all_network_3_response.png",
+      "score": 0.9999999999999997
+    },
+    {
+      "source": "D:\\火影ol脚本\\logs\\scheduler_evidence\\2026-10-19\\account_72cd26215f\\183321_459248_observed_mail_claim_all_network_3_response.png",
+      "score": 0.9992368332747219
+    }
+  ],
+  "behavior": "pending only; no inventory cleanup or purchase"
+}

@@ -8,6 +8,7 @@
 |------|-----------|------|
 | `hyol_arena.py` | `hyol_scheduler.py` | 当前标签竞技场独立客户端 |
 | `daruma_standalone_gui.py` | `daruma_standalone/` | 达摩独立客户端；桌面“火影OL达摩”打开EXE |
+| `hyol_daruma_task.py` | `hyol_daily_tasks.py` / `daruma_standalone/` | 多人解散后及单人达摩选项；同线程递归互斥锁、本轮独立记录、奖励0及回村门 |
 | `hyol_bond.py` | `hyol_scheduler.py` | 羁绊连续作战独立客户端 |
 | `hyol_team_tasks.py` | `hyol_daily_tasks.py`、`hyol_scheduler.py` | 组队副本＋通缉任务入口 |
 | `hyol_daily_tasks.py` | `hyol_scheduler.py`、`hyol_treasure.py` | 单人日常统一实现；藏宝图为默认不选实验项 |

@@ -241,7 +241,8 @@ class ObservationLifecycleTests(unittest.TestCase):
             with self.assertRaises(hs.PendingError):
                 s.click_template(s.active, 'button.bmp', hs.VIEW, 1,1,
                                  'one_target', ['page.bmp'], irreversible=True)
-        click.assert_called_once_with(101,201)
+        click.assert_called_once_with(101,201, expected_hwnd=s.hwnd,
+                                      before_down=s.check_input_pause)
         self.assertEqual('pending', s.state.action_status(s.active.name, 'one_target'))
 
 

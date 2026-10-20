@@ -9,6 +9,24 @@ import hyol_navigation as nav
 
 
 class NavigationTests(unittest.TestCase):
+    def test_desert_return_core_matches_both_captains_but_not_battle_or_gui(self):
+        from pathlib import Path
+        source = hs.ROOT / 'logs/multiplayer_expansion_return_hover_before_20261018.png'
+        second = hs.ROOT / 'logs/scheduler_evidence/2026-10-18/account_754d57d56d/232029_124255_pending_return_leaf_pending.png'
+        battle = hs.ROOT / 'logs/multiplayer_expansion_observe_2300.png'
+        gui = hs.ROOT / 'logs/multiplayer_expansion_gui_review_20261018.png'
+        if not all(path.is_file() for path in (source,second,battle,gui)):
+            self.skipTest('Local live replay frames are not bundled')
+        store = hs.TemplateStore(.98)
+        for path, expected in ((source,True),(second,True),(battle,False),(gui,False)):
+            with self.subTest(frame=path.name):
+                frame = Image.open(path).convert('RGB')
+                if frame.size != (1920,1032):
+                    background = Image.new('RGB',(1920,1032)); background.paste(frame,(0,0)); frame = background
+                matches = [store.match(frame,hs.ASSETS/name,nav.LEAF_RETURN_ROI,threshold=.98)
+                           for name in ('leaf_return_core_desert_current.bmp','leaf_return_core_desert2_current.bmp')]
+                self.assertEqual(any(match[0] for match in matches),expected)
+
     def test_team_toolbar_core_ignores_variable_translucent_border(self):
         original = Image.open(hs.ASSETS/'team_toolbar.bmp').convert('RGB')
         store = hs.TemplateStore(.98)

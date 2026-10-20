@@ -82,7 +82,7 @@ class DynamicAccountTests(unittest.TestCase):
                 frame.info['tab_x'] = selected[0]
                 return frame
             s = SimpleNamespace(shared_state_directory=Path(folder),no_content_clicks=False,
-                config={},capture=capture,check_stop=Mock(),wait_interruptible=Mock(),
+                config={},capture=capture,check_stop=Mock(),wait_interruptible=Mock(),content_click_count=0,
                 hwnd=123,account_logs={},log=Mock(last_error=''),event_sink=None,
                 chrome_click=lambda x,*args:selected.__setitem__(0,x),
                 offline_dialog_visible=lambda f:f.info['tab_x']==450,
@@ -111,7 +111,8 @@ class DynamicAccountTests(unittest.TestCase):
              patch.object(hs.Win32,'foreground',return_value=123), \
              patch.object(hs.Win32,'click') as click:
             hs.Scheduler.chrome_click(s,315,10,'observe_account:2',account)
-            click.assert_called_once_with(315,10)
+            click.assert_called_once_with(315,10, expected_hwnd=s.hwnd,
+                                          before_down=s.check_input_pause)
             click.reset_mock()
             for label,x,y in (('observe_account:3',315,10),('refresh',315,10),
                               ('observe_account:2',316,10),('observe_account:2',315,100)):

@@ -150,20 +150,31 @@ class OnnxDetector:
         classes = self.manifest['classes']
         if raw.ndim != 3 or raw.shape[0] != 1 or raw.shape[1] != 4+len(classes):
             raise ValueError(f'unexpected detector output {raw.shape}')
+        # YOLO emits thousands of candidate rows. Filter class scores in NumPy
+        # before creating Python Detection objects for the surviving boxes.
+        rows = raw[0].T
         predictions = []
-        for row in raw[0].T:
-            cls = int(np.argmax(row[4:]))
-            score = float(row[4+cls])
-            target = classes[cls]
-            if (not np.isfinite(score) or target in self.manifest.get('disabled_calibration_targets', [])
-                    or score < float(self.manifest.get('thresholds', {}).get(target, .85))):
-                continue
-            cx, cy, w, h = map(float, row[:4])
-            box = (max(0., (cx-w/2-left)/ratio), max(0., (cy-h/2-top)/ratio),
-                   min(float(frame.width), (cx+w/2-left)/ratio), min(float(frame.height), (cy+h/2-top)/ratio))
-            if box[2] <= box[0] or box[3] <= box[1] or not all(np.isfinite(box)):
-                continue
-            predictions.append(Detection(target, box, score, 'yolo', True))
+        if len(rows):
+            labels = np.argmax(rows[:, 4:], axis=1)
+            confidences = rows[np.arange(len(rows)), 4 + labels]
+            disabled = set(self.manifest.get('disabled_calibration_targets', []))
+            thresholds = self.manifest.get('thresholds', {})
+            floors = np.asarray([float(thresholds.get(target, .85)) for target in classes])
+            class_enabled = np.asarray([target not in disabled for target in classes])
+            candidates = np.flatnonzero(
+                np.isfinite(confidences) & (confidences >= floors[labels])
+                & class_enabled[labels])
+            for index in candidates:
+                row = rows[index]
+                cls = int(labels[index])
+                score = float(confidences[index])
+                target = classes[cls]
+                cx, cy, w, h = map(float, row[:4])
+                box = (max(0., (cx-w/2-left)/ratio), max(0., (cy-h/2-top)/ratio),
+                       min(float(frame.width), (cx+w/2-left)/ratio), min(float(frame.height), (cy+h/2-top)/ratio))
+                if box[2] <= box[0] or box[3] <= box[1] or not all(np.isfinite(box)):
+                    continue
+                predictions.append(Detection(target, box, score, 'yolo', True))
         kept = []
         for det in sorted(predictions, key=lambda d: d.score, reverse=True):
             if not any(d.target == det.target and iou(d.box, det.box) > .45 for d in kept):

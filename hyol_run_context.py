@@ -142,37 +142,67 @@ class RunContext:
         previous = self.binding
         scope = {a.name for a in scheduler.accounts}
         accounts = tuple(scheduler.by_name.values())
-        owners = {a.index:scheduler.state.aliases.get(a.name,a.name) for a in accounts}
+        owners = {a.index: scheduler.state.aliases.get(a.name, a.name) for a in accounts}
+        # Treat rebinding as a transaction: a failed title probe or event sink
+        # must not leave the old binding paired with partially updated accounts.
+        missing = object()
+        fields = ('accounts', 'by_name', 'available_account_names', 'joint_identity_bound',
+                  '_bound_identity_names', '_bound_identity_masks', '_known_identity_materials',
+                  '_tab_title_masks', '_dynamic_identity_names', '_dynamic_identity_masks',
+                  '_dynamic_identity_materials', 'active')
+        original_fields = {name: getattr(scheduler, name, missing) for name in fields}
+        original_maps = {name: (name in scheduler.state.global_state,
+                                scheduler.state.global_state.get(name))
+                         for name in ('tab_map', 'verified_solo_tab_map')}
         try:
             centers, observations, frames, unavailable = observe_accounts(scheduler)
-            mapping, refs = register_observations(scheduler,observations)
-            self.remember(centers,mapping,observations,frames,refs,unavailable)
-            positions = {name:slot for slot,name in mapping.items()}
-            rebound = [replace(a,tab_x=centers[positions[owners[a.index]]-1]
+            mapping, refs = register_observations(scheduler, observations)
+            positions = {name: slot for slot, name in mapping.items()}
+            rebound = [replace(a, tab_x=centers[positions[owners[a.index]]-1]
                        if owners[a.index] in positions else 1801+100*a.index) for a in accounts]
-            scheduler.accounts = [a for a in rebound if a.name in scope]
-            scheduler.by_name = {a.name:a for a in rebound}
-            logical = {a.index:owners[a.index] for a in rebound if owners[a.index] in positions}
-            masks = {i:observations[positions[key]][-1] for i,key in logical.items()}
-            scheduler.available_account_names = {a.name for a in rebound if a.index in logical}
-            scheduler.joint_identity_bound = set(scheduler.available_account_names)
-            if hasattr(scheduler,'_bound_identity_names'):
+            new_accounts = [a for a in rebound if a.name in scope]
+            new_by_name = {a.name: a for a in rebound}
+            logical = {a.index: owners[a.index] for a in rebound if owners[a.index] in positions}
+            masks = {i: observations[positions[key]][-1] for i, key in logical.items()}
+            available = {a.name for a in rebound if a.index in logical}
+            current = {a.name: a.tab_x for a in rebound if a.index in logical}
+            named = hasattr(scheduler, '_bound_identity_names')
+            # Title probing can raise. Perform it before publishing ANY new map.
+            titles = ({a.index: scheduler._title_mask(frames[positions[owners[a.index]]], a.tab_x)
+                       for a in rebound if a.index in logical} if named else None)
+            self.remember(centers, mapping, observations, frames, refs, unavailable)
+            scheduler.accounts = new_accounts
+            scheduler.by_name = new_by_name
+            scheduler.available_account_names = available
+            scheduler.joint_identity_bound = set(available)
+            if named:
                 scheduler._bound_identity_names = logical
                 scheduler._bound_identity_masks = masks
                 scheduler._known_identity_materials = refs
-                scheduler._tab_title_masks = {a.index:scheduler._title_mask(frames[positions[owners[a.index]]],a.tab_x)
-                                             for a in rebound if a.index in logical}
+                scheduler._tab_title_masks = titles
             else:
                 scheduler._dynamic_identity_names = logical
                 scheduler._dynamic_identity_masks = masks
                 scheduler._dynamic_identity_materials = refs
-            current = {a.name:a.tab_x for a in rebound if a.index in logical}
-            scheduler.state.global_state.update(tab_map=current,verified_solo_tab_map=current)
+            scheduler.state.global_state.update(tab_map=current, verified_solo_tab_map=current)
             scheduler.active = None
-            scheduler.event('run_accounts_rebound',mapping={str(a.index):owners[a.index] for a in rebound
-                            if a.index in logical}, content_clicks=0, rescans=self.rebind_count)
+            scheduler.event('run_accounts_rebound',
+                            mapping={str(a.index): owners[a.index] for a in rebound
+                                     if a.index in logical},
+                            content_clicks=0, rescans=self.rebind_count)
         except BaseException:
             self.binding = previous
+            for name, value in original_fields.items():
+                if value is missing:
+                    if hasattr(scheduler, name):
+                        delattr(scheduler, name)
+                else:
+                    setattr(scheduler, name, value)
+            for name, (existed, value) in original_maps.items():
+                if existed:
+                    scheduler.state.global_state[name] = value
+                else:
+                    scheduler.state.global_state.pop(name, None)
             raise
         finally:
             self.probing = False
@@ -204,7 +234,10 @@ class RunContext:
             frame = self.stable_layout_frame(scheduler,frame)
             account = self.resolve(scheduler,account)
             scheduler._capture_account = account
-        if account.name not in scheduler.available_account_names:
+        available = getattr(scheduler, 'available_account_names', None)
+        if available is None:
+            raise hs.PendingError('本轮账号映射尚未初始化，请重新点击开始')
+        if account.name not in available:
             raise hs.PendingError('本轮账号已不在可核实标签中')
         try:
             selected = scheduler._generic_active_tab_x(frame) == account.tab_x

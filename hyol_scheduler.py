@@ -707,15 +707,25 @@ class Win32:
         cls.user32.SetForegroundWindow(hwnd)
 
     @classmethod
-    def click(cls, x: int, y: int) -> None:
+    def click(cls, x: int, y: int, *, expected_hwnd: int | None = None,
+              before_down: Callable[[], None] | None = None) -> None:
         if not cls.user32.SetCursorPos(x, y):
             raise SafetyError("SetCursorPos failed")
-        # Let the legacy Flash surface observe a stationary hover first.  The
-        # cursor never moves between down/up, so this cannot become a drag.
+        # Let Flash observe the stationary cursor, then validate immediately
+        # before DOWN: focus and F12 can change during the hover interval.
         time.sleep(0.15)
+        if before_down is not None:
+            before_down()
+        if expected_hwnd is not None:
+            if cls.foreground() != expected_hwnd:
+                raise SafetyError("game window lost foreground during pre-click hover")
+            if cls.f12_down():
+                raise KeyboardInterrupt("F12 before mouse down")
         cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.06)
-        cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        try:
+            time.sleep(0.06)
+        finally:
+            cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     @classmethod
     def move(cls, x: int, y: int) -> None:
@@ -1006,6 +1016,7 @@ class TeamActivitySpec:
     reward_counter_roi: tuple[int, int, int, int] | None = None
     reward_counter_max: int = 0
     require_all_member_auto: bool = False
+    require_reward_confirmation: bool = False
 
 
 # The leader is the only account whose catalogue, reward count, and result are
@@ -1649,7 +1660,7 @@ class Scheduler:
         # background, a missing role name or an unhealthy screen.
         return any(self.templates.match(frame, ASSETS/name, (650,350,1300,780), .98)[0]
                    for name in ('offline_login_prompt.bmp', 'offline_login_prompt_current.bmp',
-                                'offline_login_text_current.bmp') if (ASSETS/name).exists())
+                                'offline_login_text_current.bmp', 'offline_health_login_prompt_current.bmp') if (ASSETS/name).exists())
 
     def check_offline_frame(self, frame: Image.Image) -> bool:
         if not self.offline_dialog_visible(frame):
@@ -1934,7 +1945,8 @@ class Scheduler:
         if not blank_tab_chrome and hasattr(self,"screen_point") and self.screen_point(x,y) != (physical_x,physical_y):
             raise SafetyError("window changed during chrome target validation")
         self.check_input_pause()
-        Win32.click(physical_x, physical_y)
+        Win32.click(physical_x, physical_y, expected_hwnd=self.hwnd,
+                    before_down=self.check_input_pause)
         self._capture_account = account
         self._capture_binding_probe = label.startswith(('rebind_probe:', 'observe_account:'))
         self.click_count += 1
@@ -3002,7 +3014,8 @@ class Scheduler:
                 self.state.save_account(account.name)
         physical_x, physical_y = self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)
         self.check_input_pause()
-        Win32.click(physical_x, physical_y)
+        Win32.click(physical_x, physical_y, expected_hwnd=self.hwnd,
+                    before_down=self.check_input_pause)
         self.click_count += 1
         self.content_click_count += 1
         time.sleep(0.35)
@@ -3644,8 +3657,16 @@ class Scheduler:
         if not self.wait_main_after_close(account, 'mail_ready_anchor.bmp', (801,199,1101,369)):
             raise PendingError('邮件关闭后主界面未连续三帧确认')
 
+    def _mail_backpack_full_guard(self, account: Account, frame: Image.Image, evidence=None) -> None:
+        if (self.template('mail_warehouse_anchor.bmp', (801,199,1101,389), frame, threshold=.98)[0]
+                and self.template('mail_backpack_full_current.bmp', (740,450,1180,580), frame, threshold=.985)[0]):
+            evidence = evidence or self.save_raw_evidence(frame,account,'mail_backpack_full','pending')
+            self.event('mail_backpack_full',account,evidence=str(evidence),capacity='ordinary_backpack',
+                       detail='普通背包已满，邮件附件保留待领取；未清理或购买')
+            raise PendingError('普通背包已满，邮件附件保留待领取；证据='+str(evidence))
+
     def module_mail(self, account: Account) -> None:
-        self.ensure_assets(["mail_toolbar_icon.bmp", "mail_ready_anchor.bmp", "mail_close.bmp", "mail_attachment_warehouse.bmp", "mail_empty_list.bmp", "mail_warehouse_anchor.bmp", "mail_warehouse_close.bmp", "mail_claim_all.bmp", "mail_claim_all_disabled.bmp", "mail_claimed_stamp.bmp"])
+        self.ensure_assets(["mail_toolbar_icon.bmp", "mail_ready_anchor.bmp", "mail_close.bmp", "mail_attachment_warehouse.bmp", "mail_empty_list.bmp", "mail_warehouse_anchor.bmp", "mail_warehouse_close.bmp", "mail_claim_all.bmp", "mail_claim_all_disabled.bmp", "mail_claimed_stamp.bmp", "mail_backpack_full_current.bmp"])
         from hyol_inventory import FragmentRecovery, CapacityFull, capacity_notice_visible
         recovery = FragmentRecovery(self, account)
         if recovery.active:
@@ -3683,6 +3704,7 @@ class Scheduler:
         from hyol_network_retry import run as retry_network
         def mail_claimed():
             frame = self.capture()
+            self._mail_backpack_full_guard(account,frame)
             if (capacity_notice_visible(self, frame)
                     and self.template('mail_warehouse_anchor.bmp', (801,199,1101,389), frame)[0]):
                 evidence = self.save_raw_evidence(frame,account,'mail_capacity_full','verified')
@@ -3707,6 +3729,7 @@ class Scheduler:
                 frame = self.capture()
                 evidence = self.save_raw_evidence(frame,account,label+'_response','observed')
                 self.event('mail_claim_response',account,target=label,evidence=str(evidence))
+                self._mail_backpack_full_guard(account,frame,evidence)
                 if capacity_notice_visible(self,frame):
                     recovery.request(evidence)
                     raise CapacityFull('忍者碎片仓库已满')
@@ -4395,6 +4418,11 @@ class Scheduler:
         if any(key.startswith(prefixes) and isinstance(row, dict)
                and row.get('status') == 'pending' for key, row in actions.items()):
             raise PendingError("arena daily reward claim outcome unknown; refusing duplicate")
+        # Free-difficulty confirmation can leave the cursor over a ninja card.
+        # Clear its preview before observing reward rows and the arena title;
+        # otherwise the unchanged tooltip can consume the whole watchdog wait.
+        from hyol_identity_overlays import clear_hover_preview
+        clear_hover_preview(self)
         claim_index = 1
         while self._arena_reward_claim_done(account, claim_index):
             claim_index += 1
@@ -4817,6 +4845,10 @@ class Scheduler:
     def _poll_arena_slot(self, slot: CombatSlot) -> None:
         account = slot.account
         frame = self.capture()
+        if self.template('arena_trial_notice_title_current.bmp',(780,270,1190,390),frame,threshold=.98)[0]:
+            from hyol_identity_overlays import dismiss_identity_overlays
+            dismiss_identity_overlays(self,account,frame,only_kind='arena_trial_notice')
+            return
         self._combat_progress_watchdog(slot, frame)
         if (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
                 or self._arena_waiting_battle_visible(frame)):
@@ -4859,28 +4891,34 @@ class Scheduler:
             slot.defeat_confirmed = True
             self.event("arena_defeat_confirmed", account, index=slot.next_index, target=defeat_action)
             return
-        if (
-            self.template("arena_rankdown_banner.bmp", (700, 220, 1250, 430), frame, threshold=0.90)[0]
-            and self.template("arena_rankdown_confirm.bmp", (800, 600, 1150, 760), frame, threshold=0.90)[0]
-        ):
+        rankdown_button = None
+        if self.template("arena_rankdown_banner.bmp", (700,220,1250,430), frame, threshold=.98)[0]:
+            rankdown_button = next((asset for asset in
+                ('arena_rankdown_confirm.bmp','arena_rankdown_confirm_idle_current.bmp')
+                if self.template(asset,(800,600,1150,760),frame,threshold=.98)[0]),None)
+        if rankdown_button:
             defeat_action = f"arena_rankdown_confirm_{slot.next_index}"
             if self.state.action_status(account.name, defeat_action) == "pending":
                 raise PendingError("arena rank-down confirmation outcome unknown; refusing duplicate")
             if not self.click_template(
                 account,
-                "arena_rankdown_confirm.bmp",
+                rankdown_button,
                 (800, 600, 1150, 760),
                 62,
-                17,
+                15,
                 defeat_action,
-                ["arena_rankdown_banner.bmp", "arena_rankdown_confirm.bmp"],
+                ["arena_rankdown_banner.bmp", rankdown_button],
                 irreversible=True,
-                threshold=0.90,
+                threshold=.98,
+                anchor_threshold=.98,
+                frame_predicate=lambda fresh: self.template('arena_rankdown_banner.bmp',(700,220,1250,430),fresh,threshold=.98)[0],
             ):
                 raise PendingError("arena rank-down confirmation disappeared")
             if not self.wait_absent("arena_rankdown_banner.bmp", (700, 220, 1250, 430), 5, threshold=0.90):
                 raise PendingError("arena rank-down result remained after confirmation")
             self.commit_action(account, defeat_action, "战斗失败页已明确确认")
+            from hyol_identity_overlays import clear_hover_preview
+            clear_hover_preview(self)
             attempt_action = f"arena_attempt_victory_{slot.next_index}"
             if self.state.action_status(account.name, attempt_action) == "done":
                 self.state.set_action(account.name, attempt_action, "invalidated", "subsequent rank-down result proved this attempt was a defeat")
@@ -4904,11 +4942,9 @@ class Scheduler:
                 continue
             if not self.click_template(account, "arena_rankup_confirm.bmp", (801, 600, 1101, 760), 70, 28, label, ["arena_rankup_confirm.bmp"], irreversible=True):
                 raise PendingError("arena rank-up confirmation disappeared")
-            # The matched rank-up dialog itself is the positive victory
-            # evidence.  Commit the acknowledgement immediately after the
-            # guarded click so a replaced confirmation prompt cannot cause a
-            # duplicate click on resume.
-            self.commit_action(account, label, "post-battle confirmation matched and acknowledged; not used as victory proof")
+            if not self.wait_absent("arena_rankup_confirm.bmp", (801,600,1101,760), 3):
+                raise PendingError("竞技场确认发送后按钮仍在，保留本次未决确认，不重复点击")
+            self.commit_action(account, label, "post-battle confirmation disappeared; not used as victory proof")
             self.wait_interruptible(0.35)
         else:
             raise PendingError("arena rank-up confirmation sequence did not settle")
@@ -5926,6 +5962,13 @@ class Scheduler:
     def claim_survival_rewards(self, account: Account) -> None:
         run_index = 2 if self.state.action_status(account.name, "survival_second_run_started") == "done" else 1
         action = f"survival_claim_rewards_run_{run_index}"
+        # A later slot poll can revisit this function after the reward dialog
+        # has closed. The enabled and claimed buttons share almost all pixels;
+        # the completed receipt must prevent another irreversible claim.
+        if self.state.action_status(account.name, action) == "done":
+            self.event("survival_rewards_already_verified", account, target=action,
+                       detail="本轮奖励已正向确认领取，重复调度只复用完成记录")
+            return
         reward_result_visible = self.template("survival_reward_result_confirm.bmp", (701, 569, 1151, 819))[0]
         if not reward_result_visible and self.template("survival_final_claimed.bmp", (1151, 769, 1451, 1031), threshold=0.92)[0]:
             if self.state.action_status(account.name, action) != "done":
@@ -6595,7 +6638,10 @@ class Scheduler:
             asset = ASSETS / f"{spec.reward_counter_prefix}{digit}.bmp"
             if not asset.exists():
                 continue
-            ok, score, x, y = self.template(asset.name, spec.reward_counter_roi, frame, threshold=0.88)
+            # Strong-approach 3 and 5 have similar borders. The old .88
+            # floor accepted an unenrolled 3 as 5 at .881 on a live frame.
+            threshold = .96 if spec.key == 'strong_approach' else .88
+            ok, score, x, y = self.template(asset.name, spec.reward_counter_roi, frame, threshold=threshold)
             if ok:
                 matches.append((score, digit, x, y))
         matches.sort(reverse=True)
@@ -7060,13 +7106,15 @@ class Scheduler:
             # as the verified return only after the battle result has already
             # been acknowledged; this prevents a failed/ignored start click
             # from being mistaken for completion.
-            if self.main_ready(frame) and self.state.action_status(leader.name, result_action) == "done":
+            if (self.main_ready(frame) and self.state.action_status(leader.name, result_action) == "done"
+                    and (not spec.require_reward_confirmation
+                         or self.state.action_status(leader.name, reward_action) == "done")):
                 if self.state.action_status(leader.name, start_action) == "pending":
                     self.commit_action(leader, start_action, "leader activity returned after verified result")
                 elif self.state.action_status(leader.name, start_action) != "done":
                     raise PendingError(f"{base} returned without a recorded start")
                 if repeating:
-                    if not self._team_members_auto_complete(team, spec, attempt_index):
+                    if spec.require_all_member_auto and not self._team_members_auto_complete(team, spec, attempt_index):
                         raise PendingError(f"{base} returned without all members showing 取消")
                     self.state.set_action(leader.name, complete_action, "done", "本场结果已确认并返回")
                     self._set_team_activity_status(team, leader, spec, "running", f"第{attempt_index}场完成，等待奖励次数归零")
@@ -7079,12 +7127,15 @@ class Scheduler:
             if spec.return_anchor and self.template(spec.return_anchor, (250, 80, 1720, 950), frame)[0]:
                 if self.state.action_status(leader.name, result_action) != "done":
                     raise PendingError(f"{base} returned without a committed result confirmation")
+                if spec.require_reward_confirmation and self.state.action_status(leader.name,reward_action) != "done":
+                    self.wait_interruptible(.3)
+                    continue
                 if self.state.action_status(leader.name, start_action) == "pending":
                     self.commit_action(leader, start_action, "leader activity returned after verified result")
                 elif self.state.action_status(leader.name, start_action) != "done":
                     raise PendingError(f"{base} returned without a recorded start")
                 if repeating:
-                    if not self._team_members_auto_complete(team, spec, attempt_index):
+                    if spec.require_all_member_auto and not self._team_members_auto_complete(team, spec, attempt_index):
                         raise PendingError(f"{base} returned without all members showing 取消")
                     self.state.set_action(leader.name, complete_action, "done", "本场结果已确认并返回活动页")
                     self._set_team_activity_status(team, leader, spec, "running", f"第{attempt_index}场完成，等待奖励次数归零")
@@ -7247,13 +7298,15 @@ class Scheduler:
                 self.wait_interruptible(0.3)
                 continue
 
-            if self.main_ready(frame) and self.state.action_status(leader.name, result_action) == "done":
+            if (self.main_ready(frame) and self.state.action_status(leader.name, result_action) == "done"
+                    and (not spec.require_reward_confirmation
+                         or self.state.action_status(leader.name, reward_action) == "done")):
                 if self.state.action_status(leader.name, start_action) == "pending":
                     self.commit_action(leader, start_action, "leader activity returned after verified result")
                 elif self.state.action_status(leader.name, start_action) != "done":
                     raise PendingError(f"{base} returned without a recorded start")
                 if repeating:
-                    if not self._team_members_auto_complete(team, spec, attempt_index):
+                    if spec.require_all_member_auto and not self._team_members_auto_complete(team, spec, attempt_index):
                         raise PendingError(f"{base} returned without all members showing 取消")
                     self.state.set_action(leader.name, f"{base}_complete", "done", "本场结果已确认并返回")
                     self._set_team_activity_status(team, leader, spec, "running", f"第{attempt_index}场完成，等待奖励次数归零")
@@ -7264,7 +7317,8 @@ class Scheduler:
                 return
 
             if spec.return_anchor and self.template(spec.return_anchor, (250, 80, 1720, 950), frame)[0]:
-                if self.state.action_status(leader.name, result_action) != "done":
+                if (self.state.action_status(leader.name, result_action) != "done"
+                        or spec.require_reward_confirmation and self.state.action_status(leader.name,reward_action) != "done"):
                     # The direct-start activity may keep its catalogue anchor
                     # visible for several repaint frames. It is not a return
                     # proof until a result acknowledgement has been recorded.
@@ -7275,7 +7329,7 @@ class Scheduler:
                 elif self.state.action_status(leader.name, start_action) != "done":
                     raise PendingError(f"{base} returned without a recorded start")
                 if repeating:
-                    if not self._team_members_auto_complete(team, spec, attempt_index):
+                    if spec.require_all_member_auto and not self._team_members_auto_complete(team, spec, attempt_index):
                         raise PendingError(f"{base} returned without all members showing 取消")
                     self.state.set_action(leader.name, f"{base}_complete", "done", "本场结果已确认并返回活动页")
                     self._set_team_activity_status(team, leader, spec, "running", f"第{attempt_index}场完成，等待奖励次数归零")

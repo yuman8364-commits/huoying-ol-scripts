@@ -23,6 +23,7 @@ if ($logDirectory -and -not (Test-Path -LiteralPath $logDirectory)) {
 }
 
 $steps = @(
+    @{ Name = '多人强者与独立达摩接入回归'; Arguments = @('-m', 'unittest', '-v', 'test_hyol_multiplayer_expansion.py') },
     @{ Name = '达摩独立客户端与打包路径回归'; Arguments = @('-m', 'unittest', '-v', 'test_daruma_standalone.py') },
     @{ Name = '新运行隔离、一次识别与停止行为回归'; Arguments = @('-m', 'unittest', '-v', 'test_hyol_fresh_run.py') },
     @{ Name = '实跑中断、窗口检测与身份遮挡关闭回归'; Arguments = @('-m', 'unittest', '-v', 'test_hyol_interruption_recovery.py', 'test_hyol_identity_overlays.py') },

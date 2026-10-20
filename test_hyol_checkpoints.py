@@ -166,6 +166,38 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(1300, records['treasure']['deadline_at'])
             self.assertNotIn('mail', records)
 
+    def test_historical_task_ledgers_are_read_once_per_source(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            old_day = (date.today()-timedelta(days=1)).isoformat()
+            multi = root/old_day/(hs.slug('test') + '_multi_solo.json')
+            daily = root/old_day/(hs.slug('test') + '_daily_client.json')
+            self.write(multi, {'mail': {'status': 'pending', 'phase': 'claim'}})
+            self.write(daily, {'welfare': {'status': 'pending', 'phase': 'claim'}})
+            state = hs.StateStore(['test'], root)
+            original_reader = cp.read_checkpoint
+            with patch.object(cp, 'read_checkpoint', wraps=original_reader) as read:
+                _, records = cp.load_tasks(state, 'test')
+            self.assertEqual({'mail', 'welfare'}, set(records))
+            self.assertEqual('pending', records['mail']['status'])
+            for source in (multi, daily):
+                self.assertEqual(1, sum(call.args[0] == source for call in read.call_args_list))
+
+    def test_canonical_history_does_not_open_corrupted_legacy_entrance(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            today = date.today().isoformat()
+            old = (date.today()-timedelta(days=1)).isoformat()
+            self.write(root/old/'test_tasks.json',
+                       {'mail': {'status': 'pending', 'phase': 'verified_origin'}})
+            stale = root/old/'test_multi_solo.json'
+            stale.write_text('{corrupted', encoding='utf-8')
+            state = SimpleNamespace(directory=root, day=today,
+                                    account_paths={'test': root/today/'test.json'})
+            _, records = cp.load_tasks(state, 'test')
+            self.assertEqual('pending', records['mail']['status'])
+            self.assertEqual(old, records['mail']['continuation_day'])
+
     def test_conflicting_entrances_cannot_extend_treasure_timer(self):
         result = cp.merge_records([('a', {'treasure': {'status': 'running', 'deadline_at': 1300}}),
                                    ('b', {'treasure': {'status': 'running', 'deadline_at': 1400}})])

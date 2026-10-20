@@ -14,11 +14,12 @@ from tkinter import ttk
 import numpy as np
 
 import hyol_scheduler as hs
+from hyol_daruma_task import verified as daruma_verified
 
-VERSION = "2026.10.17.8"
+VERSION = '2026.10.20.1'
 TASKS = ("group", "survival", "wanted")
 TEAM_OPTIONS = ("group", "wanted", "strong", "sealed")
-SOLO_OPTIONS = ('mail', 'welfare', 'ranking', 'survival', 'quiz', 'arena', 'weekend', 'treasure')
+SOLO_OPTIONS = ('mail', 'welfare', 'daruma', 'ranking', 'survival', 'quiz', 'arena', 'weekend', 'treasure')
 DEFAULT_SOLO_OPTIONS = ('mail', 'welfare', 'ranking', 'survival', 'quiz', 'arena')
 TASK_SEQUENCES = {"all": DEFAULT_SOLO_OPTIONS, "team": ("group", "wanted")}
 LABELS = {"group": "组队副本", "survival": "生存演习", "wanted": "通缉任务", "all": "日常三合一", "team": "组队副本＋通缉任务"}
@@ -28,6 +29,7 @@ LABELS.update(quiz='忍者测验（仅单人，全部选第一项）', all='单�
 LABELS.update(mail='邮件附件', welfare='在线福利', ranking='排位赛（第一位，剩余次数归零）', arena='竞技场（本次追加胜场可设置）')
 LABELS['treasure'] = '藏宝图（每账号5分钟，到时暂停并回村，默认不选）'
 LABELS['weekend'] = '周末任务（拼图三难度＋达摩，自动识别）'
+LABELS['daruma'] = '达摩（奖励次数归零）'
 FORMATION_LABELS = {"保持不变": "keep", "主力阵容": "main", "速刷阵容（鲨鱼／速刷阵容）": "fast"}
 SPEED_ROI = (1260, 890, 1335, 975)
 GROUP_RETURN_ROI = (1110, 750, 1380, 890)
@@ -756,7 +758,7 @@ class DailyRunner:
                 if (self.visible('treasure_page_anchor.bmp', (560,250,1380,810), frame, .96)
                         or self.visible('treasure_result_anchor.bmp', (760,440,1170,670), frame, .96)):
                     return
-            if 'weekend' in getattr(self, 'selected_tasks', ()):
+            if set(getattr(self, 'selected_tasks', ())) & {'daruma', 'weekend'}:
                 if (self.visible('daruma_game_page.bmp', (920,220,1300,325), frame, .93)
                         or self.visible('daruma_weekend_page.bmp', (880,245,1190,360), frame, .93)
                         or self.visible('puzzle_game_anchor.bmp', hs.VIEW, frame, .95)
@@ -876,6 +878,10 @@ class DailyRunner:
         from hyol_weekend import run_all
         return run_all(self)
 
+    def daruma(self):
+        from hyol_daruma_task import run
+        return run(self)
+
     def mail(self):
         self.scheduler.module_mail(self.account)
 
@@ -934,7 +940,9 @@ class DailyRunner:
                         self.event('daily_task_pending',task=task,detail=rec['last_error'])
                         continue
                 from hyol_checkpoints import complete
-                if complete(rec) and (task != "group" or not self.group_needs_more(rec)) and (task != 'ranking' or rec.get('zero_verified')):
+                if (complete(rec) and (task != "group" or not self.group_needs_more(rec))
+                        and (task != 'ranking' or rec.get('zero_verified'))
+                        and (task != 'daruma' or daruma_verified(rec))):
                     rec["last_error"] = ""
                     self.save()
                     self.event("daily_task_skipped",task=task,detail="本日已有完整完成记录")
@@ -943,7 +951,8 @@ class DailyRunner:
                 self.save()
                 self.event("daily_task_started",task=task,detail=LABELS[task]+"开始")
                 task_already_finished = rec.get("task_completed", False) and (
-                    task != "group" or not self.group_needs_more(rec)) and (task != 'ranking' or rec.get('zero_verified'))
+                    task != "group" or not self.group_needs_more(rec)) and (task != 'ranking' or rec.get('zero_verified')) and (
+                    task != 'daruma' or daruma_verified(rec))
                 if task == "survival" and task_already_finished:
                     self.scheduler.reconcile_survival_result_confirmations(self.account)
                 if not task_already_finished:
@@ -1022,6 +1031,7 @@ class DailyRunner:
             self.record(task).get('status') != 'done'
             or not self.record(task).get('task_completed')
             or not self.record(task).get('home_returned')
+            or task == 'daruma' and not daruma_verified(self.record(task))
             for task in tasks
         ):
             raise hs.PendingError('单人日常仍有未完成或未回村任务，不能开始托管')
