@@ -69,6 +69,8 @@ class MultiSoloRunner:
         from hyol_weekend import is_weekend
         if not is_weekend():
             self.tasks = tuple(task for task in self.tasks if task != 'weekend')
+        if not self.tasks:
+            raise ValueError('非周末不能执行仅包含周末任务的请求；未启动游戏，请选择其他任务')
         self.arena_wins = arena_wins
         if not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
             raise ValueError(f"竞技场追加胜场须在1到{hs.ARENA_MAX_ATTEMPTS}之间")
@@ -1006,8 +1008,8 @@ class MultiSoloRunner:
 
     def run(self, *, manage_lease=True, before_prepare=None):
         if not self.tasks:
-            self.event('weekend_calendar_skip', detail='非周末；未识别游戏窗口')
-            return 0
+            self.event('weekend_calendar_skip', detail='无可执行任务；未识别游戏窗口')
+            return 2
         s = self.scheduler
         lease = hs.ForegroundRuntimeLease()
         if manage_lease and not lease.acquire():
