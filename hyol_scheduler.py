@@ -707,15 +707,25 @@ class Win32:
         cls.user32.SetForegroundWindow(hwnd)
 
     @classmethod
-    def click(cls, x: int, y: int) -> None:
+    def click(cls, x: int, y: int, *, expected_hwnd: int | None = None,
+              before_down: Callable[[], None] | None = None) -> None:
         if not cls.user32.SetCursorPos(x, y):
             raise SafetyError("SetCursorPos failed")
-        # Let the legacy Flash surface observe a stationary hover first.  The
-        # cursor never moves between down/up, so this cannot become a drag.
+        # Let Flash observe the stationary cursor, then validate immediately
+        # before DOWN: focus and F12 can change during the hover interval.
         time.sleep(0.15)
+        if before_down is not None:
+            before_down()
+        if expected_hwnd is not None:
+            if cls.foreground() != expected_hwnd:
+                raise SafetyError("game window lost foreground during pre-click hover")
+            if cls.f12_down():
+                raise KeyboardInterrupt("F12 before mouse down")
         cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.06)
-        cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        try:
+            time.sleep(0.06)
+        finally:
+            cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
     @classmethod
     def move(cls, x: int, y: int) -> None:
@@ -1934,7 +1944,8 @@ class Scheduler:
         if not blank_tab_chrome and hasattr(self,"screen_point") and self.screen_point(x,y) != (physical_x,physical_y):
             raise SafetyError("window changed during chrome target validation")
         self.check_input_pause()
-        Win32.click(physical_x, physical_y)
+        Win32.click(physical_x, physical_y, expected_hwnd=self.hwnd,
+                    before_down=self.check_input_pause)
         self._capture_account = account
         self._capture_binding_probe = label.startswith(('rebind_probe:', 'observe_account:'))
         self.click_count += 1
@@ -3002,7 +3013,8 @@ class Scheduler:
                 self.state.save_account(account.name)
         physical_x, physical_y = self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)
         self.check_input_pause()
-        Win32.click(physical_x, physical_y)
+        Win32.click(physical_x, physical_y, expected_hwnd=self.hwnd,
+                    before_down=self.check_input_pause)
         self.click_count += 1
         self.content_click_count += 1
         time.sleep(0.35)
