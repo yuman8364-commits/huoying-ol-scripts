@@ -84,6 +84,15 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn('中止',self.api.actions)
         self.assertNotIn('启动',self.api.actions)
 
+    def test_unknown_solver_window_blocks_parallel_executable_launch(self):
+        other = dict(self.api.root, path=r'C:\\Other\\unverified_puzzle.exe')
+        self.api.windows = lambda: [other]
+        with self.assertRaisesRegex(hs.PendingError, '来源不明'):
+            with self.session():
+                pass
+        self.assertEqual([], self.api.actions)
+        self.assertEqual([], self.api.kills)
+
     def test_failure_to_contain_child_prevents_start(self):
         self.api.contained=lambda job,pid:pid==10
         with self.assertRaisesRegex(hs.PendingError,'急停进程树'):
