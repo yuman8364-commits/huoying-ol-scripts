@@ -166,6 +166,23 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(1300, records['treasure']['deadline_at'])
             self.assertNotIn('mail', records)
 
+    def test_historical_task_ledgers_are_read_once_per_source(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            old_day = (date.today()-timedelta(days=1)).isoformat()
+            multi = root/old_day/'test_multi_solo.json'
+            daily = root/old_day/'test_daily_client.json'
+            self.write(multi, {'mail': {'status': 'pending', 'phase': 'claim'}})
+            self.write(daily, {'welfare': {'status': 'pending', 'phase': 'claim'}})
+            state = hs.StateStore(['test'], root)
+            original_reader = cp.read_checkpoint
+            with patch.object(cp, 'read_checkpoint', wraps=original_reader) as read:
+                _, records = cp.load_tasks(state, 'test')
+            self.assertEqual({'mail', 'welfare'}, set(records))
+            self.assertEqual('pending', records['mail']['status'])
+            for source in (multi, daily):
+                self.assertEqual(1, sum(call.args[0] == source for call in read.call_args_list))
+
     def test_conflicting_entrances_cannot_extend_treasure_timer(self):
         result = cp.merge_records([('a', {'treasure': {'status': 'running', 'deadline_at': 1300}}),
                                    ('b', {'treasure': {'status': 'running', 'deadline_at': 1400}})])
