@@ -352,6 +352,10 @@ class PuzzleScriptSession:
             existing = self.api.windows()
             trusted = [row for row in existing if Path(row['path']).resolve() in
                        (self.executable, SOURCE_PATH.resolve())]
+            if len(trusted) != len(existing):
+                # An unknown copy can still click the same shared game surface.
+                # Never start a second solver while its input ownership is unclear.
+                raise hs.PendingError('发现来源不明的拼图脚本窗口；请先关闭原程序，避免多个脚本同时控制游戏')
             if len(trusted) > 1:
                 raise hs.PendingError('存在多个拼图程序窗口，无法确定解题控制权')
             self.job = self.api.create_job()
