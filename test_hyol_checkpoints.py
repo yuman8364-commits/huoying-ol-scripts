@@ -183,6 +183,21 @@ class CheckpointTests(unittest.TestCase):
             for source in (multi, daily):
                 self.assertEqual(1, sum(call.args[0] == source for call in read.call_args_list))
 
+    def test_canonical_history_does_not_open_corrupted_legacy_entrance(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            today = date.today().isoformat()
+            old = (date.today()-timedelta(days=1)).isoformat()
+            self.write(root/old/'test_tasks.json',
+                       {'mail': {'status': 'pending', 'phase': 'verified_origin'}})
+            stale = root/old/'test_multi_solo.json'
+            stale.write_text('{corrupted', encoding='utf-8')
+            state = SimpleNamespace(directory=root, day=today,
+                                    account_paths={'test': root/today/'test.json'})
+            _, records = cp.load_tasks(state, 'test')
+            self.assertEqual('pending', records['mail']['status'])
+            self.assertEqual(old, records['mail']['continuation_day'])
+
     def test_conflicting_entrances_cannot_extend_treasure_timer(self):
         result = cp.merge_records([('a', {'treasure': {'status': 'running', 'deadline_at': 1300}}),
                                    ('b', {'treasure': {'status': 'running', 'deadline_at': 1400}})])
