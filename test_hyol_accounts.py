@@ -111,7 +111,8 @@ class DynamicAccountTests(unittest.TestCase):
              patch.object(hs.Win32,'foreground',return_value=123), \
              patch.object(hs.Win32,'click') as click:
             hs.Scheduler.chrome_click(s,315,10,'observe_account:2',account)
-            click.assert_called_once_with(315,10)
+            click.assert_called_once_with(315,10, expected_hwnd=s.hwnd,
+                                          before_down=s.check_input_pause)
             click.reset_mock()
             for label,x,y in (('observe_account:3',315,10),('refresh',315,10),
                               ('observe_account:2',316,10),('observe_account:2',315,100)):

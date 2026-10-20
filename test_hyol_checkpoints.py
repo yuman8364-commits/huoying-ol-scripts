@@ -170,8 +170,8 @@ class CheckpointTests(unittest.TestCase):
         with TemporaryDirectory() as folder:
             root = Path(folder)
             old_day = (date.today()-timedelta(days=1)).isoformat()
-            multi = root/old_day/'test_multi_solo.json'
-            daily = root/old_day/'test_daily_client.json'
+            multi = root/old_day/(hs.slug('test') + '_multi_solo.json')
+            daily = root/old_day/(hs.slug('test') + '_daily_client.json')
             self.write(multi, {'mail': {'status': 'pending', 'phase': 'claim'}})
             self.write(daily, {'welfare': {'status': 'pending', 'phase': 'claim'}})
             state = hs.StateStore(['test'], root)

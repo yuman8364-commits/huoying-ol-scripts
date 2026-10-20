@@ -81,7 +81,8 @@ class InterruptionRecoveryTests(unittest.TestCase):
         with hit as probe, focus, input_patch as click:
             hs.Scheduler.chrome_click(scheduler, 180, 10, 'observe_account:1')
             self.assertEqual(2, probe.call_count)
-            click.assert_called_once_with(180, 10)
+            click.assert_called_once_with(180, 10, expected_hwnd=scheduler.hwnd,
+                                          before_down=scheduler.check_input_pause)
         scheduler.ensure_window.assert_called()
         self.assertEqual(1, scheduler.click_count)
 

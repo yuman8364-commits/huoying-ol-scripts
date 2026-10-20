@@ -348,6 +348,28 @@ class SchedulerUnitTests(unittest.TestCase):
         guard.assert_called_once_with()
         user.mouse_event.assert_not_called()
 
+    def test_f12_during_hover_prevents_mouse_down(self) -> None:
+        user = Mock()
+        user.SetCursorPos.return_value = True
+        with patch.object(hs.Win32, 'user32', user), \
+             patch.object(hs.Win32, 'foreground', return_value=123), \
+             patch.object(hs.Win32, 'f12_down', return_value=True), \
+             patch.object(hs.time, 'sleep'):
+            with self.assertRaises(KeyboardInterrupt):
+                hs.Win32.click(180, 200, expected_hwnd=123)
+        user.mouse_event.assert_not_called()
+
+    def test_interrupted_mouse_hold_still_releases_left_button(self) -> None:
+        user = Mock()
+        user.SetCursorPos.return_value = True
+        with patch.object(hs.Win32, 'user32', user), \
+             patch.object(hs.time, 'sleep', side_effect=[None, KeyboardInterrupt('stop')]):
+            with self.assertRaises(KeyboardInterrupt):
+                hs.Win32.click(180, 200)
+        self.assertEqual([(hs.Win32.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0),
+                          (hs.Win32.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)],
+                         [call.args for call in user.mouse_event.call_args_list])
+
     def test_chrome_click_rejects_nonclient_targets_without_input(self) -> None:
         scheduler = SimpleNamespace(hwnd=123, ensure_window=Mock(), event=Mock(), click_count=0, check_input_pause=Mock())
         for hit in (-2, -1, 0, 2, 3, 8, 9, 10, 12, 20):
@@ -2206,10 +2228,15 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn("AttachThreadInput(current_thread, foreground_thread, False)", body)
 
     def test_click_is_stationary_and_long_enough_for_flash(self) -> None:
-        source = Path(hs.__file__).read_text(encoding="utf-8")
-        body = source.split("def click(cls, x: int, y: int)", 1)[1].split("def move", 1)[0]
-        self.assertEqual(1, body.count("cls.user32.SetCursorPos("))
-        self.assertIn("time.sleep(0.06)", body)
+        user = Mock()
+        user.SetCursorPos.return_value = True
+        with patch.object(hs.Win32, 'user32', user), patch.object(hs.time, 'sleep') as sleep:
+            hs.Win32.click(180, 200)
+        user.SetCursorPos.assert_called_once_with(180, 200)
+        self.assertEqual([(.15,), (.06,)], [call.args for call in sleep.call_args_list])
+        self.assertEqual([(hs.Win32.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0),
+                          (hs.Win32.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)],
+                         [call.args for call in user.mouse_event.call_args_list])
 
     def test_desktop_capture_rejects_foreign_foreground(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")

@@ -2,10 +2,12 @@
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 import numpy as np
 import hyol_scheduler as hs
+from hyol_multi_solo import MultiSoloRunner
 from hyol_run_context import RunContext
 
 
@@ -47,6 +49,26 @@ class RunContextRebindTests(unittest.TestCase):
         self.assertEqual({'role': 180}, state.global_state['tab_map'])
         self.assertEqual({'role': 180}, state.global_state['verified_solo_tab_map'])
         self.assertFalse(hasattr(scheduler, '_dynamic_identity_names'))
+
+
+class CalendarStartTests(unittest.TestCase):
+    def test_weekday_weekend_only_rejects_before_scheduler_or_config_read(self):
+        with patch('hyol_weekend.is_weekend', return_value=False), \
+             patch.object(hs, 'read_config') as read, \
+             patch('hyol_multi_solo.DailyScheduler') as scheduler:
+            with self.assertRaisesRegex(ValueError, '非周末'):
+                MultiSoloRunner(('weekend',))
+        read.assert_not_called()
+        scheduler.assert_not_called()
+
+    def test_weekday_mixed_request_preserves_available_task(self):
+        with TemporaryDirectory() as folder:
+            config = dict(AccountDiscovery='automatic', SharedStateDirectory=folder)
+            with patch('hyol_weekend.is_weekend', return_value=False), \
+                 patch.object(hs, 'read_config', return_value=config):
+                runner = MultiSoloRunner(('mail', 'weekend'))
+            self.assertEqual(('mail',), runner.tasks)
+            self.assertFalse(runner.run_context.started)
 
 
 if __name__ == '__main__':

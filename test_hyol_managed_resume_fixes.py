@@ -139,7 +139,7 @@ class DiscoveryOfflineTests(unittest.TestCase):
         def select(x,y,label,account):
             with patch.object(hs.Win32,'foreground',return_value=99), \
                  patch.object(hs.Win32,'hit_test',return_value=1), \
-                 patch.object(hs.Win32,'click',side_effect=lambda x,y:setattr(s,'current_x',x)):
+                 patch.object(hs.Win32,'click',side_effect=lambda x,y,**guards:setattr(s,'current_x',x)):
                 hs.Scheduler.chrome_click(s,x,y,label,account)
         s.chrome_click=Mock(side_effect=select)
         s.wait_interruptible,s.check_stop,s.event=Mock(),Mock(),Mock()
