@@ -87,8 +87,11 @@ def load_tasks(state, name):
             continue
         # Parse every historical entry at most once. The old code re-opened
         # all sources for each task when checking isolated action provenance.
-        snapshots = [(source, read_checkpoint(source)) for source in sources]
         canonical = sources[0] if sources[0].name.endswith('_tasks.json') else None
+        # A canonical task journal supersedes alternate entrances; never open
+        # those secondary ledgers (which could be stale or partially written).
+        selected_sources = [canonical] if canonical else sources
+        snapshots = [(source, read_checkpoint(source)) for source in selected_sources]
         previous = snapshots[0][1] if canonical else merge_records(snapshots)
         for task, rec in previous.items():
             if task in seen or not isinstance(rec, dict) or task.startswith('_'):
