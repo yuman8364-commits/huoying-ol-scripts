@@ -85,16 +85,19 @@ def load_tasks(state, name):
         sources = [source for source in sources if source.exists()]
         if not sources:
             continue
+        # Parse every historical entry at most once. The old code re-opened
+        # all sources for each task when checking isolated action provenance.
+        snapshots = [(source, read_checkpoint(source)) for source in sources]
         canonical = sources[0] if sources[0].name.endswith('_tasks.json') else None
-        previous = read_checkpoint(canonical) if canonical else merge_records(
-            [(source, read_checkpoint(source)) for source in sources])
+        previous = snapshots[0][1] if canonical else merge_records(snapshots)
         for task, rec in previous.items():
             if task in seen or not isinstance(rec, dict) or task.startswith('_'):
                 continue
             seen.add(task)
-            task_sources = [canonical] if canonical else [source for source in sources if task in read_checkpoint(source)]
-            if task_sources and all(is_isolated(isolated,source,'task:'+task,read_checkpoint(source)[task])
-                                    for source in task_sources):
+            task_sources = snapshots[:1] if canonical else [
+                (source, ledger) for source, ledger in snapshots if task in ledger]
+            if task_sources and all(is_isolated(isolated, source, 'task:'+task, ledger[task])
+                                    for source, ledger in task_sources):
                 continue
             if complete(rec) or rec.get('status', 'new') == 'new':
                 continue
