@@ -330,7 +330,9 @@ class SurvivalReceiptTests(unittest.TestCase):
         self.pending(80)
         ctx.binding['mapping'][2] = 'other-role'
         ctx.binding['centers'] = (180,315)
-        ctx.binding['frames'][2] = self.frame.copy()
+        sibling = self.frame.copy()
+        sibling.paste('white',(267,5,339,30))
+        ctx.binding['frames'][2] = sibling
         original = deepcopy(self.s.state.accounts[self.account.name]['actions'])
         self.assertFalse(self.observe([160]*3))
         self.assertEqual(original,self.s.state.accounts[self.account.name]['actions'])
