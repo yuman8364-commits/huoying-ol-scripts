@@ -1394,7 +1394,12 @@ class Scheduler:
         register_identity_materials(self)
         run_name = self.run_context.identifier if self.run_context else run_id()
         self.diagnostics = Diagnostics(ROOT, run_name)
-        self.detector = OnnxDetector(ROOT / "models" / "detector.json")
+        # In shadow mode, model inference is diagnostic only and cannot authorize
+        # a click. Keep it opt-in for regular production runs.
+        self.detector = OnnxDetector(
+            ROOT / "models" / "detector.json",
+            allow_shadow=config.get("EnableShadowDetection", "0") == "1",
+        )
         self.last_detection = None
         self.log = JsonlLogger(LOGS / f"HYOL_Scheduler_{run_name}.jsonl")
         self.account_logs = {name: JsonlLogger(LOGS / "accounts" / f"{slug(name)}.jsonl") for name in names}
@@ -1721,7 +1726,7 @@ class Scheduler:
                     result = current
                     break
         detector = getattr(self, "detector", None)
-        if detector is None:
+        if detector is None or detector.session is None:
             return result
         ok, score, x, y = result
         shape = self.templates.last_match_size or (self.templates.load(ASSETS / name).shape if (ASSETS / name).exists() else (0, 0))
