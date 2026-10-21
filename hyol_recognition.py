@@ -87,7 +87,7 @@ class OnnxDetector:
     Manifest pins file hash, class ordering and thresholds. No implicit downloads.
     Shadow mode can collect predictions but cannot authorize new clicks.
     """
-    def __init__(self, manifest_path):
+    def __init__(self, manifest_path, *, allow_shadow=True):
         self.path = Path(manifest_path)
         self.manifest = {}
         self.session = None
@@ -99,6 +99,8 @@ class OnnxDetector:
         try:
             self.manifest = json.loads(self.path.read_text(encoding='utf-8'))
             if self.manifest.get('mode', 'off') == 'off':
+                return
+            if self.manifest.get('mode') == 'shadow' and not allow_shadow:
                 return
             model = (self.path.parent / self.manifest['file']).resolve()
             if not model.is_relative_to(self.path.parent.resolve()):

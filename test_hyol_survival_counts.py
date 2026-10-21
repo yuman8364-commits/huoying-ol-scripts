@@ -57,6 +57,7 @@ class SurvivalSelectionTests(unittest.TestCase):
         frame = Image.open(hs.LOGS / 'scheduler_evidence' / '2026-10-01' /
             'account_3ed81e0fcf' / '220503_540067_pending_survival_selection_unknown.png').convert('RGB')
         scheduler = object.__new__(hs.Scheduler)
+        scheduler.event = Mock()
         scheduler.content_guard = Mock(return_value=frame)
         scheduler._survival_full_score_visible = Mock(return_value=False)
         scheduler.templates = self.templates
@@ -146,6 +147,7 @@ class SurvivalSelectionTests(unittest.TestCase):
         s.state = SimpleNamespace(accounts={'a': {'actions': actions}},
             action_status=lambda name, key: actions.get(key, {}).get('status', 'new'),
             set_action=lambda name, key, status, detail: actions.update({key: {'status': status, 'detail': detail}}),
+            save_account=Mock(),
             set_module=Mock())
         s.template = Mock(side_effect=lambda name, *args, **kw: (name == 'survival_anchor.bmp', 1., 0, 0))
         s.wait_template = Mock(return_value=True)
@@ -187,6 +189,7 @@ class SurvivalSelectionTests(unittest.TestCase):
 
     def test_missing_grade_sends_no_click(self):
         s = object.__new__(hs.Scheduler)
+        s.event = Mock()
         s.templates = self.templates
         s._survival_full_score_visible = Mock(return_value=False)
         s.content_guard = Mock(return_value=self.frame)

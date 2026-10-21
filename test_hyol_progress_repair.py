@@ -254,6 +254,7 @@ class RepairBoundaryTests(unittest.TestCase):
 
     def reset_scheduler(self, before_path):
         s=object.__new__(hs.Scheduler);s.templates=hs.TemplateStore(.98);s.detector=None;s.state=Ledger()
+        s.verify_identity=Mock(return_value=(True, {}))
         s.state.accounts['a']['actions']['survival_reset']=dict(status='pending',
             operation_id='original:survival_reset',before_evidence=str(before_path))
         s.save_raw_evidence=Mock(return_value=Path('verified.png'));s.event=Mock()

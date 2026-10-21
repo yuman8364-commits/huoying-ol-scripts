@@ -111,6 +111,11 @@ class DailyScheduler(hs.Scheduler):
         if not self._survival_full_score_visible():
             evidence = self.save_raw_evidence(self.capture(), account, 'survival_full_digits_unverified', 'pending')
             raise hs.PendingError(f'生存220分数字未严格确认；画面={evidence}')
+        actions = self.state.accounts[account.name].get('actions', {})
+        if any(key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
+               and isinstance(row, dict) and row.get('status') == 'pending'
+               for key, row in actions.items()):
+            raise hs.PendingError('生存仍有未决开战或结算，禁止领奖、重置或覆盖原动作')
         self.claim_survival_rewards(account)
         self.reconcile_survival_result_confirmations(account)
         if getattr(self, 'survival_inline_two_runs', False) is True:

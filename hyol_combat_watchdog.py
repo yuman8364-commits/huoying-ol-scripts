@@ -27,6 +27,7 @@ class BattleWatchdog:
     max_seconds: float = math.inf
     started_at: float | None = None
     changed_at: float | None = None
+    last_observed_at: float | None = None
     reference: np.ndarray | None = field(default=None, repr=False)
     mode: str = "battle"
 
@@ -65,12 +66,20 @@ class BattleWatchdog:
                 (48, 12), Image.Resampling.BILINEAR), dtype=np.int16).ravel())
         return np.concatenate(pieces)
 
-    def observe(self, frame, now):
+    def observe(self, frame, now, *, backgrounded=False):
         """Return a stall record, or None; only observed visual change resets idle."""
         if self.started_at is None:
             self.started_at = now
         elapsed = max(0.0, now - self.started_at)
         sample = self.sample(frame, self.mode)
+        # A background tab can run for over 30 seconds without being sampled.
+        # Unobserved time is not evidence of a frozen frame: resume observation
+        # from a fresh baseline instead of declaring a stall immediately.
+        if (backgrounded and self.last_observed_at is not None
+                and now - self.last_observed_at > self.idle_seconds):
+            self.reference = None
+            self.changed_at = None
+        self.last_observed_at = now
         if sample is not None:
             if self.reference is None:
                 self.reference = sample

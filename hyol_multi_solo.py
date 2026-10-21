@@ -763,7 +763,7 @@ class MultiSoloRunner:
                 frame = s.capture()
                 if (runner.visible("survival_score_0.bmp", score, frame)
                         or s._survival_score_twenty_visible(frame)
-                        or s._survival_partial_score(frame) in (20,80,140)
+                        or s._survival_partial_score(frame) in (20,80,140,160,200)
                         or s._survival_full_score_visible(frame)):
                     break
                 if time.monotonic() >= score_deadline:
@@ -785,7 +785,7 @@ class MultiSoloRunner:
                 if s.state.action_status(account.name, 'survival_second_run_started') != 'done':
                     self._queue_survival_second_run(account, '首轮后页面已显示20/220，重置后的首场待续')
                 self.event('multi_solo_survival_reset_observed', account, score=20)
-            elif s._survival_partial_score(frame) in (20,80,140):
+            elif s._survival_partial_score(frame) in (20,80,140,160,200):
                 if s.state.action_status(account.name, 'survival_second_run_started') != 'done':
                     if not (rec.get('task_completed') and rec.get('completed', 0) >= 1
                             and s.state.action_status(account.name, 'survival_reset') == 'done'):
@@ -855,7 +855,7 @@ class MultiSoloRunner:
     def _queue_survival_second_run(self, account, reason):
         s = self.scheduler
         actions = s.state.accounts.get(account.name, {}).get('actions', {})
-        if any(key.startswith('survival_battle_step_') and isinstance(row, dict)
+        if any(key.startswith(('survival_battle_step_', 'survival_result_confirm_')) and isinstance(row, dict)
                and row.get('status') == 'pending' for key, row in actions.items()):
             raise hs.PendingError('生存首轮仍有未决战斗，禁止覆盖为第二轮')
         archives = s.state.accounts[account.name].setdefault('survival_round_archives', {})

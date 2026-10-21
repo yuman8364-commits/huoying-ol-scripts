@@ -143,7 +143,11 @@ def check_battle_watchdog(scheduler, watchdog, account, frame, label, *, mode, n
                         detail='已掉线：提示确认')
         raise AccountOffline(account, str(evidence))
     watchdog.mode = mode
-    observation = watchdog.observe(frame, time.monotonic() if now is None else now)
+    focus = getattr(scheduler, '_tab_focus_generation', 0)
+    backgrounded = getattr(watchdog, '_tab_focus_generation', focus) != focus
+    watchdog._tab_focus_generation = focus
+    observation = watchdog.observe(frame, time.monotonic() if now is None else now,
+                                   backgrounded=backgrounded)
     if observation is None:
         return
     evidence = scheduler.save_raw_evidence(frame, account, label + '_stalled', 'pending')
@@ -917,8 +921,15 @@ class StateStore:
                 from hyol_checkpoints import resolve_action
                 resolve_action(self, name, action, detail)
         actions[action] = {"status": status, "detail": detail, "updated_at": now_iso()}
+        if status != 'new' and previous.get('before_evidence'):
+            actions[action]['before_evidence'] = previous['before_evidence']
         scope = self.accounts[name].get('continuation_scope')
-        if scope:
+        survival_scope = self.accounts[name].get('survival_operation_scope') if action.startswith('survival_') else None
+        if survival_scope:
+            if status != 'new':
+                run = 2 if actions.get('survival_second_run_started', {}).get('status') == 'done' else 1
+                actions[action]['operation_id'] = previous.get('operation_id', f'{survival_scope}:run_{run}:{action}')
+        elif scope:
             actions[action]['operation_id'] = previous.get('operation_id',scope+':'+action)
         if previous.get('origin'):
             actions[action]['origin'] = previous['origin']
@@ -1159,6 +1170,8 @@ class TemplateStore:
         self._frame_matches = {}
         self._frame_crops = {}
         self._frame_correlation = {}
+        self._frame_edges = {}
+        self._edge_templates = OrderedDict()
         self._template_spectra = TemplateSpectra()
 
     def begin_frame(self, frame: Image.Image) -> None:
@@ -1168,6 +1181,7 @@ class TemplateStore:
         self._frame_matches.clear()
         self._frame_crops.clear()
         self._frame_correlation.clear()
+        self._frame_edges.clear()
 
     def _crop(self, frame, roi):
         if frame is not self._frame:
@@ -1287,12 +1301,33 @@ class TemplateStore:
         if not path.exists():
             return []
         x1, y1, x2, y2 = roi
-        image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
-        with Image.open(path) as asset:
-            template = edge_binary(asset.convert("L"), threshold=edge_threshold).astype(np.float64)
+        # Market digit templates share the same ROI; avoid recomputing the
+        # edge mask, image FFT and immutable template FFT for each digit.
+        edge_key = (roi, edge_threshold)
+        if frame is self._frame:
+            image = self._frame_edges.get(edge_key)
+            if image is None:
+                image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
+                self._frame_edges[edge_key] = image
+        else:
+            image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
+        template_key = (path, self._asset_version(path), edge_threshold)
+        template = self._edge_templates.get(template_key)
+        if template is None:
+            with Image.open(path) as asset:
+                template = edge_binary(asset.convert("L"), threshold=edge_threshold).astype(np.float64)
+            template.setflags(write=False)
+            self._edge_templates[template_key] = template
+            if len(self._edge_templates) > 64:
+                self._edge_templates.popitem(last=False)
+        else:
+            self._edge_templates.move_to_end(template_key)
         th, tw = template.shape
         cutoff = self.threshold if threshold is None else threshold
-        scores = ncc_map(image, template)
+        prepared = (self._frame_correlation.setdefault(('edge', *edge_key), {})
+                    if frame is self._frame else None)
+        scores = ncc_map(image, template, prepared=prepared,
+                         template_cache=self._template_spectra)
         candidates: list[tuple[float, int, int]] = []
         for y, x in zip(*np.where(scores >= cutoff)):
             candidates.append((float(scores[y, x]), x1 + int(x), y1 + int(y)))
@@ -1394,7 +1429,12 @@ class Scheduler:
         register_identity_materials(self)
         run_name = self.run_context.identifier if self.run_context else run_id()
         self.diagnostics = Diagnostics(ROOT, run_name)
-        self.detector = OnnxDetector(ROOT / "models" / "detector.json")
+        # In shadow mode, model inference is diagnostic only and cannot authorize
+        # a click. Keep it opt-in for regular production runs.
+        self.detector = OnnxDetector(
+            ROOT / "models" / "detector.json",
+            allow_shadow=config.get("EnableShadowDetection", "0") == "1",
+        )
         self.last_detection = None
         self.log = JsonlLogger(LOGS / f"HYOL_Scheduler_{run_name}.jsonl")
         self.account_logs = {name: JsonlLogger(LOGS / "accounts" / f"{slug(name)}.jsonl") for name in names}
@@ -1721,7 +1761,7 @@ class Scheduler:
                     result = current
                     break
         detector = getattr(self, "detector", None)
-        if detector is None:
+        if detector is None or detector.session is None:
             return result
         ok, score, x, y = result
         shape = self.templates.last_match_size or (self.templates.load(ASSETS / name).shape if (ASSETS / name).exists() else (0, 0))
@@ -1947,6 +1987,11 @@ class Scheduler:
         self.check_input_pause()
         Win32.click(physical_x, physical_y, expected_hwnd=self.hwnd,
                     before_down=self.check_input_pause)
+        if account is not None and (x, y) == (account.tab_x, 10):
+            focus_key = (self.hwnd, account.tab_x)
+            if getattr(self, '_tab_focus_key', None) != focus_key:
+                self._tab_focus_generation = getattr(self, '_tab_focus_generation', 0) + 1
+                self._tab_focus_key = focus_key
         self._capture_account = account
         self._capture_binding_probe = label.startswith(('rebind_probe:', 'observe_account:'))
         self.click_count += 1
@@ -3010,7 +3055,9 @@ class Scheduler:
             self.state.set_action(account.name, label, "pending", "written before click")
             record = self.state.action_record(account.name, label)
             if isinstance(record, dict):
-                record['before_evidence'] = str(evidence)
+                # action_record() returns a defensive copy. Persist on the
+                # actual write-ahead receipt before sending any input.
+                self.state.accounts[account.name]['actions'][label]['before_evidence'] = str(evidence)
                 self.state.save_account(account.name)
         physical_x, physical_y = self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)
         self.check_input_pause()
@@ -5032,38 +5079,53 @@ class Scheduler:
             return False
         action = self._combat_action_name('survival', index)
         original = self.state.accounts[account.name].get('actions', {}).get(action, {})
+        observed_scores = []
         for sample in range(3):
             if (not self._combat_ready_visible('survival', frame)
                     or self._combat_active_visible('survival', frame)
-                    or not self.verify_identity(account, frame)[0]):
+                    or not self._survival_page_identity_verified(account, frame)):
                 return False
+            observed_scores.append(self._survival_observed_score(frame))
             if sample < 2:
                 self.wait_interruptible(.35)
                 frame = self.capture()
         evidence = self.save_raw_evidence(frame, account, 'survival_pending_progress', 'observed')
         candidates = grade_candidates(frame, self.templates, ASSETS)
-        score_roi = (751,769,1151,1031)
-        score = (220 if self._survival_full_score_visible(frame) else
-                 20 if self._survival_score_twenty_visible(frame) else
-                 140 if self.template('survival_score_140.bmp',score_roi,frame,threshold=.98)[0] else
-                 80 if self.template('survival_score_80.bmp',score_roi,frame,threshold=.98)[0] else
-                 0 if self.template('survival_score_0.bmp',score_roi,frame,threshold=.98)[0] else None)
+        score = observed_scores[-1] if len(set(observed_scores)) == 1 else None
         observations = self.state.accounts[account.name].setdefault('survival_resume_observations', {})
         observations[action] = dict(original_pending=deepcopy(original), score=score,
                                     grades=candidates, evidence=str(evidence), observed_at=now_iso())
         self.state.save_account(account.name)
         self.event('survival_pending_progress_observed', account, index=index,
                    score=score, grades=candidates, evidence=str(evidence), outcome='unknown')
-        # A crash after an audited result close may leave the battle uncommitted.
-        # Only the same operation's completed confirmation can reconcile it.
+        # A confirmed result close is not proof of point progress. Membership
+        # starts at 80/220 for some accounts, so compare this exact run's score
+        # baseline against the stable current page instead of counting fights.
         label = f'survival_result_confirm_{index}'
         confirmation = self.state.accounts[account.name].get('actions', {}).get(label, {})
+        prior, evidence_key = self._survival_attempt_evidence(account, action)
+        baseline = prior.get(evidence_key, {}).get('score_before')
+        progressed = (type(baseline) is int and type(score) is int
+                      and 0 <= baseline < score <= 220
+                      and original.get('status') == 'pending'
+                      and not original.get('checkpoint_conflict')
+                      and not confirmation.get('checkpoint_conflict'))
         operation = original.get('operation_id')
-        expected = operation[:-len(action)]+label if isinstance(operation,str) and operation.endswith(':'+action) else None
-        if (expected and not original.get('checkpoint_conflict')
-                and confirmation.get('status') == 'done'
+        expected = operation[:-len(action)] + label if isinstance(operation, str) and operation.endswith(':' + action) else None
+        if (progressed and expected and confirmation.get('status') == 'done'
                 and confirmation.get('operation_id') == expected):
-            self.commit_action(account, action, '同一操作的结算确认已完成，生存页与身份三帧核实')
+            self.commit_action(account, action, f'原结算完成且生存积分增加：{baseline}->{score}')
+            slot.running = False
+            return True
+        start = self.state.accounts[account.name].get('actions', {}).get(f'{action}_start', {})
+        expected_start = operation + '_start' if expected else None
+        if (progressed and expected and confirmation.get('status') == 'pending'
+                and confirmation.get('operation_id') == expected
+                and start.get('status') == 'done'
+                and start.get('operation_id') == expected_start
+                and not start.get('checkpoint_conflict')):
+            self.commit_action(account, label, "原结算已关闭；三帧实名页面及积分增加已核实")
+            self.commit_action(account, action, f"中断后从生存积分对账：{baseline}->{score}")
             slot.running = False
             return True
         slot.running = False
@@ -5126,6 +5188,8 @@ class Scheduler:
         score_twenty = False
         score_eighty = False
         score_one_forty = False
+        score_one_sixty = False
+        score_two_hundred = False
         score_full = False
         while time.monotonic() < score_deadline:
             score_frame = self.capture()
@@ -5133,8 +5197,12 @@ class Scheduler:
             score_twenty = self._survival_score_twenty_visible(score_frame)
             score_eighty = self.template("survival_score_80.bmp", (751, 769, 1151, 1031), score_frame)[0]
             score_one_forty = self.template("survival_score_140.bmp", (751, 769, 1151, 1031), score_frame, threshold=0.98)[0]
+            score_one_sixty = self.template("survival_score_160.bmp", (751, 769, 1151, 1031), score_frame, threshold=0.98)[0]
+            score_two_hundred = self._survival_score_two_hundred_visible(score_frame)
+            if score_two_hundred:
+                score_zero = score_twenty = score_eighty = score_one_forty = score_one_sixty = False
             score_full = self._survival_full_score_visible(score_frame)
-            if score_zero or score_twenty or score_eighty or score_one_forty or score_full:
+            if score_zero or score_twenty or score_eighty or score_one_forty or score_one_sixty or score_two_hundred or score_full:
                 break
             self.wait_interruptible(1)
         if score_zero and self.state.action_status(account.name, "survival_reset") == "pending":
@@ -5155,7 +5223,7 @@ class Scheduler:
             return
         self.event("survival_score_observed", account,
                    score=0 if score_zero else 20 if score_twenty else 80 if score_eighty
-                   else 140 if score_one_forty else None)
+                   else 140 if score_one_forty else 160 if score_one_sixty else 200 if score_two_hundred else None)
         if not self.template("survival_anchor.bmp", (201, 69, 601, 419))[0]:
             raise PendingError("生存页面未确认，禁止选择副本")
         self.event("combat_slot_prepared", account, mode="survival", next_index=slot.next_index)
@@ -5219,25 +5287,118 @@ class Scheduler:
     def _survival_partial_score(self, frame):
         if self._survival_score_twenty_visible(frame):
             return 20
-        for value in (80, 140):
+        if self._survival_score_two_hundred_visible(frame):
+            return 200
+        for value in (80, 140, 160):
             if self.template(f'survival_score_{value}.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
                 return value
         return None
+
+    def _survival_score_two_hundred_visible(self, frame):
+        """Recognize 200/220 using the enrolled zero glyph, never as full score."""
+        if self.template('survival_score_200.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
+            return True
+        _ok, score, x, y = self.template('survival_complete_220.bmp',
+            (751, 769, 1151, 1031), frame, threshold=0)
+        if score < .90 or x < 0 or y < 0:
+            return False
+        with Image.open(ASSETS/'survival_complete_220.bmp') as source:
+            reference = np.asarray(source.convert('L')) > 155
+        actual = np.asarray(frame.crop((x, y, x+reference.shape[1], y+reference.shape[0])).convert('L')) > 155
+        if actual.shape != reference.shape:
+            return False
+        static = np.ones(reference.shape, dtype=bool)
+        static[:, 105:118] = False
+        return bool(np.mean(actual[static] == reference[static]) >= .985
+                    and np.mean(actual[6:31, 105:118] == reference[6:31, 118:131]) >= .98)
+
+    def _survival_observed_score(self, frame: Image.Image) -> int | None:
+        """Read actual points, including membership-start 80/220.
+
+        The displayed score is a checkpoint, not a count of completed fights.
+        A separate reset action determines the round, never the starting score.
+        """
+        if self._survival_full_score_visible(frame):
+            return 220
+        if self._survival_score_two_hundred_visible(frame):
+            return 200
+        if self._survival_score_twenty_visible(frame):
+            return 20
+        roi = (751, 769, 1151, 1031)
+        for score in (140, 160, 80, 0):
+            if self.template(f"survival_score_{score}.bmp", roi, frame, threshold=.98)[0]:
+                return score
+        return None
+
+    def _survival_page_identity_verified(self, account: Account, frame: Image.Image) -> bool:
+        """A full-screen page retains only this run's verified tab custody."""
+        if self.verify_identity(account, frame)[0]:
+            return True
+        from hyol_run_context import RunContext
+        from hyol_checkpoints import current_identity_mask
+        context = getattr(self, 'run_context', None)
+        if not isinstance(context, RunContext) or not context.binding:
+            return False
+        binding = context.binding
+        if (binding['mapping'].get(account.index) != self.state.aliases.get(account.name, account.name)
+                or self.active != account
+                or self._saved_tab_mapping().get(account.name) != account.tab_x
+                or not context.layout_matches(frame)
+                or self._generic_active_tab_x(frame) != account.tab_x
+                or not self.healthy(frame)
+                or not self._combat_ready_visible('survival', frame)
+                or self._combat_active_visible('survival', frame)
+                or int(current_identity_mask(frame, self.templates).sum()) >= 50):
+            return False  # A visible but different role must never use hidden-page custody.
+        try:
+            context.check_window(self)
+        except PendingError:
+            return False
+        reference = binding['frames'].get(account.index)
+        if reference is None or binding['centers'][account.index-1] != account.tab_x:
+            return False
+        def title_mask(image, x):
+            return np.asarray(image.crop((x-48,5,x+24,30)).convert('L')) < 105
+        previous, current = title_mask(reference, account.tab_x), title_mask(frame, account.tab_x)
+        if previous.any() or current.any():
+            return mask_f1(previous, current) >= .70
+        # One observed tab can have no title text. Treat that only as a unique
+        # chrome feature within the same six-role binding, never as identity alone.
+        return sum(not title_mask(image, binding['centers'][slot-1]).any()
+                   for slot, image in binding['frames'].items()) == 1
+
+    def _survival_attempt_evidence(self, account: Account, action: str):
+        from hyol_run_context import RunContext
+        context = getattr(self, 'run_context', None)
+        if isinstance(context, RunContext):
+            if Path(self.state.directory).resolve() != context.directory.resolve():
+                raise PendingError('生存账本不属于当前运行，禁止绑定操作凭据')
+            record = self.state.accounts[account.name]
+            scope = f'survival:{context.identifier}:{account.account_id}'
+            if record.get('survival_operation_scope', scope) != scope:
+                raise PendingError('生存操作编号属于其他运行或账号，保留原记录')
+            record['survival_operation_scope'] = scope
+        run = 2 if self.state.action_status(account.name, "survival_second_run_started") == "done" else 1
+        observations = self.state.accounts[account.name].setdefault("survival_attempt_observations", {})
+        return observations, f"run_{run}:{action}"
 
     def reconcile_survival_partial_reset(self, account, frame):
         """Prove a reset from its own before image and remaining 1 -> 0, never score alone."""
         if self.state.action_status(account.name, 'survival_reset') != 'pending':
             return False
         if (not self.template('survival_anchor.bmp', (201,69,601,419), frame, threshold=.92)[0]
+                or not self._survival_page_identity_verified(account, frame)
                 or self._survival_partial_score(frame) is None
                 or not any(self.template(name, (851,769,1251,1031), frame, threshold=.98)[0]
                            for name in ('survival_reset_zero_text.bmp', 'survival_reset_zero_current.bmp'))):
             return False
         actions = self.state.accounts.get(account.name, {}).get('actions', {})
-        if any(key.startswith('survival_battle_step_') and row.get('status') == 'pending'
+        if any(key.startswith(('survival_battle_step_', 'survival_result_confirm_')) and row.get('status') == 'pending'
                for key, row in actions.items() if isinstance(row, dict)):
             return False
         record = self.state.action_record(account.name, 'survival_reset')
+        if record.get('checkpoint_conflict'):
+            return False
         paths = [Path(record['before_evidence'])] if record.get('before_evidence') else []
         if not paths:
             # Older versions logged before-image paths without putting them in
@@ -5247,7 +5408,7 @@ class Scheduler:
                 stamp = datetime.fromisoformat(record['updated_at'])
             except (ValueError, KeyError):
                 return False
-            for logs in ProgressReader(ROOT).log_roots:
+            for logs in dict.fromkeys((LOGS, *ProgressReader(ROOT).log_roots)):
                 folder = logs/'scheduler_evidence'/self.state.day/slug(account.name)
                 for path in folder.glob('*_before_survival_reset.jpg'):
                     try:
@@ -5262,12 +5423,15 @@ class Scheduler:
             return False
         with Image.open(paths[0]) as image:
             before = image.convert('RGB')
-        if not (self._survival_full_score_visible(before)
+        if not (self._survival_page_identity_verified(account, before)
+                and self._survival_full_score_visible(before)
                 and self.template('survival_reset.bmp', (851,769,1251,1031), before, threshold=.98)[0]
                 and any(self.template(name, (1151,769,1451,1031), before, threshold=.98)[0]
                         for name in ('survival_final_claimed.bmp','survival_final_claimed_current.bmp'))):
             return False
         after = self.save_raw_evidence(frame, account, 'survival_partial_reset', 'verified')
+        self.state.accounts[account.name]['actions']['survival_reset'].setdefault('before_evidence', str(paths[0]))
+        self.state.save_account(account.name)
         self.commit_action(account, 'survival_reset', '原重置前220/220已领奖、剩余1次；当前部分积分且剩余0次')
         if self.state.action_status(account.name, 'survival_reset_confirm_yes') == 'pending':
             self.commit_action(account, 'survival_reset_confirm_yes', '原重置剩余次数1→0已确认')
@@ -5285,7 +5449,8 @@ class Scheduler:
         if confirm_visible:
             # Builds before direct-flow v2 incorrectly committed the reset by
             # seeing the unchanged 0/220 text behind this blocking modal.
-            self.state.set_action(account.name, reset_action, "pending", "等待确认重置生存演习")
+            if self.state.action_status(account.name, reset_action) != 'pending':
+                self.state.set_action(account.name, reset_action, "pending", "等待确认重置生存演习")
             if self.state.action_status(account.name, confirm_action) == "pending":
                 # A still-visible confirmation button proves the previous
                 # click did not transition, so this exact click is retryable.
@@ -5304,6 +5469,11 @@ class Scheduler:
                 raise PendingError("生存演习重置确认按钮消失")
             if not self.wait_absent("survival_reset_confirm_yes.bmp", (701, 469, 1151, 719), 8, threshold=0.92):
                 raise PendingError("生存演习重置确认结果未知")
+            # A membership account may restart at 80/220, not 0/220.
+            # The recorded full-score/claimed before image and reset-counter
+            # drop from 1 to 0 are required before accepting a partial score.
+            if self.reconcile_survival_partial_reset(account, self.capture()) is True:
+                return
         elif self.state.action_status(account.name, confirm_action) == "pending":
             if not self.template("survival_score_0.bmp", (751, 769, 1151, 1031))[0]:
                 raise PendingError("生存演习重置确认结果未知")
@@ -5335,7 +5505,9 @@ class Scheduler:
                 return
             raise PendingError("生存演习重置后既无确认弹窗也未稳定为0/220")
         if not self.wait_template("survival_score_0.bmp", (751, 769, 1151, 1031), 8):
-            raise PendingError("生存演习重置后未确认0/220，禁止重复重置")
+            if self.reconcile_survival_partial_reset(account, self.capture()) is True:
+                return
+            raise PendingError("生存演习重置后未确认0/220或有来源的会员初始积分，禁止重复重置")
         if self.state.action_status(account.name, confirm_action) == "pending":
             self.commit_action(account, confirm_action, "确认按钮消失且0/220已显示")
         self.commit_action(account, reset_action, "重置确认完成且0/220已显示")
@@ -5414,6 +5586,9 @@ class Scheduler:
                 if current is None:
                     raise ValueError("生存未满分且无已核实可挑战副本")
             except ValueError as exc:
+                if str(exc) != last_error:
+                    self.event('survival_grade_read_pending', account, index=index,
+                               detail=str(exc), grades=candidates)
                 last_error = str(exc)
                 selected = None
                 signature = None
@@ -5461,12 +5636,30 @@ class Scheduler:
         if status == "done":
             slot.next_index += 1
             return
+        if any(self.state.action_status(account.name, label) in ('pending', 'done')
+               for label in (action + '_start', f'survival_result_confirm_{slot.next_index}')):
+            raise PendingError('生存原开战或结算凭据仍存在，禁止覆盖积分基线或再次开战')
+        if any(key.startswith(('survival_reset','survival_claim_','survival_reward_result_confirm'))
+               and isinstance(row, dict) and row.get('status') == 'pending'
+               for key, row in self.state.accounts[account.name].get('actions', {}).items()):
+            raise PendingError('生存重置或奖励动作仍未决，禁止选择下一场或覆盖本轮积分基线')
+        # VIP accounts may begin at 80/220; an initial nonzero score is normal.
+        # Record the observed point baseline before selecting an opponent.
+        before_frame = self.content_guard(account, ['survival_anchor.bmp'])
+        before_score = self._survival_observed_score(before_frame)
+        if before_score is None:
+            evidence = self.save_raw_evidence(before_frame, account, "survival_before_score_unknown", "pending")
+            raise PendingError(f"生存开战前积分不明确，保留本场：{evidence}")
         selected = self._select_highest_survival_grade(account, slot.next_index)
         if selected is None:
             self._finish_survival_slot(slot)
             return
         if not self.wait_template("survival_fight_start_core.bmp", (751, 169, 1151, 419), 30, threshold=0.92):
             raise PendingError("survival fight-start state unknown; battle remains pending")
+        observations, key = self._survival_attempt_evidence(account, action)
+        observations[key] = dict(score_before=before_score, grade=selected['grade'],
+                                 remaining_before=selected['remaining'], observed_at=now_iso())
+        self.state.save_account(account.name)
         self._click_survival_fight_start(slot)
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
         slot.battle_watchdog_index = slot.next_index
@@ -5516,8 +5709,14 @@ class Scheduler:
         # fight-result repaint by one or more frames.
         if self.template("survival_result_confirm.bmp", (701, 519, 1151, 819), frame)[0]:
             label = f"survival_result_confirm_{slot.next_index}"
-            if self.state.action_status(account.name, label) == "pending":
+            result_status = self.state.action_status(account.name, label)
+            if result_status == "pending":
                 raise PendingError("survival result confirmation outcome unknown; refusing duplicate")
+            if result_status == "done":
+                raise PendingError("生存原场结算已核实但按钮再次出现；保留原完成记录，不重复点击")
+            action = self._combat_action_name("survival", slot.next_index)
+            if self.state.action_status(account.name, action) != "pending":
+                raise PendingError(f"{action} has no pending battle start to commit")
             if not self.click_template(account, "survival_result_confirm.bmp", (701, 519, 1151, 819), 63, 18, label, ["survival_result_confirm.bmp"], irreversible=True):
                 raise PendingError("survival result confirmation disappeared")
             if not self.wait_absent("survival_result_confirm.bmp", (701, 519, 1151, 819), 10):
@@ -5527,8 +5726,34 @@ class Scheduler:
             action = self._combat_action_name("survival", slot.next_index)
             if self.state.action_status(account.name, action) != "pending":
                 raise PendingError(f"{action} has no pending battle start to commit")
-            self.commit_action(account, label, "result confirmation returned to the verified survival page")
-            self.commit_action(account, action, "battle result confirmed and survival page returned")
+            observations, key = self._survival_attempt_evidence(account, action)
+            baseline = observations.get(key, {}).get('score_before')
+            # The score can repaint after the dialog disappears. Observe, do not
+            # repeat the result click or the fight if the score is still stale.
+            score_after = None
+            deadline = time.monotonic() + 4
+            stable = 0
+            while time.monotonic() < deadline:
+                fresh = self.capture()
+                observed = self._survival_observed_score(fresh)
+                if (type(baseline) is int and type(observed) is int
+                        and 0 <= baseline < observed <= 220
+                        and self._combat_ready_visible('survival', fresh)
+                        and self._survival_page_identity_verified(account, fresh)):
+                    stable = stable + 1 if observed == score_after else 1
+                    score_after = observed
+                    if stable >= 2:
+                        break
+                else:
+                    stable = 0
+                self.wait_interruptible(.35)
+            if stable < 2:
+                evidence = self.save_raw_evidence(self.capture(), account,
+                                                  f"survival_step_{slot.next_index}_score_unverified", "pending")
+                raise PendingError(f"生存结算未证实积分增加：原积分={baseline}，当前={score_after}；"
+                                   f"本场保持待续，不重复开战；{evidence}")
+            self.commit_action(account, label, "result closed; point increase independently confirmed")
+            self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
             slot.running = False
             slot.next_index += 1
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
@@ -5571,6 +5796,11 @@ class Scheduler:
         if not self._survival_full_score_visible():
             evidence = self.save_raw_evidence(self.capture(), account, 'survival_full_digits_unverified', 'pending')
             raise PendingError(f'生存220分数字未严格确认；画面={evidence}')
+        actions = self.state.accounts[account.name].get('actions', {})
+        if any(key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
+               and isinstance(row, dict) and row.get('status') == 'pending'
+               for key, row in actions.items()):
+            raise PendingError('生存仍有未决开战或结算，禁止领奖、重置或覆盖原动作')
         self.claim_survival_rewards(account)
         self.reconcile_survival_result_confirmations(account)
         if self.state.action_status(account.name, "survival_second_run_started") != "done":
@@ -5584,6 +5814,13 @@ class Scheduler:
                 self.event('combat_module_done', account, mode='survival', reset_exhausted=True)
                 return
             self._ensure_survival_reset(account)
+            from copy import deepcopy
+            archives = self.state.accounts[account.name].setdefault('survival_round_archives', {})
+            archives.setdefault('inline_run_1', dict(
+                archived_at=now_iso(),
+                actions=deepcopy({key: value for key, value in actions.items()
+                                  if key.startswith('survival_')})))
+            self.state.save_account(account.name)
             self.event('survival_first_run_archived', account,
                        actions={key: value for key, value in self.state.accounts.get(account.name, {}).get('actions', {}).items()
                                 if key.startswith('survival_')})
@@ -5625,7 +5862,7 @@ class Scheduler:
             if mode == "arena"
             else [
                 "survival_toolbar_current_core.bmp",
-                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_complete_220.bmp",
+                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_score_200.bmp", "survival_complete_220.bmp",
                 "survival_grade_ss.bmp", "survival_grade_s.bmp", "survival_grade_a_current.bmp", "survival_grade_b_current.bmp", "survival_grade_c.bmp", "survival_fight_start.bmp", "survival_fight_start_core.bmp", "survival_result_confirm.bmp",
                 "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
                 "survival_reward_result_confirm.bmp", "survival_final_claimed.bmp",
