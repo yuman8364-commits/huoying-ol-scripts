@@ -330,6 +330,15 @@ class SurvivalReceiptTests(unittest.TestCase):
         self.assertEqual(160, self.s._survival_partial_score(self.frame))
         self.assertFalse(self.s._survival_full_score_visible(self.frame))
 
+    def test_live_two_hundred_repaint_is_partial_and_never_full(self):
+        self.s.template = hs.Scheduler.template.__get__(self.s)
+        self.s.detector = None
+        with Image.open(hs.ASSETS/'survival_score_200.bmp') as badge:
+            self.frame.paste(badge, (837,878))
+        self.assertEqual(200, self.s._survival_observed_score(self.frame))
+        self.assertEqual(200, self.s._survival_partial_score(self.frame))
+        self.assertFalse(self.s._survival_full_score_visible(self.frame))
+
     def test_daily_finish_keeps_pending_battle_and_result_before_any_claim(self):
         from hyol_daily_tasks import DailyScheduler
         for action in (self.action, self.result):
@@ -346,6 +355,52 @@ class SurvivalReceiptTests(unittest.TestCase):
                     DailyScheduler._finish_survival_slot(self.s,self.slot)
                 self.s.claim_survival_rewards.assert_not_called()
                 self.assertEqual(original,self.s.state.accounts[self.account.name])
+
+    def test_actual_write_ahead_retains_before_image_on_disk_before_input(self):
+        import json
+        s = self.s
+        s.no_content_clicks = False
+        s.check_input_pause = Mock()
+        s.screen_point = Mock(return_value=(100,500))
+        s.save_evidence = Mock(return_value=Path(self.folder.name)/'original.png')
+        s.hwnd, s.click_count, s.content_click_count = 123, 0, 0
+        def input_sent(*args, **kwargs):
+            saved = json.loads(s.state.account_paths[self.account.name].read_text('utf-8'))
+            receipt = saved['actions']['survival_reset']
+            self.assertEqual('pending', receipt['status'])
+            self.assertEqual(str(Path(self.folder.name)/'original.png'),receipt.get('before_evidence'))
+        with patch.object(hs.Win32,'click',side_effect=input_sent), patch.object(hs.time,'sleep'):
+            s.click_point(self.account,100,500,'survival_reset',['survival_anchor.bmp'],irreversible=True)
+
+    def test_original_before_image_survives_pending_refresh_and_commit(self):
+        s = self.s
+        s.state.set_action(self.account.name,'survival_reset','pending')
+        s.state.accounts[self.account.name]['actions']['survival_reset']['before_evidence'] = 'original.png'
+        for status in ('pending','done'):
+            s.state.set_action(self.account.name,'survival_reset',status)
+            self.assertEqual('original.png', s.state.action_record(self.account.name,'survival_reset')['before_evidence'])
+        s.state.set_action(self.account.name,'survival_reset','new')
+        self.assertNotIn('before_evidence',s.state.action_record(self.account.name,'survival_reset'))
+
+    def test_reset_recovers_only_timestamp_matched_before_image_in_active_log(self):
+        s = self.s
+        s.template = hs.Scheduler.template.__get__(s)
+        s.detector = None
+        logs = Path(self.folder.name)/'active-events'
+        folder = logs/'scheduler_evidence'/s.state.day/hs.slug(self.account.name)
+        folder.mkdir(parents=True)
+        path = folder/'101112_000000_before_survival_reset.jpg'
+        with Image.open(hs.ROOT/'tests/fixtures/survival_reset_before_20261012.png') as before:
+            before.convert('RGB').save(path,quality=100,subsampling=0)
+        with Image.open(hs.ROOT/'tests/fixtures/survival_partial_after_20261012.png') as after:
+            frame = after.convert('RGB')
+        s.state.set_action(self.account.name,'survival_reset','pending')
+        receipt = s.state.accounts[self.account.name]['actions']['survival_reset']
+        receipt['updated_at'] = f'{s.state.day}T10:11:12.200+08:00'
+        with patch.object(hs,'LOGS',logs), patch.object(hs,'ROOT',Path(self.folder.name)):
+            self.assertTrue(s.reconcile_survival_partial_reset(self.account,frame))
+        self.assertEqual('done',s.state.action_status(self.account.name,'survival_reset'))
+        self.assertEqual(str(path),s.state.action_record(self.account.name,'survival_reset')['before_evidence'])
 
 
 class SchedulingSafetyTests(unittest.TestCase):

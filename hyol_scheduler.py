@@ -921,6 +921,8 @@ class StateStore:
                 from hyol_checkpoints import resolve_action
                 resolve_action(self, name, action, detail)
         actions[action] = {"status": status, "detail": detail, "updated_at": now_iso()}
+        if status != 'new' and previous.get('before_evidence'):
+            actions[action]['before_evidence'] = previous['before_evidence']
         scope = self.accounts[name].get('continuation_scope')
         survival_scope = self.accounts[name].get('survival_operation_scope') if action.startswith('survival_') else None
         if survival_scope:
@@ -3053,7 +3055,9 @@ class Scheduler:
             self.state.set_action(account.name, label, "pending", "written before click")
             record = self.state.action_record(account.name, label)
             if isinstance(record, dict):
-                record['before_evidence'] = str(evidence)
+                # action_record() returns a defensive copy. Persist on the
+                # actual write-ahead receipt before sending any input.
+                self.state.accounts[account.name]['actions'][label]['before_evidence'] = str(evidence)
                 self.state.save_account(account.name)
         physical_x, physical_y = self.screen_point(x,y) if hasattr(self,"screen_point") else (x,y)
         self.check_input_pause()
@@ -5292,6 +5296,8 @@ class Scheduler:
 
     def _survival_score_two_hundred_visible(self, frame):
         """Recognize 200/220 using the enrolled zero glyph, never as full score."""
+        if self.template('survival_score_200.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
+            return True
         _ok, score, x, y = self.template('survival_complete_220.bmp',
             (751, 769, 1151, 1031), frame, threshold=0)
         if score < .90 or x < 0 or y < 0:
@@ -5396,7 +5402,7 @@ class Scheduler:
                 stamp = datetime.fromisoformat(record['updated_at'])
             except (ValueError, KeyError):
                 return False
-            for logs in ProgressReader(ROOT).log_roots:
+            for logs in dict.fromkeys((LOGS, *ProgressReader(ROOT).log_roots)):
                 folder = logs/'scheduler_evidence'/self.state.day/slug(account.name)
                 for path in folder.glob('*_before_survival_reset.jpg'):
                     try:
@@ -5418,6 +5424,8 @@ class Scheduler:
                         for name in ('survival_final_claimed.bmp','survival_final_claimed_current.bmp'))):
             return False
         after = self.save_raw_evidence(frame, account, 'survival_partial_reset', 'verified')
+        self.state.accounts[account.name]['actions']['survival_reset'].setdefault('before_evidence', str(paths[0]))
+        self.state.save_account(account.name)
         self.commit_action(account, 'survival_reset', '原重置前220/220已领奖、剩余1次；当前部分积分且剩余0次')
         if self.state.action_status(account.name, 'survival_reset_confirm_yes') == 'pending':
             self.commit_action(account, 'survival_reset_confirm_yes', '原重置剩余次数1→0已确认')
@@ -5841,7 +5849,7 @@ class Scheduler:
             if mode == "arena"
             else [
                 "survival_toolbar_current_core.bmp",
-                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_complete_220.bmp",
+                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_score_200.bmp", "survival_complete_220.bmp",
                 "survival_grade_ss.bmp", "survival_grade_s.bmp", "survival_grade_a_current.bmp", "survival_grade_b_current.bmp", "survival_grade_c.bmp", "survival_fight_start.bmp", "survival_fight_start_core.bmp", "survival_result_confirm.bmp",
                 "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
                 "survival_reward_result_confirm.bmp", "survival_final_claimed.bmp",
