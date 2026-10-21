@@ -5059,26 +5059,23 @@ class Scheduler:
         self.state.save_account(account.name)
         self.event('survival_pending_progress_observed', account, index=index,
                    score=score, grades=candidates, evidence=str(evidence), outcome='unknown')
-        # A crash after an audited result close may leave the battle uncommitted.
-        # Only the same operation's completed confirmation can reconcile it.
+        # A confirmed result close is not proof of point progress. Membership
+        # starts at 80/220 for some accounts, so compare this exact run's score
+        # baseline against the stable current page instead of counting fights.
         label = f'survival_result_confirm_{index}'
         confirmation = self.state.accounts[account.name].get('actions', {}).get(label, {})
-        operation = original.get('operation_id')
-        expected = operation[:-len(action)]+label if isinstance(operation,str) and operation.endswith(':'+action) else None
-        if (expected and not original.get('checkpoint_conflict')
-                and confirmation.get('status') == 'done'
-                and confirmation.get('operation_id') == expected):
-            self.commit_action(account, action, '同一操作的结算确认已完成，生存页与身份三帧核实')
-            slot.running = False
-            return True
-        # An interrupted result-close may be pending even though the score
-        # subsequently repainted. Three stable, identity-bound page samples
-        # above and the original pre-fight score allow read-only reconciliation.
         prior, evidence_key = self._survival_attempt_evidence(account, action)
         baseline = prior.get(evidence_key, {}).get('score_before')
-        if (not original.get('checkpoint_conflict')
-                and isinstance(baseline, int) and isinstance(score, int) and score > baseline
-                and confirmation.get('status') == 'pending'
+        progressed = (isinstance(baseline, int) and isinstance(score, int)
+                      and score > baseline and not original.get('checkpoint_conflict'))
+        operation = original.get('operation_id')
+        expected = operation[:-len(action)] + label if isinstance(operation, str) and operation.endswith(':' + action) else None
+        if (progressed and expected and confirmation.get('status') == 'done'
+                and confirmation.get('operation_id') == expected):
+            self.commit_action(account, action, f'原结算完成且生存积分增加：{baseline}->{score}')
+            slot.running = False
+            return True
+        if (progressed and confirmation.get('status') == 'pending'
                 and self.state.action_status(account.name, f"{action}_start") == 'done'):
             self.commit_action(account, label, "原结算已关闭；三帧实名页面及积分增加已核实")
             self.commit_action(account, action, f"中断后从生存积分对账：{baseline}->{score}")
