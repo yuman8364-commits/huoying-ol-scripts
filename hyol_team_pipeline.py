@@ -1424,6 +1424,10 @@ class TeamPipelineRunner:
                     samples = rec.setdefault('battle_durations', [])
                     samples.append(round(elapsed, 3))
                     del samples[:-20]
+                    intervals = rec.setdefault('battle_timing_intervals', [])
+                    intervals.append(dict(started_at=started, ended_at=now,
+                                          task=task, completed=completed))
+                    del intervals[:-20]
                     self.event('pipeline_battle_duration', driver.account,
                                task=task, seconds=round(elapsed, 3), samples=len(samples))
             rec.pop('battle_timer_started_at', None)
@@ -1468,6 +1472,31 @@ class TeamPipelineRunner:
         except hs.PendingError as exc:
             self.block(slot, exc)
 
+    def _pipeline_timing_summary(self, elapsed):
+        intervals_by_team = {}
+        first_starts = []
+        for index in self.leaders:
+            tasks = self.record.get('teams', {}).get(str(index), {}).get('tasks', {})
+            intervals = [row for rec in tasks.values()
+                         for row in rec.get('battle_timing_intervals', ())
+                         if isinstance(row, dict) and isinstance(row.get('started_at'), (int, float))
+                         and isinstance(row.get('ended_at'), (int, float))
+                         and row['ended_at'] >= row['started_at']]
+            intervals_by_team[index] = intervals
+            if intervals:
+                first_starts.append(min(row['started_at'] for row in intervals))
+        overlap = 0.0
+        if len(self.leaders) == 2:
+            first, second = (intervals_by_team[index] for index in self.leaders)
+            overlap = sum(max(0.0, min(a['ended_at'], b['ended_at'])
+                              - max(a['started_at'], b['started_at']))
+                          for a in first for b in second)
+        return dict(total_team_seconds=round(max(0.0, elapsed), 3),
+                    observed_start_gap_seconds=round(abs(first_starts[0]-first_starts[1]), 3)
+                    if len(first_starts) >= 2 else None,
+                    observed_battle_overlap_seconds=round(overlap, 3),
+                    note='Battle starts are first positive observations; overlap is approximate.')
+
     def run_teams(self):
         """Single foreground executor; two independent, nonblocking battle states.
 
@@ -1475,12 +1504,17 @@ class TeamPipelineRunner:
         while the other captain remains in a longer bonus/reward battle.
         """
         clock = getattr(self, '_poll_clock', time.monotonic)
+        stage_started = clock()
         next_check = {index: clock() for index in self.leaders}
         while True:
             self.scheduler.check_stop()
             active = [index for index in self.leaders
                       if self.record['teams'][str(index)].get('status') in ('running', 'complete')]
             if not active:
+                timing = self._pipeline_timing_summary(clock() - stage_started)
+                self.record['team_timing_summary'] = timing
+                self.event('pipeline_timing_summary', **timing)
+                self.save()
                 return
             progressed = False
             for index in active:
