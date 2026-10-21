@@ -5066,6 +5066,19 @@ class Scheduler:
             self.commit_action(account, action, '同一操作的结算确认已完成，生存页与身份三帧核实')
             slot.running = False
             return True
+        # An interrupted result-close may be pending even though the score
+        # subsequently repainted. Three stable, identity-bound page samples
+        # above and the original pre-fight score allow read-only reconciliation.
+        prior, evidence_key = self._survival_attempt_evidence(account, action)
+        baseline = prior.get(evidence_key, {}).get('score_before')
+        if (not original.get('checkpoint_conflict')
+                and isinstance(baseline, int) and isinstance(score, int) and score > baseline
+                and confirmation.get('status') == 'pending'
+                and self.state.action_status(account.name, f"{action}_start") == 'done'):
+            self.commit_action(account, label, "原结算已关闭；三帧实名页面及积分增加已核实")
+            self.commit_action(account, action, f"中断后从生存积分对账：{baseline}->{score}")
+            slot.running = False
+            return True
         slot.running = False
         return False
 
@@ -5223,6 +5236,27 @@ class Scheduler:
             if self.template(f'survival_score_{value}.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
                 return value
         return None
+
+    def _survival_observed_score(self, frame: Image.Image) -> int | None:
+        """Read actual points, including membership-start 80/220.
+
+        The displayed score is a checkpoint, not a count of completed fights.
+        A separate reset action determines the round, never the starting score.
+        """
+        if self._survival_full_score_visible(frame):
+            return 220
+        if self._survival_score_twenty_visible(frame):
+            return 20
+        roi = (751, 769, 1151, 1031)
+        for score in (140, 80, 0):
+            if self.template(f"survival_score_{score}.bmp", roi, frame, threshold=.98)[0]:
+                return score
+        return None
+
+    def _survival_attempt_evidence(self, account: Account, action: str):
+        run = 2 if self.state.action_status(account.name, "survival_second_run_started") == "done" else 1
+        observations = self.state.accounts[account.name].setdefault("survival_attempt_observations", {})
+        return observations, f"run_{run}:{action}"
 
     def reconcile_survival_partial_reset(self, account, frame):
         """Prove a reset from its own before image and remaining 1 -> 0, never score alone."""
@@ -5461,12 +5495,23 @@ class Scheduler:
         if status == "done":
             slot.next_index += 1
             return
+        # VIP accounts may begin at 80/220; an initial nonzero score is normal.
+        # Record the observed point baseline before selecting an opponent.
+        before_frame = self.capture()
+        before_score = self._survival_observed_score(before_frame)
+        if before_score is None:
+            evidence = self.save_raw_evidence(before_frame, account, "survival_before_score_unknown", "pending")
+            raise PendingError(f"生存开战前积分不明确，保留本场：{evidence}")
         selected = self._select_highest_survival_grade(account, slot.next_index)
         if selected is None:
             self._finish_survival_slot(slot)
             return
         if not self.wait_template("survival_fight_start_core.bmp", (751, 169, 1151, 419), 30, threshold=0.92):
             raise PendingError("survival fight-start state unknown; battle remains pending")
+        observations, key = self._survival_attempt_evidence(account, action)
+        observations[key] = dict(score_before=before_score, grade=selected['grade'],
+                                 remaining_before=selected['remaining'], observed_at=now_iso())
+        self.state.save_account(account.name)
         self._click_survival_fight_start(slot)
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
         slot.battle_watchdog_index = slot.next_index
@@ -5516,8 +5561,11 @@ class Scheduler:
         # fight-result repaint by one or more frames.
         if self.template("survival_result_confirm.bmp", (701, 519, 1151, 819), frame)[0]:
             label = f"survival_result_confirm_{slot.next_index}"
-            if self.state.action_status(account.name, label) == "pending":
+            result_status = self.state.action_status(account.name, label)
+            if result_status == "pending":
                 raise PendingError("survival result confirmation outcome unknown; refusing duplicate")
+            if result_status == "done":
+                raise PendingError("生存原场结算已核实但按钮再次出现；保留原完成记录，不重复点击")
             if not self.click_template(account, "survival_result_confirm.bmp", (701, 519, 1151, 819), 63, 18, label, ["survival_result_confirm.bmp"], irreversible=True):
                 raise PendingError("survival result confirmation disappeared")
             if not self.wait_absent("survival_result_confirm.bmp", (701, 519, 1151, 819), 10):
@@ -5527,8 +5575,32 @@ class Scheduler:
             action = self._combat_action_name("survival", slot.next_index)
             if self.state.action_status(account.name, action) != "pending":
                 raise PendingError(f"{action} has no pending battle start to commit")
-            self.commit_action(account, label, "result confirmation returned to the verified survival page")
-            self.commit_action(account, action, "battle result confirmed and survival page returned")
+            observations, key = self._survival_attempt_evidence(account, action)
+            baseline = observations.get(key, {}).get('score_before')
+            # The score can repaint after the dialog disappears. Observe, do not
+            # repeat the result click or the fight if the score is still stale.
+            score_after = None
+            deadline = time.monotonic() + 4
+            stable = 0
+            while time.monotonic() < deadline:
+                fresh = self.capture()
+                observed = self._survival_observed_score(fresh)
+                if (isinstance(baseline, int) and isinstance(observed, int)
+                        and observed > baseline):
+                    stable = stable + 1 if observed == score_after else 1
+                    score_after = observed
+                    if stable >= 2:
+                        break
+                else:
+                    stable = 0
+                self.wait_interruptible(.35)
+            if stable < 2:
+                evidence = self.save_raw_evidence(self.capture(), account,
+                                                  f"survival_step_{slot.next_index}_score_unverified", "pending")
+                raise PendingError(f"生存结算未证实积分增加：原积分={baseline}，当前={score_after}；"
+                                   f"本场保持待续，不重复开战；{evidence}")
+            self.commit_action(account, label, "result closed; point increase independently confirmed")
+            self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
             slot.running = False
             slot.next_index += 1
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
