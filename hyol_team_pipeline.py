@@ -1398,96 +1398,137 @@ class TeamPipelineRunner:
                 changed=True
         if changed:self.save()
 
-    def run_teams(self):
-        # Launch both captains, then keep one selected until its round settles.
-        # No team can enter the following round before every participant settles.
+    def _next_pipeline_task(self, index):
+        """Each verified captain advances independently through selected activities."""
+        slot = self.record['teams'][str(index)]
         for selected in self.tasks:
             task = TASK_KEYS[selected]
-            while True:
-                participants = [index for index in self.leaders
-                    if self.record['teams'][str(index)]['status'] == 'running'
-                    and self.record['teams'][str(index)]['tasks'].get(task,{}).get('status') != 'done'
-                    and (index,task) not in self._not_open_tasks]
-                if not participants:
-                    break
-                before = {index:self.drivers[index].record(task).get('completed',0) for index in participants}
-                sequence = self.record.get('team_round',{}).get('sequence',0)+1
-                current = dict(task=task,sequence=sequence,participants=participants,completed_before=before,
-                               phase='launch',settled=[])
-                self.record['team_round'] = current
-                self.save()
-                self.event('pipeline_round_started',task=task,round=sequence,leaders=participants)
-                failed = []
-                for index in participants:
-                    if not self.drive_team_round(index,task,before[index],launch=True):
-                        failed.append(index)
-                        break
-                current['phase'] = 'settle'
-                current['settle_order'] = list(reversed(participants))
-                self.save()
-                # The last launched captain is already selected. Stay there,
-                # then check the other captain once, without a round-trip switch.
-                for index in reversed(participants):
-                    if index in failed:
-                        continue
-                    driver = self.drivers[index]
-                    # On a launch failure, only settle battles already launched.
-                    if failed and not driver.round_started(task,before[index]):
-                        continue
-                    if self.drive_team_round(index,task,before[index],launch=False):
-                        current['settled'].append(index)
-                        self.save()
-                    else:
-                        failed.append(index)
-                if failed:
-                    current.update(phase='pending',failed=failed)
-                    for index in participants:
-                        slot = self.record['teams'][str(index)]
-                        if slot['status'] == 'running':
-                            self.block(slot,'另一队本轮结果尚未核实；本队原场次保留，不开始下一轮')
-                    self.save()
-                    return
-                current['phase'] = 'complete'
-                self.save()
-                self.event('pipeline_round_completed',task=task,round=sequence,leaders=participants)
-        for index in self.leaders:
-            slot = self.record['teams'][str(index)]
-            if slot['status'] != 'running':
+            if (index, task) in self._not_open_tasks:
                 continue
-            try:
-                slot['status'] = 'complete'
-                self.save()
-                self.dissolve(index,slot)
-            except hs.AccountOffline as exc:
-                self.block(slot,exc,True)
-            except hs.PendingError as exc:
-                self.block(slot,exc)
+            if slot.get('tasks', {}).get(task, {}).get('status') != 'done':
+                return task
+        return None
 
-    def drive_team_round(self,index,task,completed_before,*,launch):
-        driver = self.drivers[index]
-        slot = self.record['teams'][str(index)]
-        ready = driver.round_started if launch else driver.round_settled
-        self.event('pipeline_round_focus',driver.account,task=task,phase='launch' if launch else 'settle')
-        clock = getattr(self,'_poll_clock',time.monotonic)
+    def _observe_team_battle_timing(self, driver, task, previous_completed):
+        """Learn only from a positively settled round, never from a guessed ETA."""
+        if task not in ('group', 'strong'):
+            return
+        rec = driver.record(task)
+        now = time.time()
+        completed = rec.get('completed', 0)
+        started = rec.get('battle_timer_started_at')
+        if completed > previous_completed:
+            if isinstance(started, (int, float)):
+                elapsed = now - started
+                if 1 <= elapsed <= 1200:
+                    samples = rec.setdefault('battle_durations', [])
+                    samples.append(round(elapsed, 3))
+                    del samples[:-20]
+                    self.event('pipeline_battle_duration', driver.account,
+                               task=task, seconds=round(elapsed, 3), samples=len(samples))
+            rec.pop('battle_timer_started_at', None)
+            self.save()
+        elif (rec.get('launched_battle', 0) > completed
+              and not rec.get('intent') and not isinstance(started, (int, float))):
+            rec['battle_timer_started_at'] = now
+            self.save()
+
+    @staticmethod
+    def _adaptive_team_poll(driver, task):
+        """Adjust observation frequency only. Completion still needs live proof."""
+        base = max(.05, min(8.0, float(getattr(driver, 'next_poll_seconds', .6))))
+        if task not in ('group', 'strong'):
+            return base
+        rec = driver.record(task)
+        started = rec.get('battle_timer_started_at')
+        durations = rec.get('battle_durations', ())
+        if (not isinstance(started, (int, float)) or not durations
+                or rec.get('intent') or rec.get('phase') != 'running'
+                or rec.get('launched_battle', 0) <= rec.get('completed', 0)):
+            return base
+        elapsed = max(0.0, time.time() - started)
+        recent = sorted(float(value) for value in durations[-20:] if isinstance(value, (float, int)) and 1 <= value <= 1200)
+        if not recent:
+            return base
+        expected = recent[len(recent)//2]
+        # Long optional reward stages are a normal tail; do not enforce an ETA.
+        remaining = expected - elapsed
+        if remaining > 12:
+            return min(8.0, max(base, min(8.0, remaining / 3)))
+        if remaining > 0:
+            return min(base, 2.0)
+        return min(base, 3.0)
+
+    def _finish_pipeline_team(self, index, slot):
+        """Dissolve promptly; a slow team must not hold another team's turn."""
+        clock = getattr(self, '_poll_clock', time.monotonic)
+        entered = clock()
+        try:
+            self.dissolve(index, slot)
+        except hs.AccountOffline as exc:
+            self.block(slot, exc, True)
+        except hs.PendingError as exc:
+            self.block(slot, exc)
+        finally:
+            self.defer_navigation(index, max(0, clock() - entered))
+
+    def run_teams(self):
+        """Single foreground executor; two independent, nonblocking battle states.
+
+        No global per-round barrier: a team can settle and start its next round
+        while the other captain remains in a longer bonus/reward battle.
+        """
+        clock = getattr(self, '_poll_clock', time.monotonic)
+        next_check = {index: clock() for index in self.leaders}
         while True:
             self.scheduler.check_stop()
-            if (index,task) in self._not_open_tasks or ready(task,completed_before):
-                return True
-            entered = clock()
-            try:
-                self.event('pipeline_team_tick',driver.account,task=task)
-                driver.tick(task)
-                if (index,task) in self._not_open_tasks or ready(task,completed_before):
-                    return True
-                self.scheduler.wait_interruptible(max(.05,min(8,driver.next_poll_seconds)))
-            except hs.AccountOffline as exc:
-                self.block(slot,exc,True)
-                return False
-            except hs.PendingError as exc:
-                self.block(slot,exc)
-                return False
-            finally:
-                self.defer_navigation(index,max(0,clock()-entered))
+            active = [index for index in self.leaders
+                      if self.record['teams'][str(index)].get('status') in ('running', 'complete')]
+            if not active:
+                return
+            progressed = False
+            for index in active:
+                if clock() + 1e-7 < next_check.get(index, 0):
+                    continue
+                progressed = True
+                slot = self.record['teams'][str(index)]
+                if slot['status'] == 'complete':
+                    self._finish_pipeline_team(index, slot)
+                    continue
+                task = self._next_pipeline_task(index)
+                if task is None:
+                    slot['status'] = 'complete'
+                    self.save()
+                    self._finish_pipeline_team(index, slot)
+                    continue
+                driver = self.drivers.get(index)
+                if driver is None:
+                    self.block(slot, '已核实队伍缺少任务执行器，保留当前进度')
+                    continue
+                started = clock()
+                rec = driver.record(task)
+                previous_completed = rec.get('completed', 0)
+                try:
+                    self.event('pipeline_team_tick', driver.account, task=task)
+                    driver.tick(task)
+                    self._observe_team_battle_timing(driver, task, previous_completed)
+                    if self._next_pipeline_task(index) is None:
+                        slot['status'] = 'complete'
+                        self.save()
+                        self._finish_pipeline_team(index, slot)
+                    elif driver.record(task).get('status') == 'done' or (index, task) in self._not_open_tasks:
+                        next_check[index] = clock()
+                    else:
+                        next_check[index] = clock() + self._adaptive_team_poll(driver, task)
+                except hs.AccountOffline as exc:
+                    self.block(slot, exc, True)
+                except hs.PendingError as exc:
+                    self.block(slot, exc)
+                finally:
+                    self.defer_navigation(index, max(0, clock() - started))
+            if not progressed:
+                earliest = min(next_check.get(index, clock()) for index in active)
+                self.scheduler.wait_interruptible(max(.05, min(8.0, earliest - clock())))
 
     def dissolve(self,index,slot):
         if ('group_instance' in self.tasks and (index, 'group') not in getattr(self, '_not_open_tasks', set())
