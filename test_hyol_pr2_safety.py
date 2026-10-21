@@ -321,6 +321,20 @@ class SurvivalReceiptTests(unittest.TestCase):
                     self.assertFalse(self.observe([160]*3))
                 self.assertEqual(original, self.s.state.accounts[self.account.name]['actions'])
 
+    def test_unique_blank_title_preserves_bound_account_but_duplicate_blank_does_not(self):
+        self.pending(0)
+        ctx = self.hidden_page_context()
+        self.frame.paste('white',(132,5,204,30))
+        ctx.binding['frames'][1] = self.frame.copy()
+        self.assertTrue(self.observe([80]*3))
+        self.pending(80)
+        ctx.binding['mapping'][2] = 'other-role'
+        ctx.binding['centers'] = (180,315)
+        ctx.binding['frames'][2] = self.frame.copy()
+        original = deepcopy(self.s.state.accounts[self.account.name]['actions'])
+        self.assertFalse(self.observe([160]*3))
+        self.assertEqual(original,self.s.state.accounts[self.account.name]['actions'])
+
     def test_live_vip_after_ss_is_160_and_never_full(self):
         self.s.template = hs.Scheduler.template.__get__(self.s)
         self.s.detector = None
@@ -381,6 +395,23 @@ class SurvivalReceiptTests(unittest.TestCase):
             self.assertEqual('original.png', s.state.action_record(self.account.name,'survival_reset')['before_evidence'])
         s.state.set_action(self.account.name,'survival_reset','new')
         self.assertNotIn('before_evidence',s.state.action_record(self.account.name,'survival_reset'))
+
+    def test_unresolved_reset_or_reward_blocks_start_before_selection(self):
+        for receipt in ('survival_reset','survival_reset_confirm_yes','survival_claim_rewards_run_1',
+                        'survival_claim_yes','survival_reward_result_confirm_run_1'):
+            with self.subTest(receipt=receipt), TemporaryDirectory() as folder:
+                s = self.s
+                s.state = hs.StateStore([self.account.name],Path(folder),restore_history=False)
+                s.state.set_action(self.account.name,receipt,'pending')
+                s.content_guard.reset_mock()
+                s._survival_observed_score = Mock(return_value=80)
+                s._select_highest_survival_grade = Mock(side_effect=AssertionError('reached opponent selection'))
+                slot = hs.CombatSlot(self.account,'survival')
+                original = deepcopy(s.state.accounts[self.account.name])
+                with self.assertRaises(hs.PendingError):
+                    s._start_survival_slot(slot)
+                s.content_guard.assert_not_called()
+                self.assertEqual(original,s.state.accounts[self.account.name])
 
     def test_reset_recovers_only_timestamp_matched_before_image_in_active_log(self):
         s = self.s

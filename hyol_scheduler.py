@@ -5357,9 +5357,15 @@ class Scheduler:
         reference = binding['frames'].get(account.index)
         if reference is None or binding['centers'][account.index-1] != account.tab_x:
             return False
-        def title_mask(image):
-            return np.asarray(image.crop((account.tab_x-48,5,account.tab_x+24,30)).convert('L')) < 105
-        return mask_f1(title_mask(reference), title_mask(frame)) >= .70
+        def title_mask(image, x):
+            return np.asarray(image.crop((x-48,5,x+24,30)).convert('L')) < 105
+        previous, current = title_mask(reference, account.tab_x), title_mask(frame, account.tab_x)
+        if previous.any() or current.any():
+            return mask_f1(previous, current) >= .70
+        # One observed tab can have no title text. Treat that only as a unique
+        # chrome feature within the same six-role binding, never as identity alone.
+        return sum(not title_mask(image, binding['centers'][slot-1]).any()
+                   for slot, image in binding['frames'].items()) == 1
 
     def _survival_attempt_evidence(self, account: Account, action: str):
         from hyol_run_context import RunContext
@@ -5580,6 +5586,9 @@ class Scheduler:
                 if current is None:
                     raise ValueError("生存未满分且无已核实可挑战副本")
             except ValueError as exc:
+                if str(exc) != last_error:
+                    self.event('survival_grade_read_pending', account, index=index,
+                               detail=str(exc), grades=candidates)
                 last_error = str(exc)
                 selected = None
                 signature = None
@@ -5630,6 +5639,10 @@ class Scheduler:
         if any(self.state.action_status(account.name, label) in ('pending', 'done')
                for label in (action + '_start', f'survival_result_confirm_{slot.next_index}')):
             raise PendingError('生存原开战或结算凭据仍存在，禁止覆盖积分基线或再次开战')
+        if any(key.startswith(('survival_reset','survival_claim_','survival_reward_result_confirm'))
+               and isinstance(row, dict) and row.get('status') == 'pending'
+               for key, row in self.state.accounts[account.name].get('actions', {}).items()):
+            raise PendingError('生存重置或奖励动作仍未决，禁止选择下一场或覆盖本轮积分基线')
         # VIP accounts may begin at 80/220; an initial nonzero score is normal.
         # Record the observed point baseline before selecting an opponent.
         before_frame = self.content_guard(account, ['survival_anchor.bmp'])
