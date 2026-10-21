@@ -330,6 +330,23 @@ class SurvivalReceiptTests(unittest.TestCase):
         self.assertEqual(160, self.s._survival_partial_score(self.frame))
         self.assertFalse(self.s._survival_full_score_visible(self.frame))
 
+    def test_daily_finish_keeps_pending_battle_and_result_before_any_claim(self):
+        from hyol_daily_tasks import DailyScheduler
+        for action in (self.action, self.result):
+            with self.subTest(action=action):
+                self.slot.complete = False
+                self.pending(140)
+                self.s.template.return_value = (True,1,0,0)
+                self.s.wait_template = Mock(return_value=True)
+                self.s._survival_full_score_visible = Mock(return_value=True)
+                self.s.claim_survival_rewards = Mock()
+                self.s.close_survival = Mock()
+                original = deepcopy(self.s.state.accounts[self.account.name])
+                with self.assertRaises(hs.PendingError):
+                    DailyScheduler._finish_survival_slot(self.s,self.slot)
+                self.s.claim_survival_rewards.assert_not_called()
+                self.assertEqual(original,self.s.state.accounts[self.account.name])
+
 
 class SchedulingSafetyTests(unittest.TestCase):
     def test_fast_team_starts_next_battle_during_slow_bonus_stage(self):
