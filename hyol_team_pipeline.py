@@ -1506,7 +1506,8 @@ class TeamPipelineRunner:
                     self.block(slot, '已核实队伍缺少任务执行器，保留当前进度')
                     continue
                 started = clock()
-                rec = driver.record(task)
+                rec = (driver.record(task) if hasattr(driver, 'record') else
+                       slot.setdefault('tasks', {}).setdefault(task, {'status': 'new'}))
                 previous_completed = rec.get('completed', 0)
                 try:
                     self.event('pipeline_team_tick', driver.account, task=task)
@@ -1516,7 +1517,7 @@ class TeamPipelineRunner:
                         slot['status'] = 'complete'
                         self.save()
                         self._finish_pipeline_team(index, slot)
-                    elif driver.record(task).get('status') == 'done' or (index, task) in self._not_open_tasks:
+                    elif self._next_pipeline_task(index) != task or (index, task) in self._not_open_tasks:
                         next_check[index] = clock()
                     else:
                         next_check[index] = clock() + self._adaptive_team_poll(driver, task)
