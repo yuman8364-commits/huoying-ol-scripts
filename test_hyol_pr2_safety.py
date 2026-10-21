@@ -1,0 +1,302 @@
+"""Exercise PR #2 with real ledgers and distinct account/round receipts."""
+from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+
+from PIL import Image
+
+import hyol_scheduler as hs
+import hyol_team_pipeline as pipeline
+from hyol_combat_watchdog import BattleWatchdog
+from test_hyol_team_pipeline import coordinator
+
+
+class SurvivalReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.account = hs.Account(1, 'verified-role', 180)
+        self.action = 'survival_battle_step_1'
+        self.result = 'survival_result_confirm_1'
+        self.frame = Image.new('RGB', (1920, 1032))
+        s = self.s = object.__new__(hs.Scheduler)
+        s.state = hs.StateStore([self.account.name], Path(self.folder.name), restore_history=False)
+        s.state.accounts[self.account.name]['continuation_scope'] = 'session:account:round'
+        s.templates = hs.TemplateStore(.92)
+        s.capture = Mock(return_value=self.frame)
+        s.content_guard = Mock(return_value=self.frame)
+        s.verify_identity = Mock(return_value=(True, {}))
+        s._combat_ready_visible = Mock(return_value=True)
+        s._combat_active_visible = Mock(return_value=False)
+        s.wait_interruptible = Mock()
+        s.save_raw_evidence = Mock(return_value=Path(self.folder.name) / 'observed.png')
+        s.event = Mock()
+        s.template = Mock(return_value=(False, 0, 0, 0))
+        self.slot = hs.CombatSlot(self.account, 'survival', running=True)
+
+    def pending(self, baseline, *, second=False):
+        s = self.s
+        if second:
+            s.state.set_action(self.account.name, 'survival_second_run_started', 'done')
+        for action, status in ((self.action, 'pending'), (self.action + '_start', 'done'),
+                               (self.result, 'pending')):
+            s.state.set_action(self.account.name, action, status)
+        observations, key = s._survival_attempt_evidence(self.account, self.action)
+        observations[key] = {'score_before': baseline}
+
+    def observe(self, values):
+        self.s._survival_observed_score = Mock(side_effect=values)
+        with patch.object(hs, 'grade_candidates', return_value=[]):
+            return self.s._observe_survival_pending_page(self.slot, self.frame)
+
+    def test_ordinary_and_vip_progress_in_both_rounds(self):
+        for second in (False, True):
+            for before, after in ((0, 20), (80, 140), (140, 220)):
+                with self.subTest(second=second, before=before):
+                    self.pending(before, second=second)
+                    self.assertTrue(self.observe([after] * 3))
+                    self.assertEqual('done', self.s.state.action_status(self.account.name, self.action))
+                    self.assertEqual('done', self.s.state.action_status(self.account.name, self.result))
+
+    def test_stale_unstable_or_out_of_range_score_cannot_settle(self):
+        for scores in ([80, 80, 80], [80, 140, 140], [221] * 3, [None] * 3):
+            with self.subTest(scores=scores):
+                self.pending(80)
+                self.assertFalse(self.observe(scores))
+                self.assertEqual('pending', self.s.state.action_status(self.account.name, self.action))
+
+    def test_other_operation_or_conflict_cannot_settle(self):
+        for target in (self.action, self.action + '_start', self.result):
+            for change in ({'operation_id': 'another-session:another-account'},
+                           {'checkpoint_conflict': True}):
+                with self.subTest(target=target, change=change):
+                    self.pending(80)
+                    actions = self.s.state.accounts[self.account.name]['actions']
+                    actions[target].update(change)
+                    self.assertFalse(self.observe([140] * 3))
+                    self.assertEqual('pending', actions[self.action]['status'])
+                    actions[target].pop('checkpoint_conflict', None)
+
+    def test_identity_change_cannot_settle_or_modify_original(self):
+        self.pending(80)
+        original = deepcopy(self.s.state.accounts[self.account.name]['actions'])
+        self.s.verify_identity.side_effect = [(True, {}), (False, {})]
+        self.assertFalse(self.observe([140] * 3))
+        self.assertEqual(original, self.s.state.accounts[self.account.name]['actions'])
+
+    def test_first_round_baseline_cannot_prove_second_round_battle(self):
+        self.pending(80)
+        self.s.state.set_action(self.account.name, 'survival_second_run_started', 'done')
+        self.assertFalse(self.observe([140] * 3))
+        self.assertEqual('pending', self.s.state.action_status(self.account.name, self.action))
+
+    def test_unsettled_start_blocks_new_battle_and_preserves_baseline(self):
+        self.pending(80)
+        self.s.state.set_action(self.account.name, self.action, 'new')
+        original = deepcopy(self.s.state.accounts[self.account.name])
+        self.slot.running = False
+        with self.assertRaises(hs.PendingError):
+            self.s._start_survival_slot(self.slot)
+        self.assertEqual(original, self.s.state.accounts[self.account.name])
+        self.s.content_guard.assert_not_called()
+
+    def test_full_score_cannot_overwrite_pending_start_or_result(self):
+        for target in (self.action, self.result):
+            with self.subTest(target=target):
+                self.pending(140)
+                self.s.state.set_action(self.account.name, target, 'pending')
+                self.s.template.return_value = (True, 1, 0, 0)
+                self.s.wait_template = Mock(return_value=True)
+                self.s._survival_full_score_visible = Mock(return_value=True)
+                self.s.claim_survival_rewards = Mock()
+                self.s._ensure_survival_reset = Mock()
+                original = deepcopy(self.s.state.accounts[self.account.name])
+                with self.assertRaises(hs.PendingError):
+                    self.s._finish_survival_slot(self.slot)
+                self.s.claim_survival_rewards.assert_not_called()
+                self.s._ensure_survival_reset.assert_not_called()
+                self.assertEqual(original, self.s.state.accounts[self.account.name])
+
+    def test_result_without_pending_battle_sends_no_click(self):
+        self.s.template.side_effect = lambda name, *a, **k: (name == 'survival_result_confirm.bmp', 1, 0, 0)
+        self.s.click_template = Mock()
+        with self.assertRaises(hs.PendingError):
+            self.s._poll_survival_slot(self.slot, self.frame)
+        self.s.click_template.assert_not_called()
+
+    def test_reset_modal_preserves_original_before_image(self):
+        self.s.state.set_action(self.account.name, 'survival_reset', 'pending')
+        record = self.s.state.accounts[self.account.name]['actions']['survival_reset']
+        record['before_evidence'] = 'original_full_score_claimed.png'
+        self.s.reconcile_survival_partial_reset = Mock(side_effect=[False, True])
+        self.s.template.side_effect = lambda name, *a, **k: (name == 'survival_reset_confirm_yes.bmp', 1, 0, 0)
+        self.s.click_template = Mock(return_value=True)
+        self.s.wait_absent = Mock(return_value=True)
+        self.s._ensure_survival_reset(self.account)
+        self.assertEqual('original_full_score_claimed.png',
+                         self.s.state.action_record(self.account.name, 'survival_reset')['before_evidence'])
+
+
+    def test_ordinary_and_vip_complete_two_rounds_with_single_inputs(self):
+        for initial, scores in ((0, [20, 80, 140, 220]), (80, [140, 220])):
+            with self.subTest(initial=initial), TemporaryDirectory() as folder:
+                s = self.s
+                s.state = hs.StateStore([self.account.name], Path(folder), restore_history=False)
+                s.state.accounts[self.account.name]['continuation_scope'] = 'flow:verified-role'
+                current = {'score': initial, 'round': 1}
+                sent, claimed, reset = [], [], []
+                s._survival_observed_score = Mock(side_effect=lambda frame: current['score'])
+                s._survival_full_score_visible = Mock(side_effect=lambda *a: current['score'] == 220)
+                s.wait_template = Mock(return_value=True)
+                s.wait_absent = Mock(return_value=True)
+                s.close_survival = Mock()
+                s.template = Mock(side_effect=lambda name, *a, **k: (
+                    name in ('survival_anchor.bmp', 'survival_result_confirm.bmp'), 1, 0, 0))
+                s._select_highest_survival_grade = Mock(side_effect=lambda *a:
+                    None if current['score'] == 220 else {'grade': 'SS', 'remaining': 1})
+                def click(account, name, roi, dx, dy, label, *args, **kwargs):
+                    key = (current['round'], label)
+                    self.assertNotIn(key, sent)
+                    sent.append(key)
+                    s.state.set_action(account.name, label, 'pending')
+                    return True
+                def claim(account):
+                    self.assertEqual(220, current['score'])
+                    self.assertNotIn(current['round'], claimed)
+                    claimed.append(current['round'])
+                    s.state.set_action(account.name, 'survival_claim_rewards', 'done')
+                def perform_reset(account):
+                    self.assertEqual([1], claimed)
+                    reset.append(current['round'])
+                    s.state.set_action(account.name, 'survival_reset', 'done')
+                    current.update(round=2, score=initial)
+                s.click_template = Mock(side_effect=click)
+                s.claim_survival_rewards = Mock(side_effect=claim)
+                s._ensure_survival_reset = Mock(side_effect=perform_reset)
+                slot = hs.CombatSlot(self.account, 'survival')
+                for round_index in (1, 2):
+                    for after in scores:
+                        s._start_survival_slot(slot)
+                        self.assertTrue(slot.running)
+                        current['score'] = after
+                        s._poll_survival_slot(slot, self.frame)
+                        self.assertFalse(slot.running)
+                    s._start_survival_slot(slot)
+                    self.assertEqual(round_index == 2, slot.complete)
+                self.assertEqual([1, 2], claimed)
+                self.assertEqual([1], reset)
+                self.assertEqual(4 * len(scores), len(sent))
+                s.close_survival.assert_called_once_with(self.account)
+                data = s.state.accounts[self.account.name]
+                self.assertIn('inline_run_1', data['survival_round_archives'])
+                self.assertEqual(2 * len(scores), len(data['survival_attempt_observations']))
+
+    def test_interrupted_confirmation_is_not_clicked_twice(self):
+        self.pending(80)
+        self.s.state.set_action(self.account.name, self.result, 'new')
+        self.s.template.side_effect = lambda name, *a, **k: (name == 'survival_result_confirm.bmp', 1, 0, 0)
+        def sent(*args, **kwargs):
+            self.s.state.set_action(self.account.name, self.result, 'pending')
+            return True
+        self.s.click_template = Mock(side_effect=sent)
+        self.s.wait_absent = Mock(side_effect=KeyboardInterrupt('F12'))
+        with self.assertRaises(KeyboardInterrupt):
+            self.s._poll_survival_slot(self.slot, self.frame)
+        original = deepcopy(self.s.state.accounts[self.account.name]['actions'])
+        with self.assertRaises(hs.PendingError):
+            self.s._poll_survival_slot(self.slot, self.frame)
+        self.s.click_template.assert_called_once()
+        self.assertEqual(original, self.s.state.accounts[self.account.name]['actions'])
+        self.assertTrue(self.observe([140] * 3))
+        self.s.click_template.assert_called_once()
+
+    def test_reset_requires_same_identity_and_no_pending_result(self):
+        before = hs.ROOT / 'tests/fixtures/survival_reset_before_20261012.png'
+        with Image.open(hs.ROOT / 'tests/fixtures/survival_partial_after_20261012.png') as image:
+            after = image.convert('RGB')
+        s = self.s
+        s.template = hs.Scheduler.template.__get__(s)
+        s.detector = None
+        s.state.set_action(self.account.name, 'survival_reset', 'pending')
+        s.state.accounts[self.account.name]['actions']['survival_reset']['before_evidence'] = str(before)
+        original = deepcopy(s.state.accounts[self.account.name]['actions'])
+        s.verify_identity.return_value = (False, {})
+        self.assertFalse(s.reconcile_survival_partial_reset(self.account, after))
+        self.assertEqual(original, s.state.accounts[self.account.name]['actions'])
+        s.verify_identity.return_value = (True, {})
+        s.state.set_action(self.account.name, self.result, 'pending')
+        self.assertFalse(s.reconcile_survival_partial_reset(self.account, after))
+        self.assertEqual('pending', s.state.action_status(self.account.name, 'survival_reset'))
+
+
+class SchedulingSafetyTests(unittest.TestCase):
+    def test_fast_team_starts_next_battle_during_slow_bonus_stage(self):
+        owner = coordinator()
+        owner.tasks = ('group_instance',)
+        trace = []
+        for index in owner.leaders:
+            rec = owner.record['teams'][str(index)]['tasks']['group'] = {
+                'status': 'running', 'phase': 'running', 'completed': 0, 'launched_battle': 1}
+            driver = SimpleNamespace(account=owner.scheduler.accounts[index-1],
+                                     next_poll_seconds=8 if index == 1 else .6, ticks=0,
+                                     record=lambda task, rec=rec: rec)
+            def tick(task, index=index, rec=rec, driver=driver):
+                driver.ticks += 1
+                trace.append((index, driver.ticks, owner._poll_clock()))
+                if index == 4 and driver.ticks == 2:
+                    rec.update(completed=1, launched_battle=2)
+                elif (index == 4 and driver.ticks == 3) or (index == 1 and driver.ticks == 2):
+                    rec.update(completed=2 if index == 4 else 1, status='done')
+            driver.tick = tick
+            owner.drivers[index] = driver
+        owner.dissolve = Mock(side_effect=lambda index, slot: slot.update(status='done'))
+        owner.run_teams()
+        fast_second = next(t for i, n, t in trace if i == 4 and n == 2)
+        slow_result = next(t for i, n, t in trace if i == 1 and n == 2)
+        self.assertLess(fast_second, slow_result)
+        self.assertEqual([1, 4, 4, 4, 1], [i for i, _, _ in trace])
+
+    def test_background_gap_requires_actual_focus_change(self):
+        account = hs.Account(1, 'verified-role', 180)
+        s = SimpleNamespace(_tab_focus_generation=1)
+        image = Image.new('RGB', (1920, 1032))
+        watchdog = BattleWatchdog()
+        hs.check_battle_watchdog(s, watchdog, account, image, 'battle', mode='survival', now=0)
+        s._tab_focus_generation = 3  # A -> B -> A, after successful chrome input.
+        hs.check_battle_watchdog(s, watchdog, account, image, 'battle', mode='survival', now=50)
+        s.offline_dialog_visible = Mock(return_value=False)
+        s.save_raw_evidence, s.event = Mock(), Mock()
+        with self.assertRaises(hs.BattleStalled):
+            hs.check_battle_watchdog(s, watchdog, account, image, 'battle', mode='survival', now=80)
+
+    def test_bonus_tail_only_changes_poll_delay(self):
+        rec = {'phase': 'running', 'completed': 0, 'launched_battle': 1,
+               'battle_timer_started_at': 100, 'battle_durations': [40, 45, 50],
+               'intent': {'label': 'pending-reward'}}
+        driver = SimpleNamespace(next_poll_seconds=.6, record=lambda task: rec)
+        original = deepcopy(rec)
+        with patch.object(pipeline.time, 'time', return_value=500):
+            self.assertEqual(.6, pipeline.TeamPipelineRunner._adaptive_team_poll(driver, 'group'))
+        self.assertEqual(original, rec)
+
+    def test_duration_window_does_not_truncate_total_overlap(self):
+        owner = coordinator()
+        rec = {'phase': 'running', 'completed': 1, 'launched_battle': 1,
+               'battle_timer_started_at': 100, 'battle_result_observed_at': 140,
+               'battle_durations': [40] * 20,
+               'battle_timing_intervals': [{'started_at': 10 + n, 'ended_at': 20 + n} for n in range(20)]}
+        driver = SimpleNamespace(account=owner.scheduler.accounts[0], record=lambda task: rec)
+        with patch.object(pipeline.time, 'time', return_value=150):
+            owner._observe_team_battle_timing(driver, 'group', 0)
+        self.assertEqual(20, len(rec['battle_durations']))
+        self.assertEqual(21, len(rec['battle_timing_intervals']))
+        self.assertEqual(140, rec['battle_timing_intervals'][-1]['ended_at'])
+        self.assertEqual(150, rec['battle_timing_intervals'][-1]['settled_at'])
+        self.assertNotIn('battle_result_observed_at', rec)
+
+
+if __name__ == '__main__':
+    unittest.main()

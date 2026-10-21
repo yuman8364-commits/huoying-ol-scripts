@@ -146,6 +146,7 @@ class SurvivalSelectionTests(unittest.TestCase):
         s.state = SimpleNamespace(accounts={'a': {'actions': actions}},
             action_status=lambda name, key: actions.get(key, {}).get('status', 'new'),
             set_action=lambda name, key, status, detail: actions.update({key: {'status': status, 'detail': detail}}),
+            save_account=Mock(),
             set_module=Mock())
         s.template = Mock(side_effect=lambda name, *args, **kw: (name == 'survival_anchor.bmp', 1., 0, 0))
         s.wait_template = Mock(return_value=True)

@@ -904,6 +904,10 @@ class LeaderActivityRunner(DailyRunner):
         fighting = s.strong_battle_visible(frame)
         if result or reward or fighting or s._battle_auto_on_visible(frame):
             rec['launched_battle'] = battle
+            if fighting or s._battle_auto_on_visible(frame):
+                rec.setdefault('battle_timer_started_at', time.time())
+            if result and 'battle_timer_started_at' in rec:
+                rec.setdefault('battle_result_observed_at', time.time())
             self.save()
         if result:
             self.send_once(rec,result,hs.TEAM_BATTLE_RESULT_ROI,
@@ -1191,6 +1195,10 @@ class LeaderActivityRunner(DailyRunner):
         reward = s._team_reward_result_visible(f)
         if result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90) or s._battle_auto_on_visible(f):
             rec['launched_battle'] = battle
+            if s._battle_auto_on_visible(f):
+                rec.setdefault('battle_timer_started_at', time.time())
+            if result and 'battle_timer_started_at' in rec:
+                rec.setdefault('battle_result_observed_at', time.time())
             self.save()
         if not (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)):
             if getattr(self, '_group_watchdog_index', None) != battle:
@@ -1425,12 +1433,15 @@ class TeamPipelineRunner:
                     samples.append(round(elapsed, 3))
                     del samples[:-20]
                     intervals = rec.setdefault('battle_timing_intervals', [])
-                    intervals.append(dict(started_at=started, ended_at=now,
+                    ended = rec.get('battle_result_observed_at')
+                    intervals.append(dict(started_at=started,
+                                          ended_at=ended if isinstance(ended, (int, float)) else now,
+                                          settled_at=now, result_observed=isinstance(ended, (int, float)),
                                           task=task, completed=completed))
-                    del intervals[:-20]
                     self.event('pipeline_battle_duration', driver.account,
                                task=task, seconds=round(elapsed, 3), samples=len(samples))
             rec.pop('battle_timer_started_at', None)
+            rec.pop('battle_result_observed_at', None)
             self.save()
         elif (rec.get('launched_battle', 0) > completed
               and not rec.get('intent') and not isinstance(started, (int, float))):
@@ -1440,14 +1451,16 @@ class TeamPipelineRunner:
     @staticmethod
     def _adaptive_team_poll(driver, task):
         """Adjust observation frequency only. Completion still needs live proof."""
-        base = max(.05, min(8.0, float(getattr(driver, 'next_poll_seconds', .6))))
+        base = max(.05, min(60.0, float(getattr(driver, 'next_poll_seconds', .6))))
         if task not in ('group', 'strong'):
             return base
+        base = min(base, 8.0)
         rec = driver.record(task)
         started = rec.get('battle_timer_started_at')
         durations = rec.get('battle_durations', ())
         if (not isinstance(started, (int, float)) or not durations
-                or rec.get('intent') or rec.get('phase') != 'running'
+                or rec.get('intent') or rec.get('battle_result_observed_at') is not None
+                or rec.get('phase') != 'running'
                 or rec.get('launched_battle', 0) <= rec.get('completed', 0)):
             return base
         elapsed = max(0.0, time.time() - started)
@@ -1491,10 +1504,13 @@ class TeamPipelineRunner:
             overlap = sum(max(0.0, min(a['ended_at'], b['ended_at'])
                               - max(a['started_at'], b['started_at']))
                           for a in first for b in second)
+        fully_observed = all(intervals_by_team.values()) and all(
+            row.get('result_observed') is True for rows in intervals_by_team.values() for row in rows)
         return dict(total_team_seconds=round(max(0.0, elapsed), 3),
                     observed_start_gap_seconds=round(abs(first_starts[0]-first_starts[1]), 3)
                     if len(first_starts) >= 2 else None,
                     observed_battle_overlap_seconds=round(overlap, 3),
+                    battle_overlap_fully_observed=fully_observed,
                     note='Battle starts are first positive observations; overlap is approximate.')
 
     def run_teams(self):

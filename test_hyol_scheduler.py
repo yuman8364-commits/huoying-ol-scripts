@@ -46,6 +46,7 @@ class SchedulerUnitTests(unittest.TestCase):
         scheduler._ensure_survival_reset = Mock()
         scheduler.close_survival = Mock()
         scheduler.state = Mock()
+        scheduler.state.accounts = {account.name: {'actions': {}}}
         scheduler.state.action_status.return_value = 'done'
         scheduler.event = Mock()
         hs.Scheduler._finish_survival_slot(scheduler, slot)
@@ -80,6 +81,7 @@ class SchedulerUnitTests(unittest.TestCase):
         scheduler.wait_template = Mock(return_value=True)
         scheduler._survival_full_score_visible = Mock(return_value=True)
         scheduler.claim_survival_rewards = Mock(side_effect=hs.PendingError('claim unknown'))
+        scheduler.state = SimpleNamespace(accounts={account.name: {'actions': {}}})
         scheduler.reconcile_survival_result_confirmations = Mock()
         scheduler.close_survival = Mock()
         with self.assertRaises(hs.PendingError):

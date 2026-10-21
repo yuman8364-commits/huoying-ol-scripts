@@ -76,9 +76,10 @@ class SurvivalVipTests(unittest.TestCase):
     def test_pending_result_reconciles_after_vip_score_advances(self):
         s = object.__new__(hs.Scheduler)
         action = 'survival_battle_step_1'
-        actions = {action: {'status': 'pending'},
-                   action + '_start': {'status': 'done'},
-                   'survival_result_confirm_1': {'status': 'pending'}}
+        s.templates = hs.TemplateStore(.92)
+        actions = {action: {'status': 'pending', 'operation_id': 'run:' + action},
+                   action + '_start': {'status': 'done', 'operation_id': 'run:' + action + '_start'},
+                   'survival_result_confirm_1': {'status': 'pending', 'operation_id': 'run:survival_result_confirm_1'}}
         s.state = SimpleNamespace(
             accounts={'vip': {'actions': actions,
                               'survival_attempt_observations': {
@@ -150,7 +151,7 @@ class SurvivalVipTests(unittest.TestCase):
     def test_unsampled_background_gap_does_not_trigger_fake_stall(self):
         watchdog = BattleWatchdog(idle_seconds=30)
         self.assertIsNone(watchdog.observe(self.frame, 0))
-        self.assertIsNone(watchdog.observe(self.frame, 31))
+        self.assertIsNone(watchdog.observe(self.frame, 31, backgrounded=True))
         self.assertIsNone(watchdog.observe(self.frame, 45))
         stall = watchdog.observe(self.frame, 62)
         self.assertEqual(stall['reason'], 'unchanged_frame')

@@ -27,6 +27,7 @@ def coordinator():
     owner.save,owner.event = Mock(),Mock()
     owner.scheduler = Mock()
     owner.scheduler.run_context = None
+    owner.run_context = SimpleNamespace(layout_matches=lambda frame: True)
     owner.scheduler.template.return_value = (False, 0., 0, 0)
     owner.scheduler.accounts = [hs.Account(i,f'role{i}',100+i*100) for i in range(1,7)]
     owner.scheduler.state = SimpleNamespace(day='2026-10-06',aliases={'role1':'captainA','role4':'captainB'},
