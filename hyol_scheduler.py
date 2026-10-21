@@ -5079,7 +5079,7 @@ class Scheduler:
         for sample in range(3):
             if (not self._combat_ready_visible('survival', frame)
                     or self._combat_active_visible('survival', frame)
-                    or not self.verify_identity(account, frame)[0]):
+                    or not self._survival_page_identity_verified(account, frame)):
                 return False
             observed_scores.append(self._survival_observed_score(frame))
             if sample < 2:
@@ -5184,6 +5184,7 @@ class Scheduler:
         score_twenty = False
         score_eighty = False
         score_one_forty = False
+        score_one_sixty = False
         score_two_hundred = False
         score_full = False
         while time.monotonic() < score_deadline:
@@ -5192,11 +5193,12 @@ class Scheduler:
             score_twenty = self._survival_score_twenty_visible(score_frame)
             score_eighty = self.template("survival_score_80.bmp", (751, 769, 1151, 1031), score_frame)[0]
             score_one_forty = self.template("survival_score_140.bmp", (751, 769, 1151, 1031), score_frame, threshold=0.98)[0]
+            score_one_sixty = self.template("survival_score_160.bmp", (751, 769, 1151, 1031), score_frame, threshold=0.98)[0]
             score_two_hundred = self._survival_score_two_hundred_visible(score_frame)
             if score_two_hundred:
-                score_zero = score_twenty = score_eighty = score_one_forty = False
+                score_zero = score_twenty = score_eighty = score_one_forty = score_one_sixty = False
             score_full = self._survival_full_score_visible(score_frame)
-            if score_zero or score_twenty or score_eighty or score_one_forty or score_two_hundred or score_full:
+            if score_zero or score_twenty or score_eighty or score_one_forty or score_one_sixty or score_two_hundred or score_full:
                 break
             self.wait_interruptible(1)
         if score_zero and self.state.action_status(account.name, "survival_reset") == "pending":
@@ -5217,7 +5219,7 @@ class Scheduler:
             return
         self.event("survival_score_observed", account,
                    score=0 if score_zero else 20 if score_twenty else 80 if score_eighty
-                   else 140 if score_one_forty else 200 if score_two_hundred else None)
+                   else 140 if score_one_forty else 160 if score_one_sixty else 200 if score_two_hundred else None)
         if not self.template("survival_anchor.bmp", (201, 69, 601, 419))[0]:
             raise PendingError("生存页面未确认，禁止选择副本")
         self.event("combat_slot_prepared", account, mode="survival", next_index=slot.next_index)
@@ -5283,7 +5285,7 @@ class Scheduler:
             return 20
         if self._survival_score_two_hundred_visible(frame):
             return 200
-        for value in (80, 140):
+        for value in (80, 140, 160):
             if self.template(f'survival_score_{value}.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
                 return value
         return None
@@ -5317,10 +5319,41 @@ class Scheduler:
         if self._survival_score_twenty_visible(frame):
             return 20
         roi = (751, 769, 1151, 1031)
-        for score in (140, 80, 0):
+        for score in (140, 160, 80, 0):
             if self.template(f"survival_score_{score}.bmp", roi, frame, threshold=.98)[0]:
                 return score
         return None
+
+    def _survival_page_identity_verified(self, account: Account, frame: Image.Image) -> bool:
+        """A full-screen page retains only this run's verified tab custody."""
+        if self.verify_identity(account, frame)[0]:
+            return True
+        from hyol_run_context import RunContext
+        from hyol_checkpoints import current_identity_mask
+        context = getattr(self, 'run_context', None)
+        if not isinstance(context, RunContext) or not context.binding:
+            return False
+        binding = context.binding
+        if (binding['mapping'].get(account.index) != self.state.aliases.get(account.name, account.name)
+                or self.active != account
+                or self._saved_tab_mapping().get(account.name) != account.tab_x
+                or not context.layout_matches(frame)
+                or self._generic_active_tab_x(frame) != account.tab_x
+                or not self.healthy(frame)
+                or not self._combat_ready_visible('survival', frame)
+                or self._combat_active_visible('survival', frame)
+                or int(current_identity_mask(frame, self.templates).sum()) >= 50):
+            return False  # A visible but different role must never use hidden-page custody.
+        try:
+            context.check_window(self)
+        except PendingError:
+            return False
+        reference = binding['frames'].get(account.index)
+        if reference is None or binding['centers'][account.index-1] != account.tab_x:
+            return False
+        def title_mask(image):
+            return np.asarray(image.crop((account.tab_x-48,5,account.tab_x+24,30)).convert('L')) < 105
+        return mask_f1(title_mask(reference), title_mask(frame)) >= .70
 
     def _survival_attempt_evidence(self, account: Account, action: str):
         from hyol_run_context import RunContext
@@ -5342,7 +5375,7 @@ class Scheduler:
         if self.state.action_status(account.name, 'survival_reset') != 'pending':
             return False
         if (not self.template('survival_anchor.bmp', (201,69,601,419), frame, threshold=.92)[0]
-                or not self.verify_identity(account, frame)[0]
+                or not self._survival_page_identity_verified(account, frame)
                 or self._survival_partial_score(frame) is None
                 or not any(self.template(name, (851,769,1251,1031), frame, threshold=.98)[0]
                            for name in ('survival_reset_zero_text.bmp', 'survival_reset_zero_current.bmp'))):
@@ -5378,7 +5411,7 @@ class Scheduler:
             return False
         with Image.open(paths[0]) as image:
             before = image.convert('RGB')
-        if not (self.verify_identity(account, before)[0]
+        if not (self._survival_page_identity_verified(account, before)
                 and self._survival_full_score_visible(before)
                 and self.template('survival_reset.bmp', (851,769,1251,1031), before, threshold=.98)[0]
                 and any(self.template(name, (1151,769,1451,1031), before, threshold=.98)[0]
@@ -5685,7 +5718,7 @@ class Scheduler:
                 if (type(baseline) is int and type(observed) is int
                         and 0 <= baseline < observed <= 220
                         and self._combat_ready_visible('survival', fresh)
-                        and self.verify_identity(account, fresh)[0]):
+                        and self._survival_page_identity_verified(account, fresh)):
                     stable = stable + 1 if observed == score_after else 1
                     score_after = observed
                     if stable >= 2:
@@ -5808,7 +5841,7 @@ class Scheduler:
             if mode == "arena"
             else [
                 "survival_toolbar_current_core.bmp",
-                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_complete_220.bmp",
+                "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_complete_220.bmp",
                 "survival_grade_ss.bmp", "survival_grade_s.bmp", "survival_grade_a_current.bmp", "survival_grade_b_current.bmp", "survival_grade_c.bmp", "survival_fight_start.bmp", "survival_fight_start_core.bmp", "survival_result_confirm.bmp",
                 "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
                 "survival_reward_result_confirm.bmp", "survival_final_claimed.bmp",

@@ -141,7 +141,7 @@ class SurvivalReceiptTests(unittest.TestCase):
 
 
     def test_ordinary_and_vip_complete_two_rounds_with_single_inputs(self):
-        for initial, scores in ((0, [80, 140, 200, 220]), (80, [140, 200, 220])):
+        for initial, scores in ((0, [80, 140, 200, 220]), (80, [160, 220])):
             with self.subTest(initial=initial), TemporaryDirectory() as folder:
                 s = self.s
                 s.state = hs.StateStore([self.account.name], Path(folder), restore_history=False)
@@ -268,6 +268,67 @@ class SurvivalReceiptTests(unittest.TestCase):
         s._survival_attempt_evidence(other, self.action)
         s.state.set_action(other.name, self.action, 'pending')
         self.assertNotEqual(first, s.state.action_record(other.name, self.action)['operation_id'])
+
+    def hidden_page_context(self):
+        from hyol_run_context import RunContext
+        ctx = self.s.run_context = RunContext(Path(self.folder.name), Path(self.folder.name)/'state', identifier='hidden-page-test')
+        saved = deepcopy(self.s.state.accounts[self.account.name])
+        self.s.state = hs.StateStore([self.account.name], ctx.directory, restore_history=False)
+        self.s.state.accounts[self.account.name] = saved
+        self.frame.paste('black', (140, 10, 185, 20))
+        ctx.binding = {'mapping': {1:self.account.name}, 'centers': (180,),
+                       'frames': {1:self.frame.copy()}}
+        ctx.layout_matches = Mock(return_value=True)
+        ctx.check_window = Mock()
+        self.s.verify_identity.return_value = (False, {})
+        self.s.active = self.account
+        self.s.healthy = Mock(return_value=True)
+        self.s._generic_active_tab_x = Mock(return_value=180)
+        self.s._saved_tab_mapping = Mock(return_value={self.account.name:180})
+        return ctx
+
+    def test_hidden_role_page_settles_only_its_original_bound_operation(self):
+        self.pending(0)
+        self.hidden_page_context()
+        self.assertTrue(self.observe([80]*3))
+        self.assertEqual('done', self.s.state.action_status(self.account.name, self.action))
+        self.assertEqual('done', self.s.state.action_status(self.account.name, self.result))
+
+    def test_hidden_role_cannot_settle_changed_tab_title_layout_or_account(self):
+        for changed in ('tab', 'title', 'layout', 'owner', 'active', 'window', 'visible_role'):
+            with self.subTest(changed=changed):
+                self.pending(80)
+                ctx = self.hidden_page_context()
+                if changed == 'tab':
+                    self.s._generic_active_tab_x.return_value = 315
+                elif changed == 'title':
+                    self.frame.paste('white', (132,5,204,30))
+                elif changed == 'layout':
+                    ctx.layout_matches.return_value = False
+                elif changed == 'owner':
+                    ctx.binding['mapping'][1] = 'another-role'
+                elif changed == 'active':
+                    self.s.active = hs.Account(2,'other',315)
+                elif changed == 'window':
+                    ctx.check_window.side_effect = hs.PendingError('different game window')
+                original = deepcopy(self.s.state.accounts[self.account.name]['actions'])
+                from hyol_checkpoints import current_identity_mask
+                with patch('hyol_checkpoints.current_identity_mask', wraps=current_identity_mask) as mask:
+                    if changed == 'visible_role':
+                        import numpy as np
+                        mask.side_effect = None
+                        mask.return_value = np.ones((20,160), dtype='uint8')
+                    self.assertFalse(self.observe([160]*3))
+                self.assertEqual(original, self.s.state.accounts[self.account.name]['actions'])
+
+    def test_live_vip_after_ss_is_160_and_never_full(self):
+        self.s.template = hs.Scheduler.template.__get__(self.s)
+        self.s.detector = None
+        with Image.open(hs.ASSETS/'survival_score_160.bmp') as badge:
+            self.frame.paste(badge, (837,878))
+        self.assertEqual(160, self.s._survival_observed_score(self.frame))
+        self.assertEqual(160, self.s._survival_partial_score(self.frame))
+        self.assertFalse(self.s._survival_full_score_visible(self.frame))
 
 
 class SchedulingSafetyTests(unittest.TestCase):

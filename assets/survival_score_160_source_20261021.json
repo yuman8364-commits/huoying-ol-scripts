@@ -1,0 +1,17 @@
+{
+  "source": "logs/pr2_live_20261021/events/scheduler_evidence/2026-10-21/account_c9ba2069ff/155933_207063_pending_survival_step_1_score_unverified.png",
+  "source_sha256": "a83898997e05bf741edc78b5601d09ecf16e08718f1e64cb8039f26ad21c4806",
+  "roi": [
+    837,
+    878,
+    1033,
+    915
+  ],
+  "observed_score": 160,
+  "score_before": 80,
+  "context": "After one audited SS fight; the same result was confirmed once.",
+  "asset": "survival_score_160.bmp",
+  "asset_sha256": "0b8451b9bf4c3d09f5bc507b713b9dcf39e592f7cc15c5304819c47aaac5da2e",
+  "threshold": 0.98,
+  "full_score": false
+}
