@@ -105,6 +105,48 @@ class SurvivalVipTests(unittest.TestCase):
         self.assertEqual(actions[action]['status'], 'done')
         self.assertFalse(slot.running)
 
+    def test_vip_reset_modal_accepts_proven_eighty_point_destination(self):
+        s = object.__new__(hs.Scheduler)
+        s.capture = Mock(return_value=self.frame)
+        s.reconcile_survival_partial_reset = Mock(side_effect=[False, True])
+        s.template = Mock(side_effect=lambda name, *args, **kwargs:
+                          (name == 'survival_reset_confirm_yes.bmp', 1.0, 0, 0))
+        s.click_template = Mock(return_value=True)
+        s.wait_absent = Mock(return_value=True)
+        s.wait_template = Mock()
+        s.state = SimpleNamespace(
+            action_status=lambda name, action: 'pending' if action == 'survival_reset' else 'new',
+            set_action=Mock())
+        s._ensure_survival_reset(self.account)
+        s.click_template.assert_called_once()
+        self.assertEqual(s.reconcile_survival_partial_reset.call_count, 2)
+        s.wait_template.assert_not_called()
+
+    def test_stale_score_after_result_preserves_pending_battle(self):
+        s = object.__new__(hs.Scheduler)
+        action = 'survival_battle_step_1'
+        s.state = SimpleNamespace(action_status=lambda name, label:
+                                  'pending' if label == action else 'new')
+        s.template = Mock(side_effect=lambda name, *args, **kwargs:
+                          (name == 'survival_result_confirm.bmp', 1.0, 0, 0))
+        s.click_template = Mock(return_value=True)
+        s.wait_absent = Mock(return_value=True)
+        s.wait_template = Mock(return_value=True)
+        s.capture = Mock(return_value=self.frame)
+        s.wait_interruptible = Mock()
+        s.save_raw_evidence = Mock(return_value=Path('score_stale.png'))
+        s._survival_observed_score = Mock(return_value=80)
+        s._survival_attempt_evidence = Mock(return_value=(
+            {'run_1:' + action: {'score_before': 80}}, 'run_1:' + action))
+        s.commit_action = Mock()
+        slot = hs.CombatSlot(self.account, 'survival', next_index=1, running=True)
+        with patch.object(hs.time, 'monotonic', side_effect=[0, 0, 5]):
+            with self.assertRaises(hs.PendingError):
+                s._poll_survival_slot(slot, self.frame)
+        self.assertTrue(slot.running)
+        s.click_template.assert_called_once()
+        s.commit_action.assert_not_called()
+
     def test_unsampled_background_gap_does_not_trigger_fake_stall(self):
         watchdog = BattleWatchdog(idle_seconds=30)
         self.assertIsNone(watchdog.observe(self.frame, 0))
