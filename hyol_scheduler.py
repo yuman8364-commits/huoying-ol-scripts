@@ -1159,6 +1159,8 @@ class TemplateStore:
         self._frame_matches = {}
         self._frame_crops = {}
         self._frame_correlation = {}
+        self._frame_edges = {}
+        self._edge_templates = OrderedDict()
         self._template_spectra = TemplateSpectra()
 
     def begin_frame(self, frame: Image.Image) -> None:
@@ -1168,6 +1170,7 @@ class TemplateStore:
         self._frame_matches.clear()
         self._frame_crops.clear()
         self._frame_correlation.clear()
+        self._frame_edges.clear()
 
     def _crop(self, frame, roi):
         if frame is not self._frame:
@@ -1287,12 +1290,33 @@ class TemplateStore:
         if not path.exists():
             return []
         x1, y1, x2, y2 = roi
-        image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
-        with Image.open(path) as asset:
-            template = edge_binary(asset.convert("L"), threshold=edge_threshold).astype(np.float64)
+        # Market digit templates share the same ROI; avoid recomputing the
+        # edge mask, image FFT and immutable template FFT for each digit.
+        edge_key = (roi, edge_threshold)
+        if frame is self._frame:
+            image = self._frame_edges.get(edge_key)
+            if image is None:
+                image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
+                self._frame_edges[edge_key] = image
+        else:
+            image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
+        template_key = (path, self._asset_version(path), edge_threshold)
+        template = self._edge_templates.get(template_key)
+        if template is None:
+            with Image.open(path) as asset:
+                template = edge_binary(asset.convert("L"), threshold=edge_threshold).astype(np.float64)
+            template.setflags(write=False)
+            self._edge_templates[template_key] = template
+            if len(self._edge_templates) > 64:
+                self._edge_templates.popitem(last=False)
+        else:
+            self._edge_templates.move_to_end(template_key)
         th, tw = template.shape
         cutoff = self.threshold if threshold is None else threshold
-        scores = ncc_map(image, template)
+        prepared = (self._frame_correlation.setdefault(('edge', *edge_key), {})
+                    if frame is self._frame else None)
+        scores = ncc_map(image, template, prepared=prepared,
+                         template_cache=self._template_spectra)
         candidates: list[tuple[float, int, int]] = []
         for y, x in zip(*np.where(scores >= cutoff)):
             candidates.append((float(scores[y, x]), x1 + int(x), y1 + int(y)))
