@@ -1403,7 +1403,7 @@ class TeamPipelineRunner:
         slot = self.record['teams'][str(index)]
         for selected in self.tasks:
             task = TASK_KEYS[selected]
-            if (index, task) in self._not_open_tasks:
+            if (index, task) in getattr(self, '_not_open_tasks', set()):
                 continue
             if slot.get('tasks', {}).get(task, {}).get('status') != 'done':
                 return task
@@ -1461,16 +1461,12 @@ class TeamPipelineRunner:
 
     def _finish_pipeline_team(self, index, slot):
         """Dissolve promptly; a slow team must not hold another team's turn."""
-        clock = getattr(self, '_poll_clock', time.monotonic)
-        entered = clock()
         try:
             self.dissolve(index, slot)
         except hs.AccountOffline as exc:
             self.block(slot, exc, True)
         except hs.PendingError as exc:
             self.block(slot, exc)
-        finally:
-            self.defer_navigation(index, max(0, clock() - entered))
 
     def run_teams(self):
         """Single foreground executor; two independent, nonblocking battle states.
@@ -1492,15 +1488,17 @@ class TeamPipelineRunner:
                     continue
                 progressed = True
                 slot = self.record['teams'][str(index)]
-                if slot['status'] == 'complete':
-                    self._finish_pipeline_team(index, slot)
+                if slot['status'] == 'complete' or self._next_pipeline_task(index) is None:
+                    entered = clock()
+                    if slot['status'] != 'complete':
+                        slot['status'] = 'complete'
+                        self.save()
+                    try:
+                        self._finish_pipeline_team(index, slot)
+                    finally:
+                        self.defer_navigation(index, max(0, clock() - entered))
                     continue
                 task = self._next_pipeline_task(index)
-                if task is None:
-                    slot['status'] = 'complete'
-                    self.save()
-                    self._finish_pipeline_team(index, slot)
-                    continue
                 driver = self.drivers.get(index)
                 if driver is None:
                     self.block(slot, '已核实队伍缺少任务执行器，保留当前进度')
@@ -1517,7 +1515,7 @@ class TeamPipelineRunner:
                         slot['status'] = 'complete'
                         self.save()
                         self._finish_pipeline_team(index, slot)
-                    elif self._next_pipeline_task(index) != task or (index, task) in self._not_open_tasks:
+                    elif self._next_pipeline_task(index) != task:
                         next_check[index] = clock()
                     else:
                         next_check[index] = clock() + self._adaptive_team_poll(driver, task)
