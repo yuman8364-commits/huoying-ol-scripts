@@ -922,7 +922,12 @@ class StateStore:
                 resolve_action(self, name, action, detail)
         actions[action] = {"status": status, "detail": detail, "updated_at": now_iso()}
         scope = self.accounts[name].get('continuation_scope')
-        if scope:
+        survival_scope = self.accounts[name].get('survival_operation_scope') if action.startswith('survival_') else None
+        if survival_scope:
+            if status != 'new':
+                run = 2 if actions.get('survival_second_run_started', {}).get('status') == 'done' else 1
+                actions[action]['operation_id'] = previous.get('operation_id', f'{survival_scope}:run_{run}:{action}')
+        elif scope:
             actions[action]['operation_id'] = previous.get('operation_id',scope+':'+action)
         if previous.get('origin'):
             actions[action]['origin'] = previous['origin']
@@ -5179,6 +5184,7 @@ class Scheduler:
         score_twenty = False
         score_eighty = False
         score_one_forty = False
+        score_two_hundred = False
         score_full = False
         while time.monotonic() < score_deadline:
             score_frame = self.capture()
@@ -5186,8 +5192,11 @@ class Scheduler:
             score_twenty = self._survival_score_twenty_visible(score_frame)
             score_eighty = self.template("survival_score_80.bmp", (751, 769, 1151, 1031), score_frame)[0]
             score_one_forty = self.template("survival_score_140.bmp", (751, 769, 1151, 1031), score_frame, threshold=0.98)[0]
+            score_two_hundred = self._survival_score_two_hundred_visible(score_frame)
+            if score_two_hundred:
+                score_zero = score_twenty = score_eighty = score_one_forty = False
             score_full = self._survival_full_score_visible(score_frame)
-            if score_zero or score_twenty or score_eighty or score_one_forty or score_full:
+            if score_zero or score_twenty or score_eighty or score_one_forty or score_two_hundred or score_full:
                 break
             self.wait_interruptible(1)
         if score_zero and self.state.action_status(account.name, "survival_reset") == "pending":
@@ -5208,7 +5217,7 @@ class Scheduler:
             return
         self.event("survival_score_observed", account,
                    score=0 if score_zero else 20 if score_twenty else 80 if score_eighty
-                   else 140 if score_one_forty else None)
+                   else 140 if score_one_forty else 200 if score_two_hundred else None)
         if not self.template("survival_anchor.bmp", (201, 69, 601, 419))[0]:
             raise PendingError("生存页面未确认，禁止选择副本")
         self.event("combat_slot_prepared", account, mode="survival", next_index=slot.next_index)
@@ -5272,10 +5281,28 @@ class Scheduler:
     def _survival_partial_score(self, frame):
         if self._survival_score_twenty_visible(frame):
             return 20
+        if self._survival_score_two_hundred_visible(frame):
+            return 200
         for value in (80, 140):
             if self.template(f'survival_score_{value}.bmp', (751,769,1151,1031), frame, threshold=.98)[0]:
                 return value
         return None
+
+    def _survival_score_two_hundred_visible(self, frame):
+        """Recognize 200/220 using the enrolled zero glyph, never as full score."""
+        _ok, score, x, y = self.template('survival_complete_220.bmp',
+            (751, 769, 1151, 1031), frame, threshold=0)
+        if score < .90 or x < 0 or y < 0:
+            return False
+        with Image.open(ASSETS/'survival_complete_220.bmp') as source:
+            reference = np.asarray(source.convert('L')) > 155
+        actual = np.asarray(frame.crop((x, y, x+reference.shape[1], y+reference.shape[0])).convert('L')) > 155
+        if actual.shape != reference.shape:
+            return False
+        static = np.ones(reference.shape, dtype=bool)
+        static[:, 105:118] = False
+        return bool(np.mean(actual[static] == reference[static]) >= .985
+                    and np.mean(actual[6:31, 105:118] == reference[6:31, 118:131]) >= .98)
 
     def _survival_observed_score(self, frame: Image.Image) -> int | None:
         """Read actual points, including membership-start 80/220.
@@ -5285,6 +5312,8 @@ class Scheduler:
         """
         if self._survival_full_score_visible(frame):
             return 220
+        if self._survival_score_two_hundred_visible(frame):
+            return 200
         if self._survival_score_twenty_visible(frame):
             return 20
         roi = (751, 769, 1151, 1031)
@@ -5294,6 +5323,16 @@ class Scheduler:
         return None
 
     def _survival_attempt_evidence(self, account: Account, action: str):
+        from hyol_run_context import RunContext
+        context = getattr(self, 'run_context', None)
+        if isinstance(context, RunContext):
+            if Path(self.state.directory).resolve() != context.directory.resolve():
+                raise PendingError('生存账本不属于当前运行，禁止绑定操作凭据')
+            record = self.state.accounts[account.name]
+            scope = f'survival:{context.identifier}:{account.account_id}'
+            if record.get('survival_operation_scope', scope) != scope:
+                raise PendingError('生存操作编号属于其他运行或账号，保留原记录')
+            record['survival_operation_scope'] = scope
         run = 2 if self.state.action_status(account.name, "survival_second_run_started") == "done" else 1
         observations = self.state.accounts[account.name].setdefault("survival_attempt_observations", {})
         return observations, f"run_{run}:{action}"

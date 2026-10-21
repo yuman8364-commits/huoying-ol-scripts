@@ -327,6 +327,38 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(self.driver.record('wanted')['completed'],0)
         self.s.click_template.assert_not_called()
 
+    def test_loading_between_navigation_observation_and_guard_is_waited_without_input(self):
+        rec = self.driver.record('wanted')
+        rec['navigation'] = dict(phase='open', started_at=time.time(), scrolls=0)
+        original = dict(rec['navigation'])
+        self.s.main_ready.return_value = True
+        self.s.content_click_count = 0
+        self.s._tab_title_masks = {1: np.ones((4, 8), dtype=np.uint8)}
+        self.s._title_mask.return_value = np.ones((4, 8), dtype=np.uint8)
+        self.s._generic_active_tab_x.return_value = self.driver.account.tab_x
+        self.driver.scene_transition = Mock(side_effect=[False, True])
+        self.driver.send = Mock(side_effect=hs.SafetyError('identity and page-anchor guard failed: loading'))
+        self.driver.navigate('wanted', rec, self.frame)
+        self.assertEqual(original, rec['navigation'])
+        self.assertEqual(3, self.driver.next_poll_seconds)
+        self.s.click_template.assert_not_called()
+        self.s.commit_action.assert_not_called()
+
+    def test_navigation_loading_cannot_swallow_focus_failure_or_a_sent_click(self):
+        for message, count in (('game lost foreground', 0),
+                               ('identity and page-anchor guard failed: loading', 1)):
+            with self.subTest(message=message, count=count):
+                rec = self.driver.record('wanted')
+                self.s.main_ready.return_value = True
+                self.s.content_click_count = 0
+                self.driver.scene_transition = Mock(return_value=False)
+                def fail(*args, **kwargs):
+                    self.s.content_click_count = count
+                    raise hs.SafetyError(message)
+                self.driver.send = Mock(side_effect=fail)
+                with self.assertRaises(hs.SafetyError):
+                    self.driver.navigate('wanted', rec, self.frame)
+
     def test_existing_wanted_movement_resumes_observation_without_new_auto_or_clock_reset(self):
         rec=self.driver.record('wanted')
         original=time.time()-250

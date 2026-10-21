@@ -141,7 +141,7 @@ class SurvivalReceiptTests(unittest.TestCase):
 
 
     def test_ordinary_and_vip_complete_two_rounds_with_single_inputs(self):
-        for initial, scores in ((0, [20, 80, 140, 220]), (80, [140, 220])):
+        for initial, scores in ((0, [80, 140, 200, 220]), (80, [140, 200, 220])):
             with self.subTest(initial=initial), TemporaryDirectory() as folder:
                 s = self.s
                 s.state = hs.StateStore([self.account.name], Path(folder), restore_history=False)
@@ -230,6 +230,44 @@ class SurvivalReceiptTests(unittest.TestCase):
         s.state.set_action(self.account.name, self.result, 'pending')
         self.assertFalse(s.reconcile_survival_partial_reset(self.account, after))
         self.assertEqual('pending', s.state.action_status(self.account.name, 'survival_reset'))
+
+    def test_two_hundred_is_a_partial_score_and_never_full(self):
+        s = self.s
+        s.template = hs.Scheduler.template.__get__(s)
+        s.detector = None
+        with Image.open(hs.ASSETS/'survival_complete_220.bmp') as source:
+            badge = source.convert('RGB')
+        self.frame.paste(badge, (800, 850))
+        self.assertEqual(220, s._survival_observed_score(self.frame))
+        badge.paste(badge.crop((118, 0, 131, 37)), (105, 0))
+        self.frame.paste(badge, (800, 850))
+        self.assertFalse(s._survival_full_score_visible(self.frame))
+        self.assertEqual(200, s._survival_observed_score(self.frame))
+        self.assertEqual(200, s._survival_partial_score(self.frame))
+
+    def test_real_fresh_run_allocates_account_and_round_scoped_receipts(self):
+        from hyol_run_context import RunContext
+        ctx = RunContext(Path(self.folder.name), Path(self.folder.name)/'state', identifier='fresh-run')
+        s = self.s
+        s.run_context = ctx
+        s.state = hs.StateStore([self.account.name, 'other-role'], ctx.directory, restore_history=False)
+        s._survival_attempt_evidence(self.account, self.action)
+        s.state.set_action(self.account.name, self.action, 'pending')
+        s.state.set_action(self.account.name, self.result, 'pending')
+        first = s.state.action_record(self.account.name, self.action).get('operation_id')
+        confirm = s.state.action_record(self.account.name, self.result).get('operation_id')
+        self.assertIsInstance(first, str)
+        self.assertEqual(first[:-len(self.action)]+self.result, confirm)
+        s.state.set_action(self.account.name, self.action, 'done')
+        s.state.set_action(self.account.name, self.action, 'new')
+        s.state.set_action(self.account.name, 'survival_second_run_started', 'done')
+        s.state.set_action(self.account.name, self.action, 'pending')
+        second = s.state.action_record(self.account.name, self.action)['operation_id']
+        self.assertNotEqual(first, second)
+        other = hs.Account(2, 'other-role', 315)
+        s._survival_attempt_evidence(other, self.action)
+        s.state.set_action(other.name, self.action, 'pending')
+        self.assertNotEqual(first, s.state.action_record(other.name, self.action)['operation_id'])
 
 
 class SchedulingSafetyTests(unittest.TestCase):

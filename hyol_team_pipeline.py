@@ -702,7 +702,26 @@ class LeaderActivityRunner(DailyRunner):
                     self.save()
                 self.next_poll_seconds = 3
                 return  # A render/foreground transition gets the bounded wait.
-            self.send('daily_practice_toolbar.bmp', (651,69,851,169),20,20,label+'_open',irreversible=False)
+            clicks_before = s.content_click_count
+            try:
+                self.send('daily_practice_toolbar.bmp', (651,69,851,169),20,20,label+'_open',irreversible=False)
+            except hs.SafetyError as exc:
+                # The reversible toolbar target can disappear during an NPC
+                # map transition. Observe only after a proven unsent input;
+                # focus, geometry, title and all irreversible guards stay intact.
+                if (not str(exc).startswith('identity and page-anchor guard failed:')
+                        or s.content_click_count != clicks_before):
+                    raise
+                fresh = s.capture()
+                reference = s._tab_title_masks.get(self.account.index)
+                if (reference is None or s._generic_active_tab_x(fresh) != self.account.tab_x
+                        or hs.mask_f1(reference, s._title_mask(fresh,self.account.tab_x)) < .70
+                        or not self.scene_transition(fresh)):
+                    raise
+                self.next_poll_seconds = 3
+                self.event('pipeline_navigation_loading_observed', task=task,
+                           content_authorized=False, detail='原入口未点击；同标签正向加载画面，只等待过渡')
+                return
             nav.update(last_progress_at=time.time(),deferred_at_progress=nav.get('deferred_seconds',0))
             self.save()
             return
@@ -906,7 +925,7 @@ class LeaderActivityRunner(DailyRunner):
             rec['launched_battle'] = battle
             if fighting or s._battle_auto_on_visible(frame):
                 rec.setdefault('battle_timer_started_at', time.time())
-            if result and 'battle_timer_started_at' in rec:
+            if (result or reward) and 'battle_timer_started_at' in rec:
                 rec.setdefault('battle_result_observed_at', time.time())
             self.save()
         if result:
@@ -1197,7 +1216,7 @@ class LeaderActivityRunner(DailyRunner):
             rec['launched_battle'] = battle
             if s._battle_auto_on_visible(f):
                 rec.setdefault('battle_timer_started_at', time.time())
-            if result and 'battle_timer_started_at' in rec:
+            if (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)) and 'battle_timer_started_at' in rec:
                 rec.setdefault('battle_result_observed_at', time.time())
             self.save()
         if not (result or reward or self.visible('group_return_game_current.bmp',GROUP_RETURN_ROI,f,.90)):
