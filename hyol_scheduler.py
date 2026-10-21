@@ -5364,6 +5364,11 @@ class Scheduler:
                 raise PendingError("生存演习重置确认按钮消失")
             if not self.wait_absent("survival_reset_confirm_yes.bmp", (701, 469, 1151, 719), 8, threshold=0.92):
                 raise PendingError("生存演习重置确认结果未知")
+            # A membership account may restart at 80/220, not 0/220.
+            # The recorded full-score/claimed before image and reset-counter
+            # drop from 1 to 0 are required before accepting a partial score.
+            if self.reconcile_survival_partial_reset(account, self.capture()) is True:
+                return
         elif self.state.action_status(account.name, confirm_action) == "pending":
             if not self.template("survival_score_0.bmp", (751, 769, 1151, 1031))[0]:
                 raise PendingError("生存演习重置确认结果未知")
@@ -5395,7 +5400,9 @@ class Scheduler:
                 return
             raise PendingError("生存演习重置后既无确认弹窗也未稳定为0/220")
         if not self.wait_template("survival_score_0.bmp", (751, 769, 1151, 1031), 8):
-            raise PendingError("生存演习重置后未确认0/220，禁止重复重置")
+            if self.reconcile_survival_partial_reset(account, self.capture()) is True:
+                return
+            raise PendingError("生存演习重置后未确认0/220或有来源的会员初始积分，禁止重复重置")
         if self.state.action_status(account.name, confirm_action) == "pending":
             self.commit_action(account, confirm_action, "确认按钮消失且0/220已显示")
         self.commit_action(account, reset_action, "重置确认完成且0/220已显示")
