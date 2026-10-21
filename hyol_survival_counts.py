@@ -48,9 +48,11 @@ def grade_candidates(frame: Image.Image, templates, assets: Path) -> list[dict]:
     result = []
     roi = (650, 180, 1350, 760)
     canvas = np.asarray(frame.crop(roi).convert('L'), dtype=np.float64)
+    prepared = {}
+    spectra = getattr(templates, '_template_spectra', None)
     for rank, (grade, name, dx, dy) in enumerate(GRADES):
         badge = templates.load(assets / name)
-        scores = ncc_map(canvas, badge)
+        scores = ncc_map(canvas, badge, prepared=prepared, template_cache=spectra)
         matches = []
         for _ in range(12):
             py, px = np.unravel_index(np.argmax(scores), scores.shape)
