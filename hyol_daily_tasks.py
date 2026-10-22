@@ -110,7 +110,8 @@ class DailyScheduler(hs.Scheduler):
         """Set x2 only from positively matched controls; never toggle blindly."""
         account = slot.account
         frame = frame or self.capture()
-        action = f'survival_battle_speed_x2_{slot.next_index}'
+        run_index = 2 if self.state.action_status(account.name, 'survival_second_run_started') == 'done' else 1
+        action = f'survival_run_{run_index}_battle_speed_x2_{slot.next_index}'
         roi = SPEED_ROI
         if self.template('battle_speed_x2.png', roi, frame, threshold=.84)[0]:
             if self.state.action_status(account.name, action) == 'pending':
