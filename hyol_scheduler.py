@@ -5282,10 +5282,14 @@ class Scheduler:
             if self._observe_survival_pending_page(slot, frame) is True:
                 return self._prepare_survival_slot(slot)
             start_label = f"{action}_start"
-            if self.main_ready(frame) and self.state.action_status(account.name, start_label) == "new":
-                # Older builds marked the reversible opponent-card selection
-                # as the battle action.  No audited start marker plus a verified
-                # main page proves that no scheduler fight-start click occurred.
+            action_record = self.state.action_record(account.name, action)
+            legacy_selection_only = not (isinstance(action_record, dict) and action_record.get('before_evidence'))
+            if (self.main_ready(frame)
+                    and self.state.action_status(account.name, start_label) == "new"
+                    and legacy_selection_only):
+                # Only legacy reversible opponent-selection records without a
+                # write-ahead click receipt may be cleared on the main page.
+                # A real start click with before-evidence is never replayed.
                 self.state.set_action(account.name, action, "new", "legacy opponent selection expired before audited fight start")
                 self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
                 slot.running = False
@@ -5799,9 +5803,11 @@ class Scheduler:
         observations[key] = dict(score_before=before_score, grade=selected['grade'],
                                  remaining_before=selected['remaining'], observed_at=now_iso())
         self.state.save_account(account.name)
-        self._click_survival_fight_start(slot)
-        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
+        slot.start_requested_at = time.monotonic()
+        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=slot.start_requested_at)
         slot.battle_watchdog_index = slot.next_index
+        self._click_survival_fight_start(slot)
+        slot.start_confirmed = True
         slot.running = True
         ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
         if callable(ensure_speed):
@@ -5814,11 +5820,15 @@ class Scheduler:
         label = f"{action}_start"
         status = self.state.action_status(account.name, action)
         if status == "pending" and self.state.action_status(account.name, label) == "new":
-            # Migration for the old grade-selection pending record.  The
-            # still-visible fight-start control proves no transition occurred.
-            self.state.set_action(account.name, action, "new", "fight-start still visible; legacy selection pending cleared")
-            self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
-            status = "new"
+            action_record = self.state.action_record(account.name, action)
+            legacy_selection_only = not (isinstance(action_record, dict) and action_record.get('before_evidence'))
+            if legacy_selection_only:
+                # Older versions used this action key for reversible opponent
+                # selection. Only that record, without a write-ahead click receipt,
+                # may be cleared from the positively visible start page.
+                self.state.set_action(account.name, action, "new", "fight-start visible; legacy selection pending cleared")
+                self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
+                status = "new"
         if status == "pending":
             raise PendingError("survival fight-start outcome unknown; refusing duplicate start")
         if status == "done":
@@ -5835,15 +5845,33 @@ class Scheduler:
             threshold=0.92,
         ):
             raise PendingError("survival fight-start button missing")
-        if not self.wait_absent("survival_fight_start_core.bmp", (751, 169, 1151, 419), 8, threshold=0.92):
-            raise PendingError("survival fight-start remained visible; refusing duplicate")
+        if not self.wait_absent("survival_fight_start_core.bmp", (751, 169, 1151, 419), 1.5, threshold=0.92):
+            raise PendingError("survival fight-start click sent; transition still pending, refusing duplicate")
         self.state.set_action(account.name, label, "done", "fight-start control disappeared and battle transition began")
 
     def _poll_survival_slot(self, slot: CombatSlot, frame: Image.Image | None = None) -> None:
         account = slot.account
         frame = frame or self.capture()
         if self.template("survival_fight_start_core.bmp", (751, 169, 1151, 419), frame, threshold=0.92)[0]:
+            action = self._combat_action_name("survival", slot.next_index)
+            start_label = f"{action}_start"
+            action_record = self.state.action_record(account.name, action)
+            click_may_have_been_sent = (
+                isinstance(action_record, dict) and bool(action_record.get('before_evidence'))
+            ) or self.state.action_status(account.name, start_label) in ('pending', 'done') or slot.start_confirmed
+            if click_may_have_been_sent:
+                if slot.start_requested_at is None:
+                    slot.start_requested_at = time.monotonic()
+                elapsed = time.monotonic() - slot.start_requested_at
+                if elapsed < 30:
+                    self.event('survival_battle_start_transition_pending', account,
+                               index=slot.next_index, elapsed_seconds=round(elapsed, 2),
+                               timeout_seconds=30, duplicate_click=False)
+                    self.wait_interruptible(.4)
+                    return
+                raise PendingError('生存开战点击已发送，但30秒内未确认离开开战页；保留待处理，不重复点击')
             self._click_survival_fight_start(slot)
+            slot.start_confirmed = True
             self.event("combat_battle_started", account, mode="survival", index=slot.next_index, resumed=True)
             return
         # Check the result modal before the background battle badge.  This is
@@ -5898,6 +5926,8 @@ class Scheduler:
             self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
             slot.running = False
             slot.next_index += 1
+            slot.start_confirmed = False
+            slot.start_requested_at = None
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
             return
         ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
@@ -5979,6 +6009,8 @@ class Scheduler:
             self.state.set_action(account.name, "survival_route_c_first", "new", "重置后第二轮从0/220开始")
             slot.running = False
             slot.next_index = 1
+            slot.start_confirmed = False
+            slot.start_requested_at = None
             self.event("survival_second_run_started", account)
             return
         self.close_survival(account)
