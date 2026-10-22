@@ -27,6 +27,7 @@ class SchedulerUnitTests(unittest.TestCase):
             binding={'centers': [180]}, probing=False,
             resolve=Mock(return_value=account), select=Mock(return_value=frame))
         scheduler.run_context = context
+        scheduler._validate_tab_binding = Mock()
 
         self.assertIs(frame, hs.Scheduler.switch_account_for_combat(
             scheduler, account, 'arena', running=True))
@@ -1722,6 +1723,9 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn("def _click_survival_fight_start", start)
         self.assertIn("irreversible=True", start)
         self.assertIn('self._click_survival_fight_start(slot)', poll)
+        self.assertIn('click_may_have_been_sent', poll)
+        self.assertIn('duplicate_click=False', poll)
+        self.assertIn('elapsed < 30', poll)
         self.assertIn('"survival_auto_enable_recheck"', poll)
         self.assertNotIn("survival auto-battle was not positively enabled", poll)
 
