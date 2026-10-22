@@ -916,7 +916,12 @@ class MultiSoloRunner:
                     runner.current = 'ranking'
                     record = runner.record('ranking')
                     phase = record.get('phase', 'ready')
-                    running = phase != 'ready'
+                    attempt = record.get('completed', 0) + 1
+                    action_base = f'daily_ranking_{attempt}'
+                    has_pending_action = any(
+                        s.state.action_status(account.name, action_base + '_' + suffix) == 'pending'
+                        for suffix in ('start', 'confirm', 'end', 'result', 'result_recover'))
+                    running = phase != 'ready' or has_pending_action
                     s.navigator = runner
                     runner.interleave_after_end = True
                     try:
