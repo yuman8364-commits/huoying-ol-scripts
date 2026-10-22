@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
+import tkinter as tk
 
 import hyol_runtime as runtime
 from hyol_client import UnifiedClient, INDEPENDENT, format_task_event
@@ -519,6 +520,40 @@ class GuiControlTests(unittest.TestCase):
             self.app.independent.set(label)
             self.assertEqual(self.app.request().mode, mode)
         self.assertIsNone(self.app.controller.worker)
+
+    def test_white_compact_ui_shows_settings_for_the_selected_independent_task(self):
+        self.assertEqual(self.app.cget('background').lower(), '#ffffff')
+        self.app.tabs.select(2)
+        self.app.independent.set('羁绊')
+        self.app._refresh_task_settings()
+        self.assertEqual(self.app.current_setting_codes, ('bond',))
+        self.assertIsNotNone(self.app.bond_count_control)
+        self.assertIsNone(self.app.arena_target_control)
+        self.assertTrue(self.app.formation_control.winfo_manager() == '')
+        self.assertTrue(self.app.managed_control.winfo_manager() == '')
+
+        self.app.independent.set('挖宝（5分钟）')
+        self.app._refresh_task_settings()
+        self.assertEqual(self.app.current_setting_codes, ('treasure',))
+        labels = []
+        def collect_text(widget):
+            for child in widget.winfo_children():
+                try:
+                    value = child.cget('text')
+                    if value:
+                        labels.append(str(value))
+                except tk.TclError:
+                    pass
+                collect_text(child)
+        collect_text(self.app.task_specific_box)
+        self.assertTrue(any('固定 5 分钟' in value for value in labels))
+
+        self.app.independent.set('竞技场')
+        self.app._refresh_task_settings()
+        self.assertEqual(self.app.current_setting_codes, ('arena',))
+        self.assertIsNotNone(self.app.arena_target_control)
+        self.assertTrue(self.app.arena_wins_control.instate(('disabled',)))
+        self.assertEqual(self.app.tabs.index('end'), 3)
 
     def test_explicit_new_bond_round_is_consumed_by_one_start(self):
         self.app.tabs.select(2)
