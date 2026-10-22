@@ -80,6 +80,7 @@ ARENA_MAX_ATTEMPTS = 10
 ARENA_MAX_REQUESTED_WINS = 99
 ARENA_POLL_INTERVAL_SECONDS = 2.0
 ARENA_SLOT_PENDING_LIMIT = 3
+SURVIVAL_SLOT_PENDING_LIMIT = 6
 ARENA_STALE_PENDING_SECONDS = 900
 IDENTITY_ROI = (105, 72, 250, 104)
 IDENTITY_SERVER_WIDTH = 18
@@ -4297,6 +4298,18 @@ class Scheduler:
                 ("arena_rankdown_banner.bmp", (700, 220, 1250, 430)),
                 ("arena_rankdown_confirm.bmp", (800, 600, 1150, 760)),
             )
+        elif mode == "ranking":
+            # Ranking can be safely revisited after its end-battle click while
+            # the result dialog is still open. These anchors validate that
+            # pending state instead of waiting for identity text hidden by it.
+            probes = (
+                ("ranking_page.bmp", (790, 95, 1080, 195)),
+                ("ranking_battle_anchor.bmp", (1400, 205, 1510, 251)),
+                ("ranking_end_battle.bmp", (1410, 850, 1550, 980)),
+                ("ranking_result_confirm.bmp", (860, 640, 1060, 710)),
+                ("ranking_result_stats.bmp", (890, 605, 1035, 653)),
+                ("ranking_power_warning.bmp", (790, 505, 1130, 560)),
+            )
         else:
             probes = (
                 ("survival_fight_start.bmp", (751, 169, 1151, 419)),
@@ -4347,6 +4360,10 @@ class Scheduler:
             # The title can remain during battle transitions; require a live
             # mode control or the strictly matched current-page fight button.
             return ((ranked or casual) and (title or task_state)) or (title and current_fight)
+        if mode == "ranking":
+            return (self.template("ranking_page.bmp", (790, 95, 1080, 195), frame, threshold=.95)[0]
+                    and self.template("ranking_counter_label.bmp", (1470, 153, 1586, 184),
+                                      frame, threshold=.95)[0])
         return self.template("survival_anchor.bmp", (201, 69, 601, 419), frame)[0]
 
     def switch_account_for_combat(self, account: Account, mode: str, running: bool) -> Image.Image:
@@ -5781,6 +5798,9 @@ class Scheduler:
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
         slot.battle_watchdog_index = slot.next_index
         slot.running = True
+        ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
+        if callable(ensure_speed):
+            ensure_speed(slot, self.capture())
         self.event("combat_battle_started", account, mode="survival", index=slot.next_index)
 
     def _click_survival_fight_start(self, slot: CombatSlot) -> None:
@@ -5875,6 +5895,9 @@ class Scheduler:
             slot.next_index += 1
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
             return
+        ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
+        if callable(ensure_speed):
+            ensure_speed(slot, frame)
         self._combat_progress_watchdog(slot, frame)
         if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0]:
             if not self.click_template(account, "battle_auto_off.bmp", BATTLE_AUTO_ROI, 29, 29, f"survival_battle_auto_{slot.next_index}", ["battle_auto_off.bmp"]):
@@ -5981,7 +6004,7 @@ class Scheduler:
                 "survival_toolbar_current_core.bmp",
                 "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_score_200.bmp", "survival_complete_220.bmp",
                 "survival_grade_ss.bmp", "survival_grade_s.bmp", "survival_grade_a_current.bmp", "survival_grade_b_current.bmp", "survival_grade_c.bmp", "survival_fight_start.bmp", "survival_fight_start_core.bmp", "survival_result_confirm.bmp",
-                "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
+                "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "battle_speed_x1.png", "battle_speed_x2.png", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
                 "survival_reward_result_confirm.bmp", "survival_final_claimed.bmp",
             ]
         )
