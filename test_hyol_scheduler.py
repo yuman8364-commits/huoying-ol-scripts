@@ -1682,7 +1682,7 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertLess(first_pass.index("self._prepare_survival_slot(slot)"), first_pass.index("self._start_survival_slot(slot)"))
         self.assertIn("combat_battle_start_requested", source)
         self.assertIn("ARENA_POLL_INTERVAL_SECONDS", first_pass)
-        self.assertIn("if mode == 'arena' and time.monotonic() < slot.next_poll_at:", body)
+        self.assertIn("if mode in ('arena', 'survival') and time.monotonic() < slot.next_poll_at:", body)
         self.assertIn("while any(not slot.complete and not slot.unavailable for slot in slots):", body)
 
     def test_survival_selected_fight_page_is_resumable_and_start_is_audited(self) -> None:
