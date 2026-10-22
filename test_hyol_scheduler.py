@@ -1726,12 +1726,39 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn('click_may_have_been_sent', poll)
         self.assertIn('duplicate_click=False', poll)
         self.assertIn('elapsed < 30', poll)
+        transition = poll.split('if click_may_have_been_sent:', 1)[1].split("raise PendingError('生存开战点击已发送", 1)[0]
+        self.assertNotIn('wait_interruptible', transition)
+        self.assertNotIn('_ensure_survival_battle_x2', start)
+        self.assertIn('ensure_speed(slot, frame)', poll)
         self.assertIn('slot.start_requested_at = time.monotonic()', start)
         self.assertIn('score_before=before_score', start)
         self.assertIn('battle_speed_x1.png', source)
         self.assertIn('battle_speed_x2.png', source)
         self.assertIn('"survival_auto_enable_recheck"', poll)
         self.assertNotIn("survival auto-battle was not positively enabled", poll)
+
+    def test_survival_pending_start_transition_yields_without_blocking_other_accounts(self) -> None:
+        account = hs.Account(1, 'replay', 180)
+        slot = SimpleNamespace(
+            account=account, next_index=1,
+            start_requested_at=hs.time.monotonic() - 1,
+            start_confirmed=True, last_start_transition_event_at=0.0,
+        )
+        scheduler = object.__new__(hs.Scheduler)
+        scheduler.template = Mock(return_value=(True, 1.0, 0, 0))
+        scheduler.state = SimpleNamespace(
+            action_record=Mock(return_value={'before_evidence': 'start-before.png'}),
+            action_status=Mock(return_value='done'),
+        )
+        scheduler.event = Mock()
+        scheduler.wait_interruptible = Mock()
+
+        hs.Scheduler._poll_survival_slot(scheduler, slot, Image.new('RGB', (1920, 1032)))
+
+        scheduler.event.assert_called_once()
+        self.assertEqual(scheduler.event.call_args.args[0],
+                         'survival_battle_start_transition_pending')
+        scheduler.wait_interruptible.assert_not_called()
 
     def test_survival_direct_entry_requires_real_page_before_state_migration(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
