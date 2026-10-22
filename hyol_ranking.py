@@ -124,6 +124,13 @@ def sent_result_can_reopen(r, rec):
         return False
 
 
+def _yield_waiting_result(r, rec, detail):
+    key = (rec.get('completed', 0), rec.get('phase', 'ready'))
+    if getattr(r, '_last_ranking_wait_yield_key', None) != key:
+        r.event('daily_ranking_waiting_result_yield', detail=detail)
+        r._last_ranking_wait_yield_key = key
+    return 'yield_waiting_result'
+
 def run(r):
     s, rec = r.scheduler, r.record('ranking')
     if rec.get('phase', 'ready') == 'ready':
@@ -163,15 +170,11 @@ def run(r):
             if transition_loading_visible(frame):
                 main_seen_at = None
                 if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                    r.event('daily_ranking_waiting_result_yield',
-                            detail='排位结算页面正在加载，先轮询其他账号')
-                    return 'yield_waiting_result'
+                    return _yield_waiting_result(r, rec, '排位结算页面正在加载，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
             if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                r.event('daily_ranking_waiting_result_yield',
-                        detail='排位结果页尚未稳定，先轮询其他账号')
-                return 'yield_waiting_result'
+                return _yield_waiting_result(r, rec, '排位结果页尚未稳定，先轮询其他账号')
             if main_seen_at is None:
                 main_seen_at = time.monotonic()
             if time.monotonic() - main_seen_at < 3:
@@ -188,9 +191,7 @@ def run(r):
                 if phase == 'ready':
                     raise
                 if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                    r.event('daily_ranking_waiting_result_yield',
-                            detail='排位剩余次数暂不可读，先轮询其他账号')
-                    return 'yield_waiting_result'
+                    return _yield_waiting_result(r, rec, '排位剩余次数暂不可读，先轮询其他账号')
                 # The challenge starts between two captures. Observe the
                 # existing attempt; never interpret a repaint as zero/new work.
                 s.wait_interruptible(.4)
@@ -202,9 +203,7 @@ def run(r):
             if phase != 'ready':
                 if count == rec.get('before'):
                     if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                        r.event('daily_ranking_waiting_result_yield',
-                                detail='结算后的剩余次数尚未变化，先轮询其他账号')
-                        return 'yield_waiting_result'
+                        return _yield_waiting_result(r, rec, '结算后的剩余次数尚未变化，先轮询其他账号')
                     s.wait_interruptible(.4)
                     continue
                 manual_decrement = (phase == 'confirmed'
@@ -254,9 +253,7 @@ def run(r):
         elif r.visible('ranking_result_confirm.bmp',RESULT,frame,.95) and r.visible('ranking_result_stats.bmp',(890,605,1035,653),frame,.95):
             if phase == 'result_sent' or (phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'pending'):
                 if getattr(r, 'interleave_after_end', False):
-                    r.event('daily_ranking_waiting_result_yield',
-                            detail='结果确认仍在处理，先轮询其他账号')
-                    return 'yield_waiting_result'
+                    return _yield_waiting_result(r, rec, '结果确认仍在处理，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
             if phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'new':
@@ -305,7 +302,5 @@ def run(r):
                 return 'yield_after_end'
             deadline=time.monotonic()+60
         if getattr(r, 'interleave_after_end', False) and rec.get('phase', phase) in ('end_sent', 'result_sent'):
-            r.event('daily_ranking_waiting_result_yield',
-                    detail='当前账号尚无可核实的排位结算状态，先轮询其他账号')
-            return 'yield_waiting_result'
+            return _yield_waiting_result(r, rec, '当前账号尚无可核实的排位结算状态，先轮询其他账号')
         s.wait_interruptible(.4)
