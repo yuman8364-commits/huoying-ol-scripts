@@ -160,6 +160,37 @@ class RankingTests(unittest.TestCase):
         self.assertNotIn('daily_ranking_1_result', r.actions)
         r.save.assert_called()
 
+    def test_interleaved_pending_end_state_yields_without_reclicking_end(self):
+        r = self.runner(2)
+        r.mode = 'battle'
+        r.rec.update(before=2, phase='end_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_waiting_result')
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'end_sent')
+
+    def test_interleaved_result_modal_yields_without_duplicate_confirmation(self):
+        r = self.runner(2)
+        r.mode = 'result'
+        r.rec.update(before=2, phase='result_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending',
+                         daily_ranking_1_result='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_waiting_result')
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'result_sent')
+
     def test_preexisting_zero_never_starts_battle(self):
         r=self.runner(0)
         with patch.object(ranking,'stable_remaining',return_value=0):
