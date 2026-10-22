@@ -62,7 +62,7 @@ def active_tab_centers(close_positions: tuple[int, ...]) -> tuple[int, ...]:
 
 class MultiSoloRunner:
     def __init__(self, tasks=DEFAULT_SOLO_OPTIONS, *, config_path=None, account_count=None,
-                 arena_wins=5, formation="keep", event_sink=None, managed_enabled=True, run_context=None):
+                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None):
         chosen = tuple(tasks)
         if not chosen or len(set(chosen)) != len(chosen) or any(task not in SOLO_OPTIONS for task in chosen):
             raise ValueError("请选择不重复的单人日常任务")
@@ -73,8 +73,11 @@ class MultiSoloRunner:
         if not self.tasks:
             raise ValueError('非周末不能执行仅包含周末任务的请求；未启动游戏，请选择其他任务')
         self.arena_wins = arena_wins
+        self.arena_target_mode = arena_target_mode
         if not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
-            raise ValueError(f"竞技场追加胜场须在1到{hs.ARENA_MAX_ATTEMPTS}之间")
+            raise ValueError(f"竞技场辅助胜场数须在1到{hs.ARENA_MAX_ATTEMPTS}之间")
+        if arena_target_mode not in ('tickets', 'wins'):
+            raise ValueError('竞技场结束条件须为战令归零或指定胜场')
         if formation not in ('keep', 'main', 'fast'):
             raise ValueError('请选择保持不变、主力或速刷阵容')
         self.formation = formation
@@ -146,6 +149,7 @@ class MultiSoloRunner:
             "startup_pending": self.startup_pending,
             "startup_rechecked": sorted(getattr(self, 'startup_rechecked', set())),
             "arena_requested_wins": self.arena_wins,
+            "arena_target_mode": self.arena_target_mode,
             "managed_enabled": getattr(self, 'managed_enabled', True),
             "tasks": list(self.tasks),
             "run_id": self.scheduler.diagnostics.identifier,
@@ -225,6 +229,7 @@ class MultiSoloRunner:
         runner.current = ""
         runner.group_count = 0
         runner.arena_wins = self.arena_wins
+        runner.arena_target_mode = self.arena_target_mode
         runner.formation = self.formation
         runner.formation_checked = False
         runner.generic_current_window = False
@@ -732,6 +737,125 @@ class MultiSoloRunner:
                 self.event("multi_solo_account_excluded", account, checks=checks,
                            reason="combat_page_unverified", detail="战斗标签两次无法确认健康状态")
 
+
+    def _run_arena_stage(self):
+        """Start arena battles across eligible accounts first, then poll them cooperatively."""
+        s = self.scheduler
+        original_accounts = s.accounts
+        original_eligible = getattr(s, 'arena_eligible_accounts', None)
+        original_mode = getattr(s, 'arena_target_mode', None)
+        original_target = getattr(s, 'arena_victory_target', None)
+        original_limit = getattr(s, 'arena_attempt_limit', None)
+        candidates = []
+        started_at = time.monotonic()
+        try:
+            for configured in tuple(original_accounts):
+                account = s.by_name.get(configured.name, configured)
+                if (account.name not in self.startup_returned
+                        or account.name in self.manual_deferred
+                        or account.name in self.deferred
+                        or account.name in self.excluded
+                        or account.name in self.disconnected):
+                    self.note_skipped(account, 'arena')
+                    continue
+                if self.check_account(account):
+                    candidates.append(account)
+                else:
+                    self.note_skipped(account, 'arena')
+            if not candidates:
+                self.event('multi_solo_arena_no_eligible_accounts',
+                           detail='没有通过身份与在线检查的竞技场账号')
+                return
+
+            s.accounts = candidates
+            s.arena_target_mode = self.arena_target_mode
+            s.arena_victory_target = self.arena_wins
+            requests = []
+            for account in candidates:
+                runner = self.runner_for(account)
+                runner.current = 'arena'
+                record = runner.record('arena')
+                record.update(status='running', task_completed=False, home_returned=False,
+                              followup_check_due=False, last_error='')
+                runner.save()
+                s.prepare_additional_arena_request(
+                    account, self.arena_wins, target_mode=self.arena_target_mode)
+                request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
+                if isinstance(request, dict):
+                    requests.append(request)
+                self.event('multi_solo_task_started', account, task='arena',
+                           target_mode=self.arena_target_mode,
+                           requested_wins=self.arena_wins,
+                           detail=('先逐号发起战斗，默认直到战令次数归零'
+                                   if self.arena_target_mode == 'tickets'
+                                   else f'先逐号发起战斗，每号新增确认胜场目标为{self.arena_wins}'))
+            if requests:
+                s.arena_attempt_limit = max(
+                    int(item.get('attempt_limit', hs.ARENA_MAX_ATTEMPTS))
+                    for item in requests if isinstance(item, dict))
+            pending_detail = ''
+            try:
+                s.run_combat_interleaved('arena')
+            except hs.PendingError as exc:
+                # A single unresolved slot must not stop polling/starting the
+                # other accounts. The scheduler has already quarantined unsafe
+                # slots and preserved their action ledgers.
+                pending_detail = str(exc)
+                self.event('multi_solo_arena_stage_pending', detail=pending_detail)
+
+            if not hasattr(self, 'arena_rewards_audited'):
+                self.arena_rewards_audited = set()
+            for account in candidates:
+                runner = self.runner_for(account)
+                record = runner.record('arena')
+                complete = s._account_module_complete(account, 'arena')
+                if complete:
+                    record.update(status='done', task_completed=True, home_returned=True,
+                                  followup_check_due=False, finished_at=hs.now_iso(), last_error='',
+                                  arena_requested_wins=self.arena_wins,
+                                  arena_target_mode=self.arena_target_mode)
+                    self.arena_rewards_audited.add(account.name)
+                    runner.save()
+                    self.event('multi_solo_task_complete', account, task='arena',
+                               task_completed=True, home_returned=True,
+                               target_mode=self.arena_target_mode,
+                               completed=s._arena_victory_count(account))
+                else:
+                    detail = pending_detail or '竞技场目标、战令归零或奖励领取尚未全部核实'
+                    record.update(status='pending', task_completed=False, home_returned=False,
+                                  followup_check_due=False, last_error=detail,
+                                  arena_requested_wins=self.arena_wins,
+                                  arena_target_mode=self.arena_target_mode)
+                    runner.save()
+                    self.event('multi_solo_task_pending', account, task='arena', detail=detail,
+                               target_mode=self.arena_target_mode)
+        finally:
+            s.accounts = original_accounts
+            if original_eligible is None:
+                if hasattr(s, 'arena_eligible_accounts'):
+                    delattr(s, 'arena_eligible_accounts')
+            else:
+                s.arena_eligible_accounts = original_eligible
+            if original_mode is None:
+                if hasattr(s, 'arena_target_mode'):
+                    delattr(s, 'arena_target_mode')
+            else:
+                s.arena_target_mode = original_mode
+            if original_target is None:
+                if hasattr(s, 'arena_victory_target'):
+                    delattr(s, 'arena_victory_target')
+            else:
+                s.arena_victory_target = original_target
+            if original_limit is None:
+                if hasattr(s, 'arena_attempt_limit'):
+                    delattr(s, 'arena_attempt_limit')
+            else:
+                s.arena_attempt_limit = original_limit
+            self.event('multi_solo_arena_stage_elapsed',
+                       seconds=round(time.monotonic() - started_at, 3),
+                       target_mode=self.arena_target_mode,
+                       accounts=[account.name for account in candidates])
+
     def _survival_followup(self, runner):
         """Revisit survival after the other solo tasks, using the real page state."""
         s, account = self.scheduler, runner.account
@@ -1070,6 +1194,13 @@ class MultiSoloRunner:
                     self.event('multi_solo_stage_finished', task=task,
                                seconds=round(time.monotonic()-stage_started, 3))
                     continue
+                if task == 'arena':
+                    self._run_arena_stage()
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
                 for configured in tuple(s.accounts):
                     s.check_stop()
                     account = s.by_name[configured.name]
@@ -1085,7 +1216,8 @@ class MultiSoloRunner:
                         continue
                     previous = self.runner_for(account).record(task)
                     if (task == 'arena' and previous.get('status') == 'done'
-                            and previous.get('arena_requested_wins', 5) != self.arena_wins):
+                            and (previous.get('arena_requested_wins', 5) != self.arena_wins
+                                 or previous.get('arena_target_mode', 'wins') != self.arena_target_mode)):
                         prior_request = s.state.global_state.get('arena_requests', {}).get(account.name)
                         if isinstance(prior_request, dict) and prior_request.get('status') != 'done':
                             prior_request.update(status='done', completed_at=previous.get('finished_at'))
@@ -1183,7 +1315,10 @@ def main():
     parser = argparse.ArgumentParser(description="共享窗口多账号单人日常")
     parser.add_argument("--tasks", nargs="+", choices=SOLO_OPTIONS,
                         default=list(DEFAULT_SOLO_OPTIONS))
-    parser.add_argument("--arena-wins", type=int, default=5)
+    parser.add_argument("--arena-wins", type=int, default=5,
+                        help="仅在 --arena-target-mode wins 时生效")
+    parser.add_argument("--arena-target-mode", choices=("tickets", "wins"), default="tickets",
+                        help="默认耗尽战令；wins 表示按指定新增胜场数停止")
     parser.add_argument("--account-count", type=int, default=None,
                         help="本轮要识别的账号数量；候选账号取配置TabAccountNames前N个")
     parser.add_argument("--formation", choices=("keep", "main", "fast"), default="keep")
@@ -1191,7 +1326,8 @@ def main():
     args = parser.parse_args()
     runner = MultiSoloRunner(args.tasks, config_path=args.config,
                              account_count=args.account_count,
-                             arena_wins=args.arena_wins, formation=args.formation,
+                             arena_wins=args.arena_wins, arena_target_mode=args.arena_target_mode,
+                             formation=args.formation,
                              event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
                              if str(event.get("event", "")).startswith("multi_solo_") else None)
     try:
