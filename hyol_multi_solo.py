@@ -853,7 +853,6 @@ class MultiSoloRunner:
                     self.deferred[account.name] = 'survival'
                     self.deferred_at[account.name] = time.monotonic()
                     self.event('multi_solo_task_pending', account, task='survival', detail=detail)
-            self.save_progress('survival')
             self.event('multi_solo_survival_stage_elapsed',
                        seconds=round(time.monotonic() - started_at, 3),
                        accounts=[account.name for account in candidates])
