@@ -521,10 +521,10 @@ class UnifiedClient(tk.Tk):
         elif request.mode in ('arena', 'weekend', 'treasure'):
             codes = [request.mode]
         elif request.mode == 'bond':
-            codes = ['bond']
+            codes = []
         else:
             codes = []
-        if request.final_managed:
+        if request.final_managed and request.mode not in ('bond', 'team'):
             codes.append('managed')
         return tuple(codes)
 
