@@ -19,6 +19,45 @@ import hyol_scheduler as hs
 
 
 class SchedulerUnitTests(unittest.TestCase):
+    def test_run_context_allows_hidden_tab_only_for_running_combat_slots(self):
+        scheduler = object.__new__(hs.Scheduler)
+        account = hs.Account(1, 'bound-account', 180)
+        frame = Image.new('RGB', (1920, 1032))
+        context = SimpleNamespace(
+            binding={'centers': [180]}, probing=False,
+            resolve=Mock(return_value=account), select=Mock(return_value=frame))
+        scheduler.run_context = context
+        scheduler._validate_tab_binding = Mock()
+
+        self.assertIs(frame, hs.Scheduler.switch_account_for_combat(
+            scheduler, account, 'arena', running=True))
+        context.select.assert_called_once_with(
+            scheduler, account, allow_hidden=True, allow_transition=True)
+
+        context.select.reset_mock()
+        self.assertIs(frame, hs.Scheduler.switch_account_for_combat(
+            scheduler, account, 'arena', running=False))
+        context.select.assert_called_once_with(
+            scheduler, account, allow_hidden=False, allow_transition=False)
+
+    def test_ranking_result_modal_is_a_valid_combat_switch_target(self):
+        scheduler = object.__new__(hs.Scheduler)
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler._battle_hud_visible = Mock(return_value=False)
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name == 'ranking_result_confirm.bmp', 1.0, 0, 0))
+
+        self.assertTrue(hs.Scheduler._combat_active_visible(scheduler, 'ranking', frame))
+
+    def test_ranking_ready_page_requires_page_and_counter_anchors(self):
+        scheduler = object.__new__(hs.Scheduler)
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name in ('ranking_page.bmp', 'ranking_counter_label.bmp'),
+                                   1.0, 0, 0))
+
+        self.assertTrue(hs.Scheduler._combat_ready_visible(scheduler, 'ranking', frame))
+
     def test_wanted_empty_ignores_green_map_left_border(self):
         frame = Image.new('RGB',(1920,1032),(70,70,70))
         for x in range(1715,1725):
@@ -174,10 +213,11 @@ class SchedulerUnitTests(unittest.TestCase):
             ),
             arena_victory_target=7,
             arena_attempt_limit=12,
-            _combat_limit=lambda _mode: 12,
+            _combat_limit=lambda _mode, _account=None: 12,
             _combat_action_name=lambda _mode, index: f"arena_casual_battle_{index}",
             _arena_victory_count=lambda _account: 2,
             _arena_victory_confirmed=lambda _account: False,
+            _arena_goal_complete=lambda _account: False,
             _arena_daily_rewards_complete=lambda _account: True,
         )
         self.assertEqual(3, hs.Scheduler._next_combat_index(scheduler, account, "arena"))
@@ -246,6 +286,60 @@ class SchedulerUnitTests(unittest.TestCase):
         scheduler._arena_victory_count.return_value = 13
         hs.Scheduler.prepare_additional_arena_request(scheduler, account, 1)
         self.assertEqual(14, scheduler.arena_victory_target)
+
+
+    def test_ticket_exhaustion_requires_three_positive_zero_count_frames(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = object.__new__(hs.Scheduler)
+        scheduler.capture = Mock(side_effect=[object(), object(), object()])
+        scheduler._combat_ready_visible = Mock(return_value=True)
+        scheduler._arena_token_count = Mock(return_value=0)
+        scheduler.wait_interruptible = Mock()
+        scheduler.event = Mock()
+        self.assertTrue(hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account))
+        self.assertEqual(3, scheduler.capture.call_count)
+        scheduler._arena_token_count = Mock(return_value=None)
+        scheduler.capture = Mock(return_value=object())
+        with self.assertRaisesRegex(hs.PendingError, '无法唯一识别'):
+            hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account)
+
+    def test_ticket_mode_ignores_win_target_until_tickets_are_verified_exhausted(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = object.__new__(hs.Scheduler)
+        request = {'target_mode': 'tickets', 'status': 'running', 'target': 1, 'tickets_exhausted': False}
+        scheduler.state = SimpleNamespace(global_state={'arena_requests': {account.name: request}})
+        scheduler.arena_victory_target = 1
+        scheduler._arena_victory_count = Mock(return_value=20)
+        self.assertFalse(hs.Scheduler._arena_victory_confirmed(scheduler, account))
+        self.assertFalse(hs.Scheduler._arena_goal_complete(scheduler, account))
+        request.update(status='done', tickets_exhausted=True)
+        self.assertTrue(hs.Scheduler._arena_goal_complete(scheduler, account))
+
+    def test_ticket_request_has_bounded_attempt_limit_and_does_not_use_win_count_as_stop(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = SimpleNamespace(
+            state=SimpleNamespace(global_state={}, accounts={account.name: {'actions': {}}}, save_global=Mock()),
+            _arena_victory_count=Mock(return_value=0), event=Mock(),
+        )
+        hs.Scheduler.prepare_additional_arena_request(scheduler, account, 5, target_mode='tickets')
+        request = scheduler.state.global_state['arena_requests'][account.name]
+        self.assertEqual('tickets', request['target_mode'])
+        self.assertEqual(hs.ARENA_MAX_ATTEMPTS, request['attempt_limit'])
+        self.assertFalse(request['tickets_exhausted'])
+        self.assertEqual(5, request['requested_wins'])
+
+    def test_ticket_mode_never_clicks_casual_when_tokens_are_zero(self) -> None:
+        source = Path(hs.__file__).read_text(encoding='utf-8')
+        selector = source.split('def _click_arena_mode_when_stable', 1)[1].split('def _combat_progress_watchdog', 1)[0]
+        self.assertIn("self._arena_target_mode_for(account) == 'tickets'", selector)
+        self.assertIn("return 'tickets_exhausted'", selector)
+        start = source.split('def _start_arena_slot', 1)[1].split('def _arena_opening_once', 1)[0]
+        self.assertIn('combat_battle_start_requested', start)
+        self.assertIn('start_requested_at', start)
+        poll = source.split('def _poll_arena_slot', 1)[1].split('def _finish_arena_slot', 1)[0]
+        self.assertIn('combat_battle_start_transition_pending', poll)
+        self.assertIn('elapsed < 30', poll)
+        self.assertNotIn('transition_deadline', start)
 
     def test_running_battle_waits_through_transient_missing_anchor(self) -> None:
         account = hs.Account(2, ROLE_E, 180)
@@ -1606,10 +1700,13 @@ class SchedulerUnitTests(unittest.TestCase):
     def test_interleaved_combat_starts_each_slot_before_preparing_next_slot(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
         body = source.split("def run_combat_interleaved", 1)[1].split("def module_arena", 1)[0]
-        first_round = body.split("while not all(slot.complete for slot in slots):", 1)[0]
-        self.assertLess(first_round.index("self._prepare_arena_slot(slot)"), first_round.index("self._start_arena_slot(slot)"))
-        self.assertLess(first_round.index("self._prepare_survival_slot(slot)"), first_round.index("self._start_survival_slot(slot)"))
-        self.assertIn("identity/template failure could leave every earlier tab", first_round)
+        first_pass = body.split("pause_requested = False", 1)[0]
+        self.assertLess(first_pass.index("self._prepare_arena_slot(slot)"), first_pass.index("self._start_arena_slot(slot)"))
+        self.assertLess(first_pass.index("self._prepare_survival_slot(slot)"), first_pass.index("self._start_survival_slot(slot)"))
+        self.assertIn("combat_battle_start_requested", source)
+        self.assertIn("ARENA_POLL_INTERVAL_SECONDS", first_pass)
+        self.assertIn("if mode in ('arena', 'survival') and time.monotonic() < slot.next_poll_at:", body)
+        self.assertIn("while any(not slot.complete and not slot.unavailable for slot in slots):", body)
 
     def test_survival_selected_fight_page_is_resumable_and_start_is_audited(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
@@ -1628,8 +1725,42 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn("def _click_survival_fight_start", start)
         self.assertIn("irreversible=True", start)
         self.assertIn('self._click_survival_fight_start(slot)', poll)
+        self.assertIn('click_may_have_been_sent', poll)
+        self.assertIn('duplicate_click=False', poll)
+        self.assertIn('elapsed < 30', poll)
+        transition = poll.split('if click_may_have_been_sent:', 1)[1].split("raise PendingError('生存开战点击已发送", 1)[0]
+        self.assertNotIn('wait_interruptible', transition)
+        self.assertNotIn('_ensure_survival_battle_x2', start)
+        self.assertIn('ensure_speed(slot, frame)', poll)
+        self.assertIn('slot.start_requested_at = time.monotonic()', start)
+        self.assertIn('score_before=before_score', start)
+        self.assertIn('battle_speed_x1.png', source)
+        self.assertIn('battle_speed_x2.png', source)
         self.assertIn('"survival_auto_enable_recheck"', poll)
         self.assertNotIn("survival auto-battle was not positively enabled", poll)
+
+    def test_survival_pending_start_transition_yields_without_blocking_other_accounts(self) -> None:
+        account = hs.Account(1, 'replay', 180)
+        slot = SimpleNamespace(
+            account=account, next_index=1,
+            start_requested_at=hs.time.monotonic() - 1,
+            start_confirmed=True, last_start_transition_event_at=0.0,
+        )
+        scheduler = object.__new__(hs.Scheduler)
+        scheduler.template = Mock(return_value=(True, 1.0, 0, 0))
+        scheduler.state = SimpleNamespace(
+            action_record=Mock(return_value={'before_evidence': 'start-before.png'}),
+            action_status=Mock(return_value='done'),
+        )
+        scheduler.event = Mock()
+        scheduler.wait_interruptible = Mock()
+
+        hs.Scheduler._poll_survival_slot(scheduler, slot, Image.new('RGB', (1920, 1032)))
+
+        scheduler.event.assert_called_once()
+        self.assertEqual(scheduler.event.call_args.args[0],
+                         'survival_battle_start_transition_pending')
+        scheduler.wait_interruptible.assert_not_called()
 
     def test_survival_direct_entry_requires_real_page_before_state_migration(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
@@ -1962,6 +2093,7 @@ class SchedulerUnitTests(unittest.TestCase):
             template=Mock(side_effect=match), click_template=Mock(return_value=True),
             event=Mock(), wait_interruptible=Mock(),
         )
+        scheduler._arena_target_mode_for = lambda account: 'wins'
         selected = hs.Scheduler._click_arena_mode_when_stable(scheduler, account, "arena_casual_battle_1")
         self.assertEqual("current_arena_page", selected)
         self.assertEqual(3, scheduler.capture.call_count)
@@ -2034,6 +2166,7 @@ class SchedulerUnitTests(unittest.TestCase):
             save_raw_evidence=Mock(return_value='ranked_unavailable.png'),
             event=Mock(), wait_interruptible=Mock(),
         )
+        scheduler._arena_target_mode_for = lambda account: 'wins'
         selected = hs.Scheduler._click_arena_mode_when_stable(scheduler, account, 'attempt_1')
         self.assertEqual('casual', selected)
         self.assertEqual(3, scheduler.capture.call_count)

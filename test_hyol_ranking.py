@@ -134,13 +134,98 @@ class RankingTests(unittest.TestCase):
 
     def test_five_end_clicks_and_actual_zero_required(self):
         r=self.runner()
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'],5)
         self.assertTrue(r.rec['zero_verified'])
         self.assertEqual(sum(n=='ranking_end_battle.bmp' for n,_,_ in r.clicks),5)
         self.assertEqual(len(r.actions),15)
         self.assertTrue(all(value=='done' for value in r.actions.values()))
+
+    def test_multi_account_mode_yields_immediately_after_end_click(self):
+        r = self.runner(2)
+        r.mode = 'battle'
+        r.rec.update(before=2, phase='confirmed', status='running')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_after_end')
+        self.assertEqual(r.rec['phase'], 'end_sent')
+        self.assertEqual([name for name, _, _ in r.clicks],
+                         ['ranking_end_battle.bmp'])
+        self.assertEqual(r.actions['daily_ranking_1_end'], 'pending')
+        self.assertNotIn('daily_ranking_1_result', r.actions)
+        r.save.assert_called()
+
+    def test_interleaved_pending_end_state_yields_without_reclicking_end(self):
+        r = self.runner(2)
+        r.mode = 'battle'
+        r.rec.update(before=2, phase='end_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_waiting_result')
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'end_sent')
+
+    def test_interleaved_result_modal_yields_without_duplicate_confirmation(self):
+        r = self.runner(2)
+        r.mode = 'result'
+        r.rec.update(before=2, phase='result_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending',
+                         daily_ranking_1_result='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_waiting_result')
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'result_sent')
+
+    def test_ready_phase_with_pending_action_never_replays_challenge(self):
+        r = self.runner(2)
+        r.mode = 'page'
+        r.rec.update(completed=0, phase='ready')
+        r.actions['daily_ranking_1_start'] = 'pending'
+        r.interleave_after_end = True
+
+        with self.assertRaises(hs.PendingError):
+            ranking.run(r)
+
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'ready')
+
+    def test_result_reconciliation_starts_next_battle_before_yielding_at_its_end(self):
+        r = self.runner(2)
+        r.mode = 'result'
+        r.rec.update(completed=0, before=2, phase='end_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending')
+        r.interleave_after_end = True
+
+        with patch.object(ranking, 'stable_remaining', side_effect=lambda runner, seconds=8: runner.count):
+            first_result = ranking.run(r)
+            self.assertEqual(first_result, 'yield_waiting_result')
+            self.assertEqual([name for name, _, _ in r.clicks], ['ranking_result_confirm.bmp'])
+            second_result = ranking.run(r)
+
+        self.assertEqual(second_result, 'yield_after_end')
+        self.assertEqual([name for name, _, _ in r.clicks],
+                         ['ranking_result_confirm.bmp',
+                          'ranking_challenge.bmp',
+                          'ranking_end_battle.bmp'])
+        self.assertEqual(r.rec['completed'], 1)
+        self.assertEqual(r.rec['phase'], 'end_sent')
 
     def test_preexisting_zero_never_starts_battle(self):
         r=self.runner(0)
@@ -163,7 +248,7 @@ class RankingTests(unittest.TestCase):
                 r.clicks.append((name,args[0],args[3]))
             else: original_click(name,*args)
         r.visible,r.click=visible,click
-        def count(r):
+        def count(r, seconds=8):
             self.assertNotEqual(r.mode,'warning')
             return r.count
         with patch.object(ranking,'stable_remaining',side_effect=count):
@@ -178,7 +263,7 @@ class RankingTests(unittest.TestCase):
         original_visible=r.visible
         r.visible=lambda name,*args,**kwargs: (True if name=='arena_defeat_banner.bmp'
                          and r.mode=='result' else original_visible(name,*args,**kwargs))
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'],1)
         self.assertEqual(r.rec['remaining'],0)
@@ -199,7 +284,7 @@ class RankingTests(unittest.TestCase):
                     raise hs.SafetyError('page anchor guard failed: transient animation')
             original_click(name,roi,dx,dy,label,anchors,irreversible)
         r.click=click
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             with self.assertRaises(hs.SafetyError):
                 ranking.run(r)
             self.assertEqual(r.rec['phase'],'end_pending')
@@ -257,7 +342,7 @@ class RankingTests(unittest.TestCase):
                 original_click(name, *args)
         r.click = click
         with patch.object(ranking, 'sent_result_can_reopen', return_value=True), \
-                patch.object(ranking, 'stable_remaining', side_effect=lambda r: r.count):
+                patch.object(ranking, 'stable_remaining', side_effect=lambda r, seconds=8: r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'], 2)
         self.assertTrue(r.rec['zero_verified'])
@@ -319,7 +404,7 @@ class RankingTests(unittest.TestCase):
                 else:
                     original_click(name,*args)
             r.click=click
-            with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+            with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
                 ranking.run(r)
             self.assertEqual(r.rec['completed'],5)
             self.assertTrue(r.rec['zero_verified'])
@@ -394,7 +479,7 @@ class RankingTests(unittest.TestCase):
                 waited.append(True)
                 r.mode='page'
         r.scheduler.wait_interruptible.side_effect=after_wait
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertTrue(waited)
         self.assertEqual(r.rec['completed'],9)

@@ -78,6 +78,9 @@ ARENA_REQUIRED_WINS = 1
 ARENA_DAILY_REWARD_CLAIMS = 2
 ARENA_MAX_ATTEMPTS = 10
 ARENA_MAX_REQUESTED_WINS = 99
+ARENA_POLL_INTERVAL_SECONDS = 2.0
+ARENA_SLOT_PENDING_LIMIT = 3
+SURVIVAL_SLOT_PENDING_LIMIT = 6
 ARENA_STALE_PENDING_SECONDS = 900
 IDENTITY_ROI = (105, 72, 250, 104)
 IDENTITY_SERVER_WIDTH = 18
@@ -1144,6 +1147,11 @@ class CombatSlot:
     queue_started_at: float | None = None
     battle_watchdog: BattleWatchdog | None = None
     battle_watchdog_index: int = 0
+    next_poll_at: float = 0.0
+    pending_checks: int = 0
+    start_confirmed: bool = False
+    start_requested_at: float | None = None
+    needs_prepare: bool = False
 
 
 def check_combat_slot_watchdog(scheduler, slot, frame, *, now=None):
@@ -3900,9 +3908,19 @@ class Scheduler:
             return f"arena_casual_battle_{index}"
         return f"survival_battle_step_{index}"
 
-    def _combat_limit(self, mode: str) -> int:
-        # A safety bound, never proof of score completion.
-        return getattr(self, "arena_attempt_limit", ARENA_MAX_ATTEMPTS) if mode == "arena" else 20
+    def _combat_limit(self, mode: str, account: Account | None = None) -> int:
+        # A safety bound, never proof of score completion. Arena limits belong
+        # to each account's request; the no-account form remains a compatibility
+        # fallback for old callers and tests.
+        if mode != "arena":
+            return 20
+        if account is not None:
+            requests = getattr(getattr(self, 'state', None), 'global_state', {}).get('arena_requests', {})
+            record = requests.get(account.name, {}) if isinstance(requests, dict) else {}
+            limit = record.get('attempt_limit') if isinstance(record, dict) else None
+            if type(limit) is int and limit >= 1:
+                return limit
+        return getattr(self, "arena_attempt_limit", ARENA_MAX_ATTEMPTS)
 
     def _arena_victory_count(self, account: Account) -> int:
         account_state = self.state.accounts.get(account.name, {})
@@ -3915,16 +3933,42 @@ class Scheduler:
             and str(record.get("status", "")) == "done"
         )
 
-    def _arena_victory_confirmed(self, account: Account) -> bool:
-        """Return only positively recorded arena victory evidence.
+    def _arena_target_mode_for(self, account: Account) -> str:
+        requests = getattr(getattr(self, 'state', None), 'global_state', {}).get('arena_requests', {})
+        record = requests.get(account.name, {}) if isinstance(requests, dict) else {}
+        mode = record.get('target_mode') if isinstance(record, dict) else None
+        if mode in ('tickets', 'wins'):
+            return mode
+        return getattr(self, 'arena_target_mode', 'wins')
 
+    def _arena_target_for(self, account: Account) -> int:
+        requests = getattr(getattr(self, 'state', None), 'global_state', {}).get('arena_requests', {})
+        record = requests.get(account.name, {}) if isinstance(requests, dict) else {}
+        target = record.get('target') if isinstance(record, dict) else None
+        if type(target) is int and target >= 1:
+            return target
+        return int(getattr(self, 'arena_victory_target', ARENA_REQUIRED_WINS) or ARENA_REQUIRED_WINS)
+
+    def _arena_goal_complete(self, account: Account) -> bool:
+        if self._arena_target_mode_for(account) == 'tickets':
+            requests = getattr(getattr(self, 'state', None), 'global_state', {}).get('arena_requests', {})
+            record = requests.get(account.name, {}) if isinstance(requests, dict) else {}
+            return (isinstance(record, dict) and record.get('status') == 'done'
+                    and record.get('tickets_exhausted') is True)
+        return self._arena_victory_confirmed(account)
+
+    def _arena_victory_confirmed(self, account: Account) -> bool:
+        """Return whether the configured *win-count* goal has positive evidence.
+
+        Ticket-exhaustion mode deliberately does not use wins as its stop gate;
+        each battle result is still recorded independently by attempt index.
         A generic result-confirm button is not a victory signal: the same
-        result path can be followed by a defeat dialog.  The rank-up dialog is
-        a positive victory signal in the enrolled client, and the explicit
-        marker makes that fact survive a process interruption.  The legacy
-        rank-up action records are accepted as a one-time migration path.
+        result path can be followed by a defeat dialog. The legacy rank-up
+        action records remain a one-time migration path.
         """
-        target = self.arena_victory_target or ARENA_REQUIRED_WINS
+        if self._arena_target_mode_for(account) == 'tickets':
+            return False
+        target = self._arena_target_for(account)
         if self._arena_victory_count(account) >= target:
             return True
         if target > 1:
@@ -4179,7 +4223,7 @@ class Scheduler:
         return False
 
     def _next_combat_index(self, account: Account, mode: str) -> int:
-        limit = self._combat_limit(mode)
+        limit = self._combat_limit(mode, account)
         if mode == "survival":
             actions = self.state.accounts.get(account.name, {}).get("actions", {})
             attempts = {int(key.removeprefix("survival_battle_step_")): record
@@ -4201,18 +4245,15 @@ class Scheduler:
             for index in range(1, limit + 1):
                 if self.state.action_status(account.name, self._combat_action_name(mode, index)) == "pending":
                     return index
-            if self._arena_victory_confirmed(account) and self._arena_daily_rewards_complete(account):
+            # Completion is account-scoped: each account owns its target mode
+            # and ticket/win request record.
+            goal_complete = self._arena_goal_complete(account)
+            if goal_complete and self._arena_daily_rewards_complete(account):
                 return limit + 1
             # ``arena_daily_victory`` is an old daily-task marker.  It cannot
             # satisfy a newly requested additional-victory target by itself.
             # Only the current target and positive attempt records may close
             # the module.
-            if (
-                self.state.action_status(account.name, "arena_daily_victory") == "done"
-                and self._arena_victory_count(account) >= (self.arena_victory_target or ARENA_REQUIRED_WINS)
-                and self._arena_daily_rewards_complete(account)
-            ):
-                return limit + 1
         for index in range(1, limit + 1):
             if self.state.action_status(account.name, self._combat_action_name(mode, index)) != "done":
                 return index
@@ -4250,6 +4291,18 @@ class Scheduler:
                 ("arena_defeat_confirm.bmp", (801, 580, 1101, 760)),
                 ("arena_rankdown_banner.bmp", (700, 220, 1250, 430)),
                 ("arena_rankdown_confirm.bmp", (800, 600, 1150, 760)),
+            )
+        elif mode == "ranking":
+            # Ranking can be safely revisited after its end-battle click while
+            # the result dialog is still open. These anchors validate that
+            # pending state instead of waiting for identity text hidden by it.
+            probes = (
+                ("ranking_page.bmp", (790, 95, 1080, 195)),
+                ("ranking_battle_anchor.bmp", (1400, 205, 1510, 251)),
+                ("ranking_end_battle.bmp", (1410, 850, 1550, 980)),
+                ("ranking_result_confirm.bmp", (860, 640, 1060, 710)),
+                ("ranking_result_stats.bmp", (890, 605, 1035, 653)),
+                ("ranking_power_warning.bmp", (790, 505, 1130, 560)),
             )
         else:
             probes = (
@@ -4301,6 +4354,10 @@ class Scheduler:
             # The title can remain during battle transitions; require a live
             # mode control or the strictly matched current-page fight button.
             return ((ranked or casual) and (title or task_state)) or (title and current_fight)
+        if mode == "ranking":
+            return (self.template("ranking_page.bmp", (790, 95, 1080, 195), frame, threshold=.95)[0]
+                    and self.template("ranking_counter_label.bmp", (1470, 153, 1586, 184),
+                                      frame, threshold=.95)[0])
         return self.template("survival_anchor.bmp", (201, 69, 601, 419), frame)[0]
 
     def switch_account_for_combat(self, account: Account, mode: str, running: bool) -> Image.Image:
@@ -4358,6 +4415,13 @@ class Scheduler:
             self._record_tab_binding(account)
             self.event("combat_account_bound", account, mode=mode, running=running, tab_click_suppressed=True)
             return frame
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing and not current_only:
+            # Full-client battle/result modals hide the in-game identity strip.
+            # The bound tab-title mask authorizes observation/switching only;
+            # subsequent content clicks still require fresh page and identity gates.
+            return context.select(self, account,
+                                  allow_hidden=running, allow_transition=running)
         if not running:
             if (getattr(self, 'active', None) == account
                     and self._saved_tab_mapping().get(account.name) == account.tab_x):
@@ -4567,6 +4631,22 @@ class Scheduler:
             self.wait_interruptible(.2)
         raise PendingError('arena content or token count did not stabilize')
 
+    def _arena_tickets_exhausted_on_page(self, account: Account, *, samples: int = 3) -> bool:
+        """Require repeated positive ready-page observations of a zero ticket count."""
+        for sample in range(samples):
+            frame = self.capture()
+            if not self._combat_ready_visible('arena', frame):
+                raise PendingError('竞技场页面未确认，不能判断战令是否归零')
+            tokens = self._arena_token_count(frame)
+            if tokens is None:
+                raise PendingError('战令剩余次数无法唯一识别，禁止误入休闲战斗')
+            if tokens > 0:
+                return False
+            if sample + 1 < samples:
+                self.wait_interruptible(0.25)
+        self.event('arena_tickets_exhausted_verified', account, remaining=0, samples=samples)
+        return True
+
     def _arena_token_count(self, frame: Image.Image) -> int | None:
         matches = [count for count in range(4) if self.template(
             f'arena_tokens_remaining_{count}.bmp', (975,295,1070,340), frame, threshold=.98)[0]]
@@ -4575,7 +4655,7 @@ class Scheduler:
     def _prepare_arena_slot(self, slot: CombatSlot) -> None:
         account = slot.account
         slot.next_index = self._next_combat_index(account, "arena")
-        if slot.next_index > self._combat_limit("arena"):
+        if slot.next_index > self._combat_limit("arena", account):
             # The module may have completed in a previous process.  Re-open
             # only to verify and close a leftover arena page; no battle click
             # is made in this branch.
@@ -4714,7 +4794,12 @@ class Scheduler:
                            detail="排位按钮点击前刷新，重新核对战令可用状态")
             elif ready and casual and tokens == 0:
                 casual_only_frames += 1
-                if casual_only_frames >= 3:
+                if self._arena_target_mode_for(account) == 'tickets':
+                    if casual_only_frames >= 3:
+                        self.event('arena_tickets_exhausted_verified', account,
+                                   remaining=0, samples=casual_only_frames)
+                        return 'tickets_exhausted'
+                elif casual_only_frames >= 3:
                     evidence = self.save_raw_evidence(frame, account,
                                                       "arena_ranked_unavailable", "verified")
                     self.event("arena_ranked_unavailable", account,
@@ -4722,8 +4807,8 @@ class Scheduler:
                     if self.click_template(account, "arena_casual_button_current.bmp",
                                            (760, 719, 1050, 919), 88, 29, action,
                                            ["arena_ready_anchor.bmp", "arena_casual_button_current.bmp"],
-                                   irreversible=True,
-                                   frame_predicate=lambda fresh: self._arena_token_count(fresh) == 0):
+                                           irreversible=True,
+                                           frame_predicate=lambda fresh: self._arena_token_count(fresh) == 0):
                         self.event("arena_battle_mode_selected", account,
                                    battle_mode="casual", target=action)
                         return "casual"
@@ -4733,6 +4818,10 @@ class Scheduler:
                 current_fight_frames += 1
                 casual_only_frames = 0
                 if current_fight_frames >= 3:
+                    if self._arena_target_mode_for(account) == 'tickets':
+                        self.event('arena_tickets_exhausted_verified', account,
+                                   remaining=0, samples=current_fight_frames)
+                        return 'tickets_exhausted'
                     if self.click_template(
                         account,
                         "arena_battle_button_current.bmp",
@@ -4775,7 +4864,7 @@ class Scheduler:
         account = slot.account
         if slot.running or slot.complete:
             return
-        if slot.next_index > self._combat_limit("arena"):
+        if slot.next_index > self._combat_limit("arena", account):
             self._finish_arena_slot(slot)
             return
         self._claim_arena_tasks(account)
@@ -4783,6 +4872,11 @@ class Scheduler:
             self._finish_arena_slot(slot)
             return
         self._lower_arena_daily_tasks(account)
+        if (self._arena_target_mode_for(account) == 'tickets'
+                and self._arena_tickets_exhausted_on_page(account)):
+            slot.next_index = self._combat_limit('arena', account) + 1
+            self._finish_arena_slot(slot)
+            return
         # Move away from the opponent cards so their hover tooltip cannot
         # cover the casual button, then wait for that exact visual target.
         Win32.move(*self.screen_point(100, 500))
@@ -4811,6 +4905,10 @@ class Scheduler:
         # reward claims.  Require a successful guarded revalidation, while
         # allowing a transient frame replacement to retry without any click.
         battle_mode = self._click_arena_mode_when_stable(account, action)
+        if battle_mode == 'tickets_exhausted':
+            slot.next_index = self._combat_limit('arena', account) + 1
+            self._finish_arena_slot(slot)
+            return
         if battle_mode is None:
             if self._arena_victory_confirmed(account):
                 self._finish_arena_slot(slot)
@@ -4818,25 +4916,20 @@ class Scheduler:
             raise PendingError("arena ranked/casual battle button did not stabilize before the required victory")
         slot.victory_confirmed = False
         slot.defeat_confirmed = False
+        slot.start_confirmed = False
+        slot.start_requested_at = time.monotonic()
         slot.progress_phase = ""
         slot.progress_changed_at = 0.0
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
         slot.battle_watchdog_index = slot.next_index
-        transition_deadline = time.monotonic() + 30
-        while time.monotonic() < transition_deadline:
-            self.check_stop()
-            frame = self.capture()
-            matching = (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
-                        or self._arena_waiting_battle_visible(frame))
-            loading = self.template("arena_loading_anchor.bmp", ARENA_LOADING_ROI, frame)[0]
-            active = self._combat_active_visible("arena", frame)
-            if matching or loading or active:
-                slot.running = True
-                self.event("combat_battle_started", account, mode="arena", index=slot.next_index)
-                return
-            self._combat_progress_watchdog(slot, frame)
-            self.wait_interruptible(0.2)
-        raise PendingError("arena did not enter matching or battle; start remains pending")
+        # The guarded mode click is already write-ahead logged. Do not wait up
+        # to 30 seconds on this account before issuing the other accounts'
+        # starts; confirm matching/loading/battle on the periodic poll pass.
+        slot.running = True
+        slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
+        self.event('combat_battle_start_requested', account, mode='arena', index=slot.next_index,
+                   battle_mode=battle_mode, next_check_seconds=ARENA_POLL_INTERVAL_SECONDS)
+        return
 
     def _arena_opening_once(self, account, index, frame):
         """Write ahead before each opening input; a pending input is never resent."""
@@ -4897,11 +4990,17 @@ class Scheduler:
             dismiss_identity_overlays(self,account,frame,only_kind='arena_trial_notice')
             return
         self._combat_progress_watchdog(slot, frame)
-        if (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
-                or self._arena_waiting_battle_visible(frame)):
+        matching = (self.template("arena_matching_anchor.bmp", (601, 349, 1201, 751), frame)[0]
+                    or self._arena_waiting_battle_visible(frame))
+        loading = self.template("arena_loading_anchor.bmp", ARENA_LOADING_ROI, frame)[0]
+        if (matching or loading or self._battle_hud_visible(frame)) and not slot.start_confirmed:
+            slot.start_confirmed = True
+            self.event('combat_battle_started', account, mode='arena', index=slot.next_index,
+                       phase='matching' if matching else 'loading' if loading else 'battle_hud')
+        if matching:
             self.wait_interruptible(0.4)
             return
-        if self.template("arena_loading_anchor.bmp", ARENA_LOADING_ROI, frame)[0]:
+        if loading:
             self.wait_interruptible(0.4)
             return
         # Do not return merely because the battle frame is visible: the auto
@@ -5018,7 +5117,21 @@ class Scheduler:
             status = self.state.action_status(account.name, action)
             slot.victory_confirmed = slot.victory_confirmed or self._arena_attempt_victory_confirmed(account, slot.next_index)
             if not slot.victory_confirmed and not slot.defeat_confirmed:
-                raise PendingError("arena returned without a positively confirmed victory or defeat")
+                if not slot.start_confirmed:
+                    # A just-clicked battle can briefly leave the ready-page
+                    # controls visible while the matching overlay is painting.
+                    # Keep polling this slot without treating that transition
+                    # frame as an unknown result or quarantining it after 6s.
+                    if slot.start_requested_at is None:
+                        slot.start_requested_at = time.monotonic()
+                    elapsed = time.monotonic() - slot.start_requested_at
+                    if elapsed < 30:
+                        self.event('combat_battle_start_transition_pending', account,
+                                   mode='arena', index=slot.next_index,
+                                   elapsed_seconds=round(elapsed, 2), timeout_seconds=30)
+                        self.wait_interruptible(0.4)
+                        return
+                raise PendingError("arena returned without a positively confirmed victory or defeat; no matching/loading/battle page or result was confirmed; refusing duplicate start")
             if status == "pending":
                 outcome = "returned to arena page after positively confirmed victory" if slot.victory_confirmed else "returned to arena page after confirmed defeat"
                 self.commit_action(account, action, outcome)
@@ -5030,6 +5143,10 @@ class Scheduler:
             slot.next_index = self._next_combat_index(account, "arena")
             slot.victory_confirmed = False
             slot.defeat_confirmed = False
+            slot.start_confirmed = False
+            slot.start_requested_at = None
+            slot.pending_checks = 0
+            slot.next_poll_at = 0.0
             self.event(
                 "combat_battle_finished",
                 account,
@@ -5045,11 +5162,16 @@ class Scheduler:
         if slot.complete:
             return
         account = slot.account
+        target_mode = self._arena_target_mode_for(account)
         if not self.template("arena_ready_anchor.bmp", (851, 199, 1451, 449))[0]:
             raise PendingError("arena completion page is not positively visible")
-        slot.victory_confirmed = slot.victory_confirmed or self._arena_victory_confirmed(account)
-        if not slot.victory_confirmed:
-            raise PendingError("竞技场尚未确认胜利，保持待处理")
+        if target_mode == 'tickets':
+            if not self._arena_tickets_exhausted_on_page(account):
+                raise PendingError('竞技场战令次数尚未归零，不能判定完成')
+        else:
+            slot.victory_confirmed = slot.victory_confirmed or self._arena_victory_confirmed(account)
+            if not slot.victory_confirmed:
+                raise PendingError("竞技场尚未确认胜利，保持待处理")
         # Always inspect the current rows, even when older claims #1/#2 are done.
         self._claim_arena_tasks(account)
         reward_deadline = time.monotonic() + 10
@@ -5068,8 +5190,21 @@ class Scheduler:
         if not self.wait_until_main(12):
             raise PendingError("arena page did not close through a verified X")
         slot.complete = True
-        self.state.set_module(account.name, "arena", "done", f"{self.arena_victory_target} arena victories and two daily reward claims verified")
-        self.event("combat_module_done", account, mode="arena", wins=self._arena_victory_count(account), target=self.arena_victory_target, claims=ARENA_DAILY_REWARD_CLAIMS)
+        requests = self.state.global_state.setdefault('arena_requests', {})
+        request = requests.get(account.name)
+        if isinstance(request, dict):
+            request.update(status='done', completed_at=now_iso(), target_mode=target_mode)
+            request['tickets_exhausted'] = target_mode == 'tickets'
+            if target_mode == 'tickets':
+                request['ticket_count_at_completion'] = 0
+            self.state.save_global()
+        detail = ('ranked tickets exhausted and two daily reward claims verified'
+                  if target_mode == 'tickets'
+                  else f'{self._arena_target_for(account)} arena victories and two daily reward claims verified')
+        self.state.set_module(account.name, "arena", "done", detail)
+        self.event("combat_module_done", account, mode="arena", target_mode=target_mode,
+                   wins=self._arena_victory_count(account), target=self._arena_target_for(account),
+                   tickets_exhausted=target_mode == 'tickets', claims=ARENA_DAILY_REWARD_CLAIMS)
 
     def _observe_survival_pending_page(self, slot: CombatSlot, frame: Image.Image) -> bool:
         """A ready page is progress evidence, never an invented battle outcome."""
@@ -5143,10 +5278,14 @@ class Scheduler:
             if self._observe_survival_pending_page(slot, frame) is True:
                 return self._prepare_survival_slot(slot)
             start_label = f"{action}_start"
-            if self.main_ready(frame) and self.state.action_status(account.name, start_label) == "new":
-                # Older builds marked the reversible opponent-card selection
-                # as the battle action.  No audited start marker plus a verified
-                # main page proves that no scheduler fight-start click occurred.
+            action_record = self.state.action_record(account.name, action)
+            legacy_selection_only = not (isinstance(action_record, dict) and action_record.get('before_evidence'))
+            if (self.main_ready(frame)
+                    and self.state.action_status(account.name, start_label) == "new"
+                    and legacy_selection_only):
+                # Only legacy reversible opponent-selection records without a
+                # write-ahead click receipt may be cleared on the main page.
+                # A real start click with before-evidence is never replayed.
                 self.state.set_action(account.name, action, "new", "legacy opponent selection expired before audited fight start")
                 self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
                 slot.running = False
@@ -5660,10 +5799,15 @@ class Scheduler:
         observations[key] = dict(score_before=before_score, grade=selected['grade'],
                                  remaining_before=selected['remaining'], observed_at=now_iso())
         self.state.save_account(account.name)
-        self._click_survival_fight_start(slot)
-        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
+        slot.start_requested_at = time.monotonic()
+        slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=slot.start_requested_at)
         slot.battle_watchdog_index = slot.next_index
+        self._click_survival_fight_start(slot)
+        slot.start_confirmed = True
         slot.running = True
+        # Yield to the next account immediately after the guarded start action.
+        # Speed is verified and set to x2 on this slot's next poll, so a slow
+        # speed-control repaint cannot delay other accounts' battle starts.
         self.event("combat_battle_started", account, mode="survival", index=slot.next_index)
 
     def _click_survival_fight_start(self, slot: CombatSlot) -> None:
@@ -5672,11 +5816,15 @@ class Scheduler:
         label = f"{action}_start"
         status = self.state.action_status(account.name, action)
         if status == "pending" and self.state.action_status(account.name, label) == "new":
-            # Migration for the old grade-selection pending record.  The
-            # still-visible fight-start control proves no transition occurred.
-            self.state.set_action(account.name, action, "new", "fight-start still visible; legacy selection pending cleared")
-            self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
-            status = "new"
+            action_record = self.state.action_record(account.name, action)
+            legacy_selection_only = not (isinstance(action_record, dict) and action_record.get('before_evidence'))
+            if legacy_selection_only:
+                # Older versions used this action key for reversible opponent
+                # selection. Only that record, without a write-ahead click receipt,
+                # may be cleared from the positively visible start page.
+                self.state.set_action(account.name, action, "new", "fight-start visible; legacy selection pending cleared")
+                self.event("survival_selection_reconciled_without_start", account, index=slot.next_index)
+                status = "new"
         if status == "pending":
             raise PendingError("survival fight-start outcome unknown; refusing duplicate start")
         if status == "done":
@@ -5693,17 +5841,88 @@ class Scheduler:
             threshold=0.92,
         ):
             raise PendingError("survival fight-start button missing")
-        if not self.wait_absent("survival_fight_start_core.bmp", (751, 169, 1151, 419), 8, threshold=0.92):
-            raise PendingError("survival fight-start remained visible; refusing duplicate")
+        if not self.wait_absent("survival_fight_start_core.bmp", (751, 169, 1151, 419), 1.5, threshold=0.92):
+            raise PendingError("survival fight-start click sent; transition still pending, refusing duplicate")
         self.state.set_action(account.name, label, "done", "fight-start control disappeared and battle transition began")
+
+    def _reconcile_survival_start_transition(self, slot: CombatSlot, frame: Image.Image) -> bool:
+        """Confirm a delayed start from fresh bound battle/result evidence without input."""
+        account = slot.account
+        action = self._combat_action_name('survival', slot.next_index)
+        label = action + '_start'
+        original = self.state.action_record(account.name, action)
+        if (not isinstance(original, dict) or original.get('status') != 'pending'
+                or not original.get('before_evidence')
+                or self.state.action_status(account.name, label) == 'done'):
+            return False
+        positive = (self._battle_hud_visible(frame) or self.template(
+            'survival_result_confirm.bmp', (701,519,1151,819), frame, threshold=.98)[0])
+        if not positive:
+            return False
+        fresh = self._content_guard_once(account, (
+            'survival_battle_hud_left_current.bmp', 'survival_result_confirm.bmp'), .98)
+        if not (self._battle_hud_visible(fresh) or self.template(
+                'survival_result_confirm.bmp', (701,519,1151,819), fresh, threshold=.98)[0]):
+            return False
+        if not self.verify_identity(account, fresh)[0]:
+            from hyol_run_context import RunContext
+            context = getattr(self, 'run_context', None)
+            if (not isinstance(context, RunContext) or not context.binding
+                    or self.active != account or not context.layout_matches(fresh)
+                    or context.binding['mapping'].get(account.index) != self.state.aliases.get(account.name, account.name)
+                    or self._saved_tab_mapping().get(account.name) != account.tab_x
+                    or self._generic_active_tab_x(fresh) != account.tab_x):
+                raise PendingError('延迟开战画面缺少本运行账号与当前标签的唯一绑定')
+            context.check_window(self)
+        observations, key = self._survival_attempt_evidence(account, action)
+        row = self.state.accounts[account.name]
+        scope = row.get('survival_operation_scope')
+        run = 2 if self.state.action_status(account.name, 'survival_second_run_started') == 'done' else 1
+        expected = (f'{scope}:run_{run}:{action}' if scope else
+                    f"{row.get('continuation_scope')}:{action}")
+        start = self.state.action_record(account.name, label)
+        if (not (scope or row.get('continuation_scope')) or original.get('operation_id') != expected
+                or original.get('checkpoint_conflict') or start.get('checkpoint_conflict')
+                or (start.get('operation_id') and start['operation_id'] != expected + '_start')
+                or type(observations.get(key, {}).get('score_before')) is not int):
+            raise PendingError('延迟生存开战凭据与本账号、本轮积分基线不一致')
+        self.state.set_action(account.name, label, 'done', '后续轮询已从新鲜战斗或结果画面确认原开战转场')
+        slot.start_confirmed = True
+        self.event('survival_delayed_start_verified', account, index=slot.next_index,
+                   duplicate_click=False)
+        return True
 
     def _poll_survival_slot(self, slot: CombatSlot, frame: Image.Image | None = None) -> None:
         account = slot.account
         frame = frame or self.capture()
         if self.template("survival_fight_start_core.bmp", (751, 169, 1151, 419), frame, threshold=0.92)[0]:
+            action = self._combat_action_name("survival", slot.next_index)
+            start_label = f"{action}_start"
+            action_record = self.state.action_record(account.name, action)
+            click_may_have_been_sent = (
+                isinstance(action_record, dict) and bool(action_record.get('before_evidence'))
+            ) or self.state.action_status(account.name, start_label) in ('pending', 'done') or slot.start_confirmed
+            if click_may_have_been_sent:
+                if slot.start_requested_at is None:
+                    slot.start_requested_at = time.monotonic()
+                elapsed = time.monotonic() - slot.start_requested_at
+                if elapsed < 30:
+                    last_notice = getattr(slot, 'last_start_transition_event_at', 0.0)
+                    if not last_notice or time.monotonic() - last_notice >= 5:
+                        self.event('survival_battle_start_transition_pending', account,
+                                   index=slot.next_index, elapsed_seconds=round(elapsed, 2),
+                                   timeout_seconds=30, duplicate_click=False)
+                        slot.last_start_transition_event_at = time.monotonic()
+                    # This is a cooperative scheduler: do not sleep here.
+                    # Returning lets the caller poll other accounts while this
+                    # tab's start transition is still pending.
+                    return
+                raise PendingError('生存开战点击已发送，但30秒内未确认离开开战页；保留待处理，不重复点击')
             self._click_survival_fight_start(slot)
+            slot.start_confirmed = True
             self.event("combat_battle_started", account, mode="survival", index=slot.next_index, resumed=True)
             return
+        self._reconcile_survival_start_transition(slot, frame)
         # Check the result modal before the background battle badge.  This is
         # important on the shared client where the auto badge can outlive the
         # fight-result repaint by one or more frames.
@@ -5756,8 +5975,13 @@ class Scheduler:
             self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
             slot.running = False
             slot.next_index += 1
+            slot.start_confirmed = False
+            slot.start_requested_at = None
             self.event("combat_battle_finished", account, mode="survival", index=slot.next_index - 1)
             return
+        ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
+        if callable(ensure_speed):
+            ensure_speed(slot, frame)
         self._combat_progress_watchdog(slot, frame)
         if self.template("battle_auto_off.bmp", BATTLE_AUTO_ROI, frame)[0]:
             if not self.click_template(account, "battle_auto_off.bmp", BATTLE_AUTO_ROI, 29, 29, f"survival_battle_auto_{slot.next_index}", ["battle_auto_off.bmp"]):
@@ -5834,6 +6058,8 @@ class Scheduler:
             self.state.set_action(account.name, "survival_route_c_first", "new", "重置后第二轮从0/220开始")
             slot.running = False
             slot.next_index = 1
+            slot.start_confirmed = False
+            slot.start_requested_at = None
             self.event("survival_second_run_started", account)
             return
         self.close_survival(account)
@@ -5864,7 +6090,7 @@ class Scheduler:
                 "survival_toolbar_current_core.bmp",
                 "survival_anchor.bmp", "survival_close.bmp", "survival_reset.bmp", "survival_reset_confirm_yes.bmp", "survival_reset_confirm_no.bmp", "survival_score_0.bmp", "survival_score_80.bmp", "survival_score_140.bmp", "survival_score_160.bmp", "survival_score_200.bmp", "survival_complete_220.bmp",
                 "survival_grade_ss.bmp", "survival_grade_s.bmp", "survival_grade_a_current.bmp", "survival_grade_b_current.bmp", "survival_grade_c.bmp", "survival_fight_start.bmp", "survival_fight_start_core.bmp", "survival_result_confirm.bmp",
-                "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
+                "battle_auto_off.bmp", "battle_auto_on.bmp", "battle_auto_on_current.bmp", "battle_auto_on_current_core.bmp", "battle_speed_x1.png", "battle_speed_x2.png", "survival_claim_all.bmp", "survival_claim_confirm_yes.bmp",
                 "survival_reward_result_confirm.bmp", "survival_final_claimed.bmp",
             ]
         )
@@ -5892,15 +6118,17 @@ class Scheduler:
                     self._prepare_arena_slot(slot)
                 else:
                     self._prepare_survival_slot(slot)
-                # Start this account immediately after its ready page is
-                # verified.  Preparing all six pages first meant a later
-                # identity/template failure could leave every earlier tab in
-                # the lobby without ever entering battle.
+                # For arena, the guarded start click is journaled and the slot
+                # becomes pollable immediately. This lets the next account start
+                # without waiting for the first account's full transition.
                 if not slot.complete and not slot.running:
                     if mode == "arena":
                         self._start_arena_slot(slot)
                     else:
                         self._start_survival_slot(slot)
+                if slot.running:
+                    slot.next_poll_at = time.monotonic() + (
+                        ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
             except AccountOffline as exc:
                 slot.unavailable = True
                 self.state.set_module(slot.account.name, mode, 'pending', str(exc))
@@ -5910,6 +6138,26 @@ class Scheduler:
                 self.state.set_module(slot.account.name, mode, "pending", str(exc))
                 self.state.add_pending(slot.account.name, mode, str(exc))
                 self.event("combat_slot_pending", slot.account, mode=mode, detail=str(exc))
+                if mode in ('arena', 'survival'):
+                    action = self._combat_action_name(mode, slot.next_index)
+                    if self.state.action_status(slot.account.name, action) == 'pending':
+                        slot.running = True
+                        if mode == 'arena' and slot.start_requested_at is None:
+                            slot.start_requested_at = time.monotonic()
+                    if not slot.running:
+                        if (self.active == slot.account
+                                and not self.ensure_account_main_before_release(slot.account, mode)):
+                            raise LeaseBlocked(f"{mode} preparation did not return through a verified main page") from exc
+                        slot.needs_prepare = True
+                    slot.pending_checks += 1
+                    slot.next_poll_at = time.monotonic() + (
+                        ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
+                    limit = ARENA_SLOT_PENDING_LIMIT if mode == 'arena' else SURVIVAL_SLOT_PENDING_LIMIT
+                    if slot.pending_checks >= limit:
+                        slot.unavailable = True
+                        self.event('combat_slot_quarantined_after_pending', slot.account, mode=mode,
+                                   checks=slot.pending_checks, detail=str(exc))
+                    continue
                 if self.active == slot.account and not slot.running and not self.ensure_account_main_before_release(slot.account, mode):
                     raise LeaseBlocked(f"{mode} preparation did not return through a verified main page") from exc
                 raise
@@ -5922,6 +6170,8 @@ class Scheduler:
             for slot in slots:
                 if slot.complete or slot.unavailable:
                     continue
+                if mode in ('arena', 'survival') and time.monotonic() < slot.next_poll_at:
+                    continue
                 if pause_requested and not slot.running:
                     continue
                 try:
@@ -5933,14 +6183,26 @@ class Scheduler:
                             self._poll_survival_slot(slot)
                     else:
                         if mode == "arena":
-                            self._start_arena_slot(slot)
+                            if slot.needs_prepare:
+                                self._prepare_arena_slot(slot)
+                                slot.needs_prepare = False
+                            if not slot.complete and not slot.running:
+                                self._start_arena_slot(slot)
                         else:
-                            self._start_survival_slot(slot)
-                    if not slot.running and slot.next_index > self._combat_limit(mode):
+                            if slot.needs_prepare:
+                                self._prepare_survival_slot(slot)
+                                slot.needs_prepare = False
+                            if not slot.complete and not slot.running:
+                                self._start_survival_slot(slot)
+                    if not slot.running and slot.next_index > self._combat_limit(mode, slot.account):
                         if mode == "arena":
                             self._finish_arena_slot(slot)
                         else:
                             self._finish_survival_slot(slot)
+                    slot.pending_checks = 0
+                    if slot.running:
+                        slot.next_poll_at = time.monotonic() + (
+                            ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
                     progress = True
                 except AccountOffline as exc:
                     slot.unavailable = True
@@ -5959,6 +6221,27 @@ class Scheduler:
                     self.state.set_module(slot.account.name, mode, "pending", str(exc))
                     self.state.add_pending(slot.account.name, mode, str(exc))
                     self.event("combat_slot_pending", slot.account, mode=mode, detail=str(exc), running=slot.running)
+                    if mode in ('arena', 'survival'):
+                        action = self._combat_action_name(mode, slot.next_index)
+                        if self.state.action_status(slot.account.name, action) == 'pending':
+                            slot.running = True
+                            if mode == 'arena' and slot.start_requested_at is None:
+                                slot.start_requested_at = time.monotonic()
+                        slot.pending_checks += 1
+                        interval = ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4
+                        if slot.running:
+                            slot.next_poll_at = time.monotonic() + interval
+                        else:
+                            if self.active == slot.account and not self.ensure_account_main_before_release(slot.account, mode):
+                                raise LeaseBlocked(f"{mode} slot did not return through a verified main page") from exc
+                            slot.needs_prepare = True
+                            slot.next_poll_at = time.monotonic() + interval
+                        limit = ARENA_SLOT_PENDING_LIMIT if mode == 'arena' else SURVIVAL_SLOT_PENDING_LIMIT
+                        if slot.pending_checks >= limit:
+                            slot.unavailable = True
+                            self.event('combat_slot_quarantined_after_pending', slot.account, mode=mode,
+                                       checks=slot.pending_checks, detail=str(exc))
+                        continue
                     if self.active == slot.account and not slot.running and not self.ensure_account_main_before_release(slot.account, mode):
                         raise LeaseBlocked(f"{mode} slot did not return through a verified main page") from exc
                     raise
@@ -5995,7 +6278,7 @@ class Scheduler:
         # controls.  Wait for actual task/button content; a single early frame
         # must never be interpreted as "no ranked action".
         self._wait_arena_ready_content(account)
-        for battle_index in range(1, self._combat_limit("arena") + 1):
+        for battle_index in range(1, self._combat_limit("arena", account) + 1):
             # A prior run may already contain the positive victory marker while
             # this compatibility path was interrupted before its final close.
             # Reconcile that state without opening a second battle.
@@ -9696,7 +9979,7 @@ class Scheduler:
         if self.state.module_status(account.name, module) != "done":
             return False
         if module == "arena":
-            return self._arena_victory_confirmed(account) and self._arena_daily_rewards_complete(account)
+            return self._arena_goal_complete(account) and self._arena_daily_rewards_complete(account)
         if module == 'survival':
             # The module is marked done only after stable 220/220, reward
             # claim confirmation, and the verified close/home return.
@@ -9931,19 +10214,24 @@ class Scheduler:
         guard_legacy_local_unresolved(self)
         return bind_current_identity(self, account)
 
-    def prepare_additional_arena_request(self, account: Account, wins: int) -> None:
+    def prepare_additional_arena_request(self, account: Account, wins: int, *, target_mode: str = 'wins') -> None:
+        if target_mode not in ('tickets', 'wins'):
+            raise ValueError('竞技场结束条件须为战令归零或指定胜场')
+        self.arena_target_mode = target_mode
         requests = self.state.global_state.setdefault("arena_requests", {})
         record = requests.get(account.name, {})
         current_wins = self._arena_victory_count(account)
         actions = self.state.accounts.get(account.name, {}).get("actions", {})
         prefix = "arena_casual_battle_"
         last_attempt = max((int(key[len(prefix):]) for key in actions if key.startswith(prefix) and key[len(prefix):].isdigit()), default=0)
-        if not record or record.get("status") == "done":
+        target_mode_changed = isinstance(record, dict) and record.get('target_mode', 'wins') != target_mode
+        if not record or record.get("status") == "done" or target_mode_changed:
             record = {
-                "status": "running", "requested_wins": wins,
+                "status": "running", "target_mode": target_mode, "requested_wins": wins,
                 "base_wins": current_wins,
                 "target": current_wins + wins,
-                "attempt_limit": last_attempt + wins + ARENA_MAX_ATTEMPTS,
+                "attempt_limit": last_attempt + (wins if target_mode == 'wins' else 0) + ARENA_MAX_ATTEMPTS,
+                "tickets_exhausted": False,
                 "created_at": now_iso(),
             }
             requests[account.name] = record
@@ -9952,35 +10240,27 @@ class Scheduler:
             previous_target = int(record.get("target", current_wins + previous_requested))
             base_wins = int(record.get("base_wins", max(0, previous_target - previous_requested)))
             record["base_wins"] = base_wins
-            if previous_requested != wins:
+            if target_mode == 'wins' and previous_requested != wins:
                 record.update(
-                    requested_wins=wins,
-                    target=base_wins + wins,
-                    attempt_limit=max(
-                        int(record.get("attempt_limit", 0)),
-                        last_attempt + wins + ARENA_MAX_ATTEMPTS,
-                    ),
+                    requested_wins=wins, target=base_wins + wins,
+                    attempt_limit=max(int(record.get("attempt_limit", 0)), last_attempt + wins + ARENA_MAX_ATTEMPTS),
                     updated_at=now_iso(),
                 )
-                self.event(
-                    "arena_request_updated",
-                    account,
-                    previous_requested_wins=previous_requested,
-                    requested_wins=wins,
-                    target=record["target"],
-                )
+                self.event("arena_request_updated", account, previous_requested_wins=previous_requested,
+                           requested_wins=wins, target=record["target"])
+            else:
+                record.update(requested_wins=wins, target_mode=target_mode,
+                              attempt_limit=max(int(record.get("attempt_limit", 0)),
+                                                last_attempt + (wins if target_mode == 'wins' else 0) + ARENA_MAX_ATTEMPTS))
         self.arena_victory_target = int(record["target"])
         self.arena_attempt_limit = int(record["attempt_limit"])
         self.state.save_global()
         remaining = max(0, self.arena_victory_target - current_wins)
-        self.event(
-            "arena_request_ready",
-            account,
-            target=self.arena_victory_target,
-            requested_wins=record["requested_wins"],
-            remaining_wins=remaining,
-            detail=f"本轮选择{record['requested_wins']}场胜利，尚需{remaining}场；将连续执行到目标完成",
-        )
+        detail = (f"本轮目标为战令剩余次数归零；指定胜场{wins}仅在辅助模式生效"
+                  if target_mode == 'tickets'
+                  else f"本轮选择新增{record['requested_wins']}场胜利，尚需{remaining}场；将执行到目标完成")
+        self.event("arena_request_ready", account, target_mode=target_mode, target=self.arena_victory_target,
+                   requested_wins=record["requested_wins"], remaining_wins=remaining, detail=detail)
 
     def execute_command(self, command: SchedulerCommand) -> int:
         """Run one finite panel command under this scheduler's single lease."""

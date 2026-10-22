@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.20.1'
+VERSION = '2026.10.22.2'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -34,12 +34,15 @@ class RunRequest:
     bond_count: int = 5
     new_bond_round: bool = False
     final_managed: bool = True
+    arena_target_mode: str = 'tickets'
 
     def __post_init__(self):
         if self.mode not in MODES:
             raise ValueError('请选择有效任务类型')
         if not 1 <= self.account_count <= 6 or not 1 <= self.arena_wins <= hs.ARENA_MAX_ATTEMPTS:
-            raise ValueError('账号数量须为1～6，竞技场追加胜场须为1～10')
+            raise ValueError('账号数量须为1～6，竞技场辅助胜场数须为1～10')
+        if self.arena_target_mode not in ('tickets', 'wins'):
+            raise ValueError('竞技场结束条件须为战令归零或指定胜场')
         if self.formation not in ('keep', 'main', 'fast') or not 1 <= self.bond_count <= MAX_BATTLES:
             raise ValueError('阵容或羁绊次数无效')
         if not isinstance(self.final_managed, bool) or not isinstance(self.new_bond_round, bool):
@@ -151,13 +154,15 @@ def _make_runner(request, event_sink, root, run_context):
     root = Path(root)
     if request.mode == 'team_then_multi':
         runner = TeamPipelineRunner(request.leaders, request.team_tasks, request.tasks,
-                                    arena_wins=request.arena_wins, formation=request.formation,
+                                    arena_wins=request.arena_wins, arena_target_mode=request.arena_target_mode,
+                                    formation=request.formation,
                                     managed_enabled=request.final_managed, event_sink=event_sink, root=root,
                                     run_context=run_context)
     elif request.mode == 'multi':
         runner = MultiSoloRunner(request.tasks, config_path=root/'HYOL_Daily.ini',
                                  account_count=request.account_count, arena_wins=request.arena_wins,
-                                 formation=request.formation, managed_enabled=request.final_managed,
+                                 arena_target_mode=request.arena_target_mode, formation=request.formation,
+                                 managed_enabled=request.final_managed,
                                  event_sink=event_sink, run_context=run_context)
     elif request.mode == 'team':
         selection = TeamSelection(request.leader, () if request.friend_shortcut else request.members,
@@ -172,7 +177,8 @@ def _make_runner(request, event_sink, root, run_context):
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
         runner = DailyRunner('all', selected_tasks=tasks, config_path=root/'DAILY_Client.ini',
                              generic_current_window=True, formation=request.formation,
-                             arena_wins=request.arena_wins, managed_enabled=request.final_managed,
+                             arena_wins=request.arena_wins, arena_target_mode=request.arena_target_mode,
+                             managed_enabled=request.final_managed,
                              event_sink=event_sink)
     prohibit_purchase(runner.scheduler)
     return runner

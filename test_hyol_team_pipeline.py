@@ -22,6 +22,7 @@ def coordinator():
     owner = object.__new__(pipeline.TeamPipelineRunner)
     owner.leaders,owner.tasks,owner.solo_tasks = (1,4),pipeline.TEAM_TASKS,('mail',)
     owner.formation,owner.arena_wins,owner.managed_enabled = 'main',5,False
+    owner.arena_target_mode = 'tickets'
     owner.record = dict(id='original',phase='teams',teams={str(i):dict(status='running',tasks={},leader_slot=i)
                                                          for i in owner.leaders})
     owner.save,owner.event = Mock(),Mock()

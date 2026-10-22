@@ -62,7 +62,7 @@ def active_tab_centers(close_positions: tuple[int, ...]) -> tuple[int, ...]:
 
 class MultiSoloRunner:
     def __init__(self, tasks=DEFAULT_SOLO_OPTIONS, *, config_path=None, account_count=None,
-                 arena_wins=5, formation="keep", event_sink=None, managed_enabled=True, run_context=None):
+                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None):
         chosen = tuple(tasks)
         if not chosen or len(set(chosen)) != len(chosen) or any(task not in SOLO_OPTIONS for task in chosen):
             raise ValueError("请选择不重复的单人日常任务")
@@ -73,8 +73,11 @@ class MultiSoloRunner:
         if not self.tasks:
             raise ValueError('非周末不能执行仅包含周末任务的请求；未启动游戏，请选择其他任务')
         self.arena_wins = arena_wins
+        self.arena_target_mode = arena_target_mode
         if not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
-            raise ValueError(f"竞技场追加胜场须在1到{hs.ARENA_MAX_ATTEMPTS}之间")
+            raise ValueError(f"竞技场辅助胜场数须在1到{hs.ARENA_MAX_ATTEMPTS}之间")
+        if arena_target_mode not in ('tickets', 'wins'):
+            raise ValueError('竞技场结束条件须为战令归零或指定胜场')
         if formation not in ('keep', 'main', 'fast'):
             raise ValueError('请选择保持不变、主力或速刷阵容')
         self.formation = formation
@@ -146,6 +149,7 @@ class MultiSoloRunner:
             "startup_pending": self.startup_pending,
             "startup_rechecked": sorted(getattr(self, 'startup_rechecked', set())),
             "arena_requested_wins": self.arena_wins,
+            "arena_target_mode": self.arena_target_mode,
             "managed_enabled": getattr(self, 'managed_enabled', True),
             "tasks": list(self.tasks),
             "run_id": self.scheduler.diagnostics.identifier,
@@ -225,6 +229,7 @@ class MultiSoloRunner:
         runner.current = ""
         runner.group_count = 0
         runner.arena_wins = self.arena_wins
+        runner.arena_target_mode = self.arena_target_mode
         runner.formation = self.formation
         runner.formation_checked = False
         runner.generic_current_window = False
@@ -732,6 +737,459 @@ class MultiSoloRunner:
                 self.event("multi_solo_account_excluded", account, checks=checks,
                            reason="combat_page_unverified", detail="战斗标签两次无法确认健康状态")
 
+
+    def _run_survival_stage(self):
+        """Start each eligible survival battle first, then poll each account independently."""
+        s = self.scheduler
+        original_accounts = s.accounts
+        original_navigator = getattr(s, 'navigator', None)
+        original_navigators = getattr(s, '_combat_navigators', None)
+        original_observation = getattr(s, '_task_observation', None)
+        original_inline = getattr(s, 'survival_inline_two_runs', None)
+        candidates = []
+        runners = {}
+        pending_detail = ''
+        started_at = time.monotonic()
+        try:
+            for configured in tuple(original_accounts):
+                account = s.by_name.get(configured.name, configured)
+                runner = self.runner_for(account)
+                runner.current = 'survival'
+                record = runner.record('survival')
+                if (record.get('status') == 'done' and record.get('task_completed')
+                        and record.get('home_returned') and not record.get('followup_check_due')):
+                    self.event('multi_solo_task_skip_done', account, task='survival')
+                    continue
+                if (account.name not in self.startup_returned
+                        or account.name in self.manual_deferred
+                        or account.name in self.deferred
+                        or account.name in self.excluded
+                        or account.name in self.disconnected
+                        or 'survival' in getattr(self, 'blocked_tasks', {}).get(account.name, ())):
+                    self.note_skipped(account, 'survival')
+                    continue
+                if not self.check_account(account):
+                    self.note_skipped(account, 'survival')
+                    continue
+                s.navigator = runner
+                frame = s.capture()
+                page_visible = runner.visible('survival_anchor.bmp', (201, 69, 601, 419), frame)
+                actions = s.state.accounts.get(account.name, {}).get('actions', {})
+                has_pending_battle = any(
+                    key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
+                    and isinstance(value, dict) and value.get('status') == 'pending'
+                    for key, value in actions.items())
+                has_survival_attempt = any(
+                    key.startswith('survival_battle_step_') and isinstance(value, dict)
+                    and value.get('status') in ('pending', 'done')
+                    for key, value in actions.items())
+                in_combat = (s._battle_hud_visible(frame)
+                             or s.template('survival_result_confirm.bmp', (701, 519, 1151, 819), frame)[0]
+                             or s.template('survival_reward_result_confirm.bmp', (701, 569, 1151, 819), frame)[0])
+                if (in_combat or has_pending_battle
+                        or (page_visible and (has_survival_attempt or record.get('followup_check_due')))):
+                    # Resume the exact page/attempt. Never change formation while
+                    # a battle or an unresolved result may still be active.
+                    runner.formation_checked = True
+                elif not runner.formation_checked:
+                    try:
+                        runner.ensure_formation_once()
+                    except hs.AccountOffline as exc:
+                        self.skip_disconnected(account, 'survival')
+                        continue
+                    except hs.PendingError as exc:
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error=str(exc))
+                        runner.save()
+                        self.deferred[account.name] = 'survival'
+                        self.deferred_at[account.name] = time.monotonic()
+                        self.event('multi_solo_survival_prepare_pending', account, detail=str(exc))
+                        continue
+                record.update(status='running', last_error='')
+                runner.save()
+                runners[account.name] = runner
+                candidates.append(account)
+            if not candidates:
+                self.event('multi_solo_survival_no_eligible_accounts',
+                           detail='没有需要继续执行的生存演习账号')
+                return True
+
+            s.accounts = candidates
+            s._combat_navigators = runners
+            s.survival_inline_two_runs = True
+            # Each CombatSlot owns its watchdog. Do not let one global task
+            # observation accidentally monitor a different account after a tab switch.
+            s._task_observation = None
+            self.event('multi_solo_survival_interleaved_start',
+                       accounts=[account.name for account in candidates],
+                       detail='每号确认开战后立即切号；战斗中确认x2；结果与积分按账号轮询')
+            try:
+                s.run_combat_interleaved('survival')
+            except hs.PendingError as exc:
+                pending_detail = str(exc)
+                self.event('multi_solo_survival_stage_pending', detail=pending_detail)
+
+            for account in candidates:
+                runner = runners[account.name]
+                record = runner.record('survival')
+                if s._account_module_complete(account, 'survival'):
+                    runner.survival_inline_complete = True
+                    record.update(status='done', task_completed=True, home_returned=True,
+                                  followup_check_due=False, finished_at=hs.now_iso(), last_error='',
+                                  completed=2 if s.state.action_status(
+                                      account.name, 'survival_second_run_started') == 'done' else 1)
+                    runner.save()
+                    self.deferred.pop(account.name, None)
+                    self.deferred_at.pop(account.name, None)
+                    self.event('multi_solo_task_complete', account, task='survival',
+                               task_completed=True, home_returned=True, followup_check_due=False)
+                else:
+                    detail = pending_detail or '生存演习尚有战斗、积分、领奖或重置状态待核实'
+                    record.update(status='pending', task_completed=False, home_returned=False,
+                                  last_error=detail)
+                    runner.save()
+                    # Keep this account away from unrelated content clicks until
+                    # the original survival action can be reconciled.
+                    self.deferred[account.name] = 'survival'
+                    self.deferred_at[account.name] = time.monotonic()
+                    self.event('multi_solo_task_pending', account, task='survival', detail=detail)
+            self.event('multi_solo_survival_stage_elapsed',
+                       seconds=round(time.monotonic() - started_at, 3),
+                       accounts=[account.name for account in candidates])
+            return True
+        finally:
+            s.accounts = original_accounts
+            s.navigator = original_navigator
+            s._task_observation = original_observation
+            if original_navigators is None:
+                if hasattr(s, '_combat_navigators'):
+                    delattr(s, '_combat_navigators')
+            else:
+                s._combat_navigators = original_navigators
+            if original_inline is None:
+                if hasattr(s, 'survival_inline_two_runs'):
+                    delattr(s, 'survival_inline_two_runs')
+            else:
+                s.survival_inline_two_runs = original_inline
+
+    def _run_ranking_stage(self):
+        """Yield to the next account immediately after each verified end-battle click."""
+        s = self.scheduler
+        original_accounts = s.accounts
+        original_navigator = getattr(s, 'navigator', None)
+        original_observation = getattr(s, '_task_observation', None)
+        candidates = []
+        pending = {}
+        next_polls = {}
+        waiting_since = {}
+        waiting_keys = {}
+        started_at = time.monotonic()
+        try:
+            for configured in tuple(original_accounts):
+                account = s.by_name.get(configured.name, configured)
+                runner = self.runner_for(account)
+                record = runner.record('ranking')
+                if (record.get('status') == 'done' and record.get('task_completed')
+                        and record.get('home_returned') and record.get('zero_verified')
+                        and record.get('remaining') == 0):
+                    self.event('multi_solo_task_skip_done', account, task='ranking')
+                    continue
+                if (account.name not in self.startup_returned
+                        or account.name in self.manual_deferred
+                        or account.name in self.deferred
+                        or account.name in self.excluded
+                        or account.name in self.disconnected
+                        or 'ranking' in getattr(self, 'blocked_tasks', {}).get(account.name, ())):
+                    self.note_skipped(account, 'ranking')
+                    continue
+                candidates.append(account)
+                pending[account.name] = account
+            if not candidates:
+                self.event('multi_solo_ranking_no_eligible_accounts',
+                           detail='没有需要继续执行的排位赛账号')
+                return True
+
+            s.accounts = candidates
+            s._task_observation = None
+            while pending:
+                if s.check_pause_boundary():
+                    self.save_progress('paused')
+                    return False
+                progressed = False
+                for account in tuple(pending.values()):
+                    s.check_stop()
+                    if s.check_pause_boundary():
+                        self.save_progress('paused')
+                        return False
+                    now = time.monotonic()
+                    if now < next_polls.get(account.name, 0):
+                        continue
+                    runner = self.runner_for(account)
+                    runner.current = 'ranking'
+                    record = runner.record('ranking')
+                    phase = record.get('phase', 'ready')
+                    attempt = record.get('completed', 0) + 1
+                    action_base = f'daily_ranking_{attempt}'
+                    has_pending_action = any(
+                        s.state.action_status(account.name, action_base + '_' + suffix) == 'pending'
+                        for suffix in ('start', 'confirm', 'end', 'result', 'result_recover'))
+                    running = phase != 'ready' or has_pending_action
+                    s.navigator = runner
+                    runner.interleave_after_end = True
+                    persist_progress = True
+                    try:
+                        s.switch_account_for_combat(account, 'ranking', running=running)
+                        record.update(status='running', last_error='')
+                        runner.save()
+                        result = runner.ranking()
+                        if result in ('yield_after_end', 'yield_waiting_result'):
+                            if result == 'yield_after_end':
+                                record['ranking_interleave_wait_checks'] = 0
+                                waiting_since[account.name] = time.monotonic()
+                                waiting_keys[account.name] = (record.get('completed', 0), record.get('phase'))
+                                detail = '结束战斗动作已发送，立即切换账号；结果和剩余次数延后核实'
+                                event_name = 'multi_solo_ranking_end_sent_yield'
+                                progressed = True
+                            else:
+                                checks = int(record.get('ranking_interleave_wait_checks', 0)) + 1
+                                record['ranking_interleave_wait_checks'] = checks
+                                key = (record.get('completed', 0), record.get('phase'))
+                                if waiting_keys.get(account.name) != key:
+                                    waiting_since[account.name] = time.monotonic()
+                                    waiting_keys[account.name] = key
+                                if time.monotonic() - waiting_since.setdefault(account.name, time.monotonic()) >= 30:
+                                    raise hs.PendingError('排位结果连续30秒无进展；保留断点并继续其他账号')
+                                detail = '排位结果尚未稳定，已让出本轮继续处理其他账号'
+                                event_name = 'multi_solo_ranking_wait_yield'
+                                persist_progress = checks == 1 or checks % 5 == 0
+                            record.update(status='pending', task_completed=False, home_returned=False,
+                                          last_error=detail)
+                            next_polls[account.name] = time.monotonic() + .4
+                            if persist_progress or result == 'yield_after_end':
+                                runner.save()
+                                self.event(event_name, account, detail=detail)
+                        else:
+                            frame = s.capture()
+                            if not (s.main_ready(frame) and s.template(
+                                    'leaf_village_name_current.bmp', (1690, 110, 1920, 148),
+                                    frame, threshold=.92)[0]):
+                                runner.return_to_main()
+                                frame = s.capture()
+                            if not (s.main_ready(frame) and s.template(
+                                    'leaf_village_name_current.bmp', (1690, 110, 1920, 148),
+                                    frame, threshold=.92)[0]):
+                                raise hs.PendingError('排位次数归零后未确认木叶村主界面')
+                            if record.get('zero_verified') is not True or record.get('remaining') != 0:
+                                raise hs.PendingError('排位未正向确认剩余次数归零，不能标记完成')
+                            record.pop('ranking_interleave_wait_checks', None)
+                            record.update(status='done', task_completed=True, home_returned=True,
+                                          finished_at=hs.now_iso(), last_error='')
+                            runner.save()
+                            pending.pop(account.name, None)
+                            self.deferred.pop(account.name, None)
+                            self.deferred_at.pop(account.name, None)
+                            self.event('multi_solo_task_complete', account, task='ranking',
+                                       task_completed=True, home_returned=True, remaining=0)
+                            progressed = True
+                    except hs.AccountOffline as exc:
+                        self.skip_disconnected(account, 'ranking')
+                        pending.pop(account.name, None)
+                        progressed = True
+                    except hs.BattleStalled as exc:
+                        self.skip_stalled(account, 'ranking', exc)
+                        pending.pop(account.name, None)
+                        progressed = True
+                    except (hs.PendingError, hs.SafetyError) as exc:
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error=str(exc))
+                        runner.save()
+                        frame = s.capture()
+                        mapping = s._saved_tab_mapping()
+                        custody = (getattr(s, 'active', None) == account
+                                   and isinstance(mapping, dict) and mapping.get(account.name) == account.tab_x
+                                   and s._generic_active_tab_x(frame) == account.tab_x
+                                   and s._combat_active_visible('ranking', frame))
+                        if not custody and not s.ensure_account_main_before_release(account, 'ranking'):
+                            raise hs.LeaseBlocked(f'{account.name}排位异常后无法确认安全交接') from exc
+                        self.deferred[account.name] = 'ranking'
+                        self.deferred_at[account.name] = time.monotonic()
+                        self.event('multi_solo_ranking_stage_pending', account, detail=str(exc))
+                        pending.pop(account.name, None)
+                        progressed = True
+                    finally:
+                        runner.interleave_after_end = False
+                    if persist_progress:
+                        self.save_progress('ranking')
+                if not progressed:
+                    s.wait_interruptible(.4)
+            self.event('multi_solo_ranking_stage_elapsed',
+                       seconds=round(time.monotonic() - started_at, 3),
+                       accounts=[account.name for account in candidates])
+            return True
+        finally:
+            s.accounts = original_accounts
+            s.navigator = original_navigator
+            s._task_observation = original_observation
+
+    def _run_arena_stage(self):
+        """Start arena battles across eligible accounts first, then poll them cooperatively."""
+        s = self.scheduler
+        original_accounts = s.accounts
+        original_eligible = getattr(s, 'arena_eligible_accounts', None)
+        original_mode = getattr(s, 'arena_target_mode', None)
+        original_target = getattr(s, 'arena_victory_target', None)
+        original_limit = getattr(s, 'arena_attempt_limit', None)
+        candidates = []
+        runners = {}
+        started_at = time.monotonic()
+        try:
+            for configured in tuple(original_accounts):
+                account = s.by_name.get(configured.name, configured)
+                if account.name in getattr(self, 'arena_rewards_audited', set()):
+                    self.event('multi_solo_task_skip_done', account, task='arena',
+                               detail='本轮已核实战令归零和奖励领取，不重复开启')
+                    continue
+                if (account.name not in self.startup_returned
+                        or account.name in self.manual_deferred
+                        or account.name in self.deferred
+                        or account.name in self.excluded
+                        or account.name in self.disconnected):
+                    self.note_skipped(account, 'arena')
+                    runner = self.runner_for(account)
+                    record = runner.record('arena')
+                    if record.get('status') == 'running':
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error='账号本轮暂缓，未执行竞技场')
+                        runner.save()
+                    continue
+                if self.check_account(account):
+                    runner = self.runner_for(account)
+                    runners[account.name] = runner
+                    record = runner.record('arena')
+                    request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
+                    same_target = (isinstance(request, dict) and request.get('status') == 'done'
+                                   and request.get('target_mode', 'wins') == self.arena_target_mode
+                                   and (self.arena_target_mode == 'tickets'
+                                        or request.get('requested_wins') == self.arena_wins))
+                    if record.get('task_completed') and same_target:
+                        runner.current = 'arena'
+                        s.recheck_arena_rewards(account)
+                        frame = s.capture()
+                        if not (s._arena_daily_rewards_complete(account) and s.main_ready(frame)
+                                and s.template('leaf_village_name_current.bmp', (1690,110,1920,148), frame,
+                                               threshold=.92)[0]):
+                            raise hs.PendingError('已完成竞技场请求的奖励或回村复查尚未核实；禁止重建目标')
+                        if not hasattr(self, 'arena_rewards_audited'):
+                            self.arena_rewards_audited = set()
+                        self.arena_rewards_audited.add(account.name)
+                        record.update(status='done', home_returned=True, followup_check_due=False, last_error='')
+                        runner.save()
+                        self.event('multi_solo_task_skip_done', account, task='arena',
+                                   detail='持久完成请求已复查奖励及回村，不追加目标')
+                        continue
+                    candidates.append(account)
+                else:
+                    self.note_skipped(account, 'arena')
+                    runner = self.runner_for(account)
+                    record = runner.record('arena')
+                    if record.get('status') == 'running':
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error='账号身份或在线状态未确认，本轮暂缓竞技场')
+                        runner.save()
+            if not candidates:
+                self.event('multi_solo_arena_no_eligible_accounts',
+                           detail='没有通过身份与在线检查的竞技场账号')
+                return
+
+            s.accounts = candidates
+            s.arena_target_mode = self.arena_target_mode
+            s.arena_victory_target = self.arena_wins
+            requests = []
+            for account in candidates:
+                runner = runners[account.name]
+                runner.current = 'arena'
+                record = runner.record('arena')
+                record.update(status='running', task_completed=False, home_returned=False,
+                              followup_check_due=False, last_error='')
+                runner.save()
+                s.prepare_additional_arena_request(
+                    account, self.arena_wins, target_mode=self.arena_target_mode)
+                request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
+                if isinstance(request, dict):
+                    requests.append(request)
+                self.event('multi_solo_task_started', account, task='arena',
+                           target_mode=self.arena_target_mode,
+                           requested_wins=self.arena_wins,
+                           detail=('先逐号发起战斗，默认直到战令次数归零'
+                                   if self.arena_target_mode == 'tickets'
+                                   else f'先逐号发起战斗，每号新增确认胜场目标为{self.arena_wins}'))
+            if requests:
+                s.arena_attempt_limit = max(
+                    int(item.get('attempt_limit', hs.ARENA_MAX_ATTEMPTS))
+                    for item in requests if isinstance(item, dict))
+            pending_detail = ''
+            try:
+                s.run_combat_interleaved('arena')
+            except hs.PendingError as exc:
+                # A single unresolved slot must not stop polling/starting the
+                # other accounts. The scheduler has already quarantined unsafe
+                # slots and preserved their action ledgers.
+                pending_detail = str(exc)
+                self.event('multi_solo_arena_stage_pending', detail=pending_detail)
+
+            if not hasattr(self, 'arena_rewards_audited'):
+                self.arena_rewards_audited = set()
+            for account in candidates:
+                runner = runners[account.name]
+                record = runner.record('arena')
+                complete = s._account_module_complete(account, 'arena')
+                if complete:
+                    record.update(status='done', task_completed=True, home_returned=True,
+                                  followup_check_due=False, finished_at=hs.now_iso(), last_error='',
+                                  arena_requested_wins=self.arena_wins,
+                                  arena_target_mode=self.arena_target_mode)
+                    self.arena_rewards_audited.add(account.name)
+                    runner.save()
+                    self.event('multi_solo_task_complete', account, task='arena',
+                               task_completed=True, home_returned=True,
+                               target_mode=self.arena_target_mode,
+                               completed=s._arena_victory_count(account))
+                else:
+                    detail = pending_detail or '竞技场目标、战令归零或奖励领取尚未全部核实'
+                    record.update(status='pending', task_completed=False, home_returned=False,
+                                  followup_check_due=False, last_error=detail,
+                                  arena_requested_wins=self.arena_wins,
+                                  arena_target_mode=self.arena_target_mode)
+                    runner.save()
+                    self.event('multi_solo_task_pending', account, task='arena', detail=detail,
+                               target_mode=self.arena_target_mode)
+        finally:
+            s.accounts = original_accounts
+            if original_eligible is None:
+                if hasattr(s, 'arena_eligible_accounts'):
+                    delattr(s, 'arena_eligible_accounts')
+            else:
+                s.arena_eligible_accounts = original_eligible
+            if original_mode is None:
+                if hasattr(s, 'arena_target_mode'):
+                    delattr(s, 'arena_target_mode')
+            else:
+                s.arena_target_mode = original_mode
+            if original_target is None:
+                if hasattr(s, 'arena_victory_target'):
+                    delattr(s, 'arena_victory_target')
+            else:
+                s.arena_victory_target = original_target
+            if original_limit is None:
+                if hasattr(s, 'arena_attempt_limit'):
+                    delattr(s, 'arena_attempt_limit')
+            else:
+                s.arena_attempt_limit = original_limit
+            self.event('multi_solo_arena_stage_elapsed',
+                       seconds=round(time.monotonic() - started_at, 3),
+                       target_mode=self.arena_target_mode,
+                       accounts=[account.name for account in candidates])
+
     def _survival_followup(self, runner):
         """Revisit survival after the other solo tasks, using the real page state."""
         s, account = self.scheduler, runner.account
@@ -1070,6 +1528,31 @@ class MultiSoloRunner:
                     self.event('multi_solo_stage_finished', task=task,
                                seconds=round(time.monotonic()-stage_started, 3))
                     continue
+                if task == 'arena':
+                    self._run_arena_stage()
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
+                if task == 'survival':
+                    if not self._run_survival_stage():
+                        self.save_progress('paused')
+                        return 2
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
+                if task == 'ranking':
+                    if not self._run_ranking_stage():
+                        self.save_progress('paused')
+                        return 2
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
                 for configured in tuple(s.accounts):
                     s.check_stop()
                     account = s.by_name[configured.name]
@@ -1085,7 +1568,8 @@ class MultiSoloRunner:
                         continue
                     previous = self.runner_for(account).record(task)
                     if (task == 'arena' and previous.get('status') == 'done'
-                            and previous.get('arena_requested_wins', 5) != self.arena_wins):
+                            and (previous.get('arena_requested_wins', 5) != self.arena_wins
+                                 or previous.get('arena_target_mode', 'wins') != self.arena_target_mode)):
                         prior_request = s.state.global_state.get('arena_requests', {}).get(account.name)
                         if isinstance(prior_request, dict) and prior_request.get('status') != 'done':
                             prior_request.update(status='done', completed_at=previous.get('finished_at'))
@@ -1183,7 +1667,10 @@ def main():
     parser = argparse.ArgumentParser(description="共享窗口多账号单人日常")
     parser.add_argument("--tasks", nargs="+", choices=SOLO_OPTIONS,
                         default=list(DEFAULT_SOLO_OPTIONS))
-    parser.add_argument("--arena-wins", type=int, default=5)
+    parser.add_argument("--arena-wins", type=int, default=5,
+                        help="仅在 --arena-target-mode wins 时生效")
+    parser.add_argument("--arena-target-mode", choices=("tickets", "wins"), default="tickets",
+                        help="默认耗尽战令；wins 表示按指定新增胜场数停止")
     parser.add_argument("--account-count", type=int, default=None,
                         help="本轮要识别的账号数量；候选账号取配置TabAccountNames前N个")
     parser.add_argument("--formation", choices=("keep", "main", "fast"), default="keep")
@@ -1191,7 +1678,8 @@ def main():
     args = parser.parse_args()
     runner = MultiSoloRunner(args.tasks, config_path=args.config,
                              account_count=args.account_count,
-                             arena_wins=args.arena_wins, formation=args.formation,
+                             arena_wins=args.arena_wins, arena_target_mode=args.arena_target_mode,
+                             formation=args.formation,
                              event_sink=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True)
                              if str(event.get("event", "")).startswith("multi_solo_") else None)
     try:

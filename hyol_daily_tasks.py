@@ -97,9 +97,54 @@ class DailyScheduler(hs.Scheduler):
         return super()._team_activity_completion_verified(team, leader, spec)
 
     def _open_verified_survival(self, account):
+        # The multi-account interleaved scheduler owns one navigator per tab.
+        # Bind the correct account runner before entering its survival page.
+        runners = getattr(self, '_combat_navigators', {})
+        if account.name in runners:
+            self.navigator = runners[account.name]
+        if getattr(self, 'navigator', None) is None:
+            raise hs.PendingError('生存演习入口缺少当前账号的任务上下文')
         self.navigator.enter("survival")
 
+    def _ensure_survival_battle_x2(self, slot, frame=None):
+        """Set x2 only from positively matched controls; never toggle blindly."""
+        account = slot.account
+        frame = frame or self.capture()
+        run_index = 2 if self.state.action_status(account.name, 'survival_second_run_started') == 'done' else 1
+        action = f'survival_run_{run_index}_battle_speed_x2_{slot.next_index}'
+        roi = SPEED_ROI
+        if self.template('battle_speed_x2.png', roi, frame, threshold=.84)[0]:
+            if self.state.action_status(account.name, action) == 'pending':
+                self.commit_action(account, action, 'x2 button positively visible after the pending toggle')
+            return True
+        if not self.template('battle_speed_x1.png', roi, frame, threshold=.84)[0]:
+            return False
+        if not self._battle_auto_on_visible(frame):
+            return False
+        status = self.state.action_status(account.name, action)
+        if status == 'pending':
+            raise hs.PendingError('生存二倍速切换结果未核实；禁止重复点击切换按钮')
+        if status == 'done':
+            raise hs.PendingError('本场二倍速曾确认开启，但当前画面又显示x1；保留状态待核实')
+        anchors = ['battle_auto_on.bmp', 'battle_auto_on_current.bmp',
+                   'battle_auto_on_current_core.bmp', 'battle_speed_x1.png']
+        if not self.click_template(
+                account, 'battle_speed_x1.png', roi, 14, 14, action, anchors,
+                irreversible=True, threshold=.84, anchor_threshold=.90,
+                frame_predicate=lambda fresh:
+                    self._battle_auto_on_visible(fresh)
+                    and self.template('battle_speed_x1.png', roi, fresh, threshold=.84)[0]):
+            return False
+        if not self.wait_template('battle_speed_x2.png', roi, 1.2, threshold=.84):
+            raise hs.PendingError('生存二倍速切换已发送，但x2状态尚未确认')
+        self.commit_action(account, action, '生存战斗速度已从x1切换并确认x2')
+        self.event('survival_battle_speed_x2_verified', account, index=slot.next_index)
+        return True
+
     def _finish_survival_slot(self, slot):
+        runners = getattr(self, "_combat_navigators", {})
+        if slot.account.name in runners:
+            self.navigator = runners[slot.account.name]
         # The single-person daily target is one 220-point reward, not a reset.
         if slot.complete:
             return
@@ -156,11 +201,14 @@ def selected_sequence(task, selected_tasks=None):
 
 
 class DailyRunner:
-    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, managed_enabled=True):
-        if task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99 or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS or formation not in ("keep", "main", "fast"):
-            raise ValueError("任务无效，次数应为1—99，或0表示打到本日奖励次数归零")
+    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, arena_target_mode='tickets', managed_enabled=True):
+        if (task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99
+                or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS
+                or formation not in ("keep", "main", "fast")
+                or arena_target_mode not in ('tickets', 'wins')):
+            raise ValueError("任务、竞技场结束条件或次数无效")
         self.task, self.group_count = task, group_count
-        self.arena_wins = arena_wins
+        self.arena_wins, self.arena_target_mode = arena_wins, arena_target_mode
         if not isinstance(managed_enabled, bool):
             raise ValueError("最后托管选项必须为开启或关闭")
         self.managed_enabled = managed_enabled
@@ -191,12 +239,13 @@ class DailyRunner:
         self.wanted_selection_cancelled = False
 
     @classmethod
-    def for_bound_account(cls, scheduler, account, tasks, *, formation='keep', arena_wins=5, managed_enabled=True):
+    def for_bound_account(cls, scheduler, account, tasks, *, formation='keep', arena_wins=5, arena_target_mode='tickets', managed_enabled=True):
         """Share one verified account's task ledger without creating another worker."""
         runner = object.__new__(cls)
         runner.scheduler, runner.account = scheduler, account
         runner.task, runner.current = 'all', ''
         runner.group_count, runner.arena_wins = 0, arena_wins
+        runner.arena_target_mode = arena_target_mode
         runner.managed_enabled = managed_enabled
         runner.selected_tasks = tuple(tasks)
         runner.formation, runner.formation_checked = formation, False
@@ -897,8 +946,10 @@ class DailyRunner:
 
     def arena(self):
         self.scheduler.arena_victory_target = self.arena_wins
+        self.scheduler.arena_target_mode = self.arena_target_mode
         self.scheduler.accounts = [self.account]
-        self.scheduler.prepare_additional_arena_request(self.account, self.arena_wins)
+        self.scheduler.prepare_additional_arena_request(
+            self.account, self.arena_wins, target_mode=self.arena_target_mode)
         self.scheduler.run_combat_interleaved('arena')
         if self.scheduler.state.module_status(self.account.name, 'arena') != 'done':
             raise hs.PendingError('竞技场尚未核实每日目标')
@@ -1128,7 +1179,8 @@ class DailyClient(tk.Tk):
                                       config_path=self.config_path,
                                       generic_current_window=self.generic_current_window,
                                       selected_tasks=[key for key,value in self.task_options.items() if value.get()] if self.task_options else None,
-                                      arena_wins=self.arena_wins.get(),managed_enabled=self.managed_enabled.get())
+                                      arena_wins=self.arena_wins.get(),arena_target_mode='wins',
+                                      managed_enabled=self.managed_enabled.get())
         except (ValueError,tk.TclError) as exc:
             self.status.set(str(exc))
             return

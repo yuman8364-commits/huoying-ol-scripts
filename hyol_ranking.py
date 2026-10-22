@@ -124,8 +124,24 @@ def sent_result_can_reopen(r, rec):
         return False
 
 
+def _yield_waiting_result(r, rec, detail):
+    key = (rec.get('completed', 0), rec.get('phase', 'ready'))
+    if getattr(r, '_last_ranking_wait_yield_key', None) != key:
+        r.event('daily_ranking_waiting_result_yield', detail=detail)
+        r._last_ranking_wait_yield_key = key
+    return 'yield_waiting_result'
+
 def run(r):
     s, rec = r.scheduler, r.record('ranking')
+    if rec.get('phase', 'ready') == 'ready':
+        attempt = rec.get('completed', 0) + 1
+        base = f'daily_ranking_{attempt}'
+        pending = [base + '_' + suffix for suffix in ('start', 'confirm', 'end', 'result', 'result_recover')
+                   if s.state.action_status(r.account.name, base + '_' + suffix) == 'pending']
+        if pending:
+            raise hs.PendingError(
+                '排位动作账本仍有未决点击但阶段记录为ready；保留断点，禁止重复开战：' + ','.join(pending))
+
     manual_result = rec.get('manual_defeat_result_evidence')
     recover_manual_result = (rec.get('phase') == 'confirmed'
         and manual_result_witness_valid(rec))
@@ -153,8 +169,12 @@ def run(r):
                 and not r.visible('ranking_page.bmp', PAGE, frame, .95)):
             if transition_loading_visible(frame):
                 main_seen_at = None
+                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                    return _yield_waiting_result(r, rec, '排位结算页面正在加载，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
+            if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                return _yield_waiting_result(r, rec, '排位结果页尚未稳定，先轮询其他账号')
             if main_seen_at is None:
                 main_seen_at = time.monotonic()
             if time.monotonic() - main_seen_at < 3:
@@ -165,10 +185,13 @@ def run(r):
         main_seen_at = None
         if r.visible('ranking_page.bmp', PAGE, frame, .95) and not r.visible('ranking_power_warning.bmp',(790,505,1130,560),frame,.95):
             try:
-                count = stable_remaining(r)
+                count = stable_remaining(r, seconds=(1.5 if getattr(r, 'interleave_after_end', False)
+                                                   and phase in ('end_sent', 'result_sent') else 8))
             except hs.PendingError:
                 if phase == 'ready':
                     raise
+                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                    return _yield_waiting_result(r, rec, '排位剩余次数暂不可读，先轮询其他账号')
                 # The challenge starts between two captures. Observe the
                 # existing attempt; never interpret a repaint as zero/new work.
                 s.wait_interruptible(.4)
@@ -179,6 +202,8 @@ def run(r):
                 continue
             if phase != 'ready':
                 if count == rec.get('before'):
+                    if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                        return _yield_waiting_result(r, rec, '结算后的剩余次数尚未变化，先轮询其他账号')
                     s.wait_interruptible(.4)
                     continue
                 manual_decrement = (phase == 'confirmed'
@@ -227,6 +252,8 @@ def run(r):
             deadline=time.monotonic()+60
         elif r.visible('ranking_result_confirm.bmp',RESULT,frame,.95) and r.visible('ranking_result_stats.bmp',(890,605,1035,653),frame,.95):
             if phase == 'result_sent' or (phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'pending'):
+                if getattr(r, 'interleave_after_end', False):
+                    return _yield_waiting_result(r, rec, '结果确认仍在处理，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
             if phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'new':
@@ -241,7 +268,7 @@ def run(r):
                         completed=index)
             # The result button can appear while the final skill dialogue still
             # intercepts mouse input. Let that animation settle before one click.
-            s.wait_interruptible(3)
+            s.wait_interruptible(.4 if getattr(r, 'interleave_after_end', False) else 3)
             if not r.visible('ranking_result_confirm.bmp',RESULT,threshold=.95):
                 continue
             rec['phase']='result_pending'
@@ -266,5 +293,14 @@ def run(r):
                 continue  # Button repainted before input; observe the original attempt.
             rec['phase']='end_sent'
             r.save()
+            if getattr(r, 'interleave_after_end', False):
+                # Multi-account mode yields immediately after the guarded end
+                # click. The result dialog/counter is reconciled on this
+                # account's next round-robin turn; never replay the end click.
+                r.event('daily_ranking_end_sent_yield',
+                        detail='结束战斗动作已发送，结果留待下轮核实')
+                return 'yield_after_end'
             deadline=time.monotonic()+60
+        if getattr(r, 'interleave_after_end', False) and rec.get('phase', phase) in ('end_sent', 'result_sent'):
+            return _yield_waiting_result(r, rec, '当前账号尚无可核实的排位结算状态，先轮询其他账号')
         s.wait_interruptible(.4)
