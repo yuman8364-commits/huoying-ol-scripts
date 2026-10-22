@@ -19,6 +19,24 @@ import hyol_scheduler as hs
 
 
 class SchedulerUnitTests(unittest.TestCase):
+    def test_ranking_result_modal_is_a_valid_combat_switch_target(self):
+        scheduler = object.__new__(hs.Scheduler)
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler._battle_hud_visible = Mock(return_value=False)
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name == 'ranking_result_confirm.bmp', 1.0, 0, 0))
+
+        self.assertTrue(hs.Scheduler._combat_active_visible(scheduler, 'ranking', frame))
+
+    def test_ranking_ready_page_requires_page_and_counter_anchors(self):
+        scheduler = object.__new__(hs.Scheduler)
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name in ('ranking_page.bmp', 'ranking_counter_label.bmp'),
+                                   1.0, 0, 0))
+
+        self.assertTrue(hs.Scheduler._combat_ready_visible(scheduler, 'ranking', frame))
+
     def test_wanted_empty_ignores_green_map_left_border(self):
         frame = Image.new('RGB',(1920,1032),(70,70,70))
         for x in range(1715,1725):
