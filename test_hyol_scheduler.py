@@ -19,6 +19,26 @@ import hyol_scheduler as hs
 
 
 class SchedulerUnitTests(unittest.TestCase):
+    def test_run_context_allows_hidden_tab_only_for_running_combat_slots(self):
+        scheduler = object.__new__(hs.Scheduler)
+        account = hs.Account(1, 'bound-account', 180)
+        frame = Image.new('RGB', (1920, 1032))
+        context = SimpleNamespace(
+            binding={'centers': [180]}, probing=False,
+            resolve=Mock(return_value=account), select=Mock(return_value=frame))
+        scheduler.run_context = context
+
+        self.assertIs(frame, hs.Scheduler.switch_account_for_combat(
+            scheduler, account, 'arena', running=True))
+        context.select.assert_called_once_with(
+            scheduler, account, allow_hidden=True, allow_transition=True)
+
+        context.select.reset_mock()
+        self.assertIs(frame, hs.Scheduler.switch_account_for_combat(
+            scheduler, account, 'arena', running=False))
+        context.select.assert_called_once_with(
+            scheduler, account, allow_hidden=False, allow_transition=False)
+
     def test_ranking_result_modal_is_a_valid_combat_switch_target(self):
         scheduler = object.__new__(hs.Scheduler)
         frame = Image.new('RGB', (1920, 1032))
