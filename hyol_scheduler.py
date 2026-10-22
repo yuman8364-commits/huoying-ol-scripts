@@ -2045,12 +2045,7 @@ class Scheduler:
     def switch_account(self, account: Account, verify: bool = True) -> Image.Image:
         context = getattr(self, 'run_context', None)
         if context and context.binding and not context.probing:
-            # A running battle/result modal hides the in-game identity strip.
-            # In the full client, permit tab-title-verified observation of that
-            # hidden page so the round robin can switch away and revisit it.
-            # Content actions still require their own fresh identity/page gates.
-            return context.select(self, account,
-                                  allow_hidden=running, allow_transition=running)
+            return context.select(self, account)
         # Click near the upper tab body rather than the close glyph.  The
         # browser recalculates tab widths as titles repaint; using the title
         # band keeps a fixed enrolled x-coordinate from landing on an adjacent
@@ -4426,6 +4421,13 @@ class Scheduler:
             self._record_tab_binding(account)
             self.event("combat_account_bound", account, mode=mode, running=running, tab_click_suppressed=True)
             return frame
+        context = getattr(self, 'run_context', None)
+        if context and context.binding and not context.probing and not current_only:
+            # Full-client battle/result modals hide the in-game identity strip.
+            # The bound tab-title mask authorizes observation/switching only;
+            # subsequent content clicks still require fresh page and identity gates.
+            return context.select(self, account,
+                                  allow_hidden=running, allow_transition=running)
         if not running:
             if (getattr(self, 'active', None) == account
                     and self._saved_tab_mapping().get(account.name) == account.tab_x):
