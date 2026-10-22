@@ -1655,10 +1655,13 @@ class SchedulerUnitTests(unittest.TestCase):
     def test_interleaved_combat_starts_each_slot_before_preparing_next_slot(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
         body = source.split("def run_combat_interleaved", 1)[1].split("def module_arena", 1)[0]
-        first_round = body.split("while not all(slot.complete for slot in slots):", 1)[0]
-        self.assertLess(first_round.index("self._prepare_arena_slot(slot)"), first_round.index("self._start_arena_slot(slot)"))
-        self.assertLess(first_round.index("self._prepare_survival_slot(slot)"), first_round.index("self._start_survival_slot(slot)"))
-        self.assertIn("identity/template failure could leave every earlier tab", first_round)
+        first_pass = body.split("pause_requested = False", 1)[0]
+        self.assertLess(first_pass.index("self._prepare_arena_slot(slot)"), first_pass.index("self._start_arena_slot(slot)"))
+        self.assertLess(first_pass.index("self._prepare_survival_slot(slot)"), first_pass.index("self._start_survival_slot(slot)"))
+        self.assertIn("combat_battle_start_requested", source)
+        self.assertIn("ARENA_POLL_INTERVAL_SECONDS", first_pass)
+        self.assertIn("if mode == 'arena' and time.monotonic() < slot.next_poll_at:", body)
+        self.assertIn("while any(not slot.complete and not slot.unavailable for slot in slots):", body)
 
     def test_survival_selected_fight_page_is_resumable_and_start_is_audited(self) -> None:
         source = Path(hs.__file__).read_text(encoding="utf-8")
