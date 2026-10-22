@@ -969,6 +969,7 @@ class MultiSoloRunner:
                                 raise hs.PendingError('排位次数归零后未确认木叶村主界面')
                             if record.get('zero_verified') is not True or record.get('remaining') != 0:
                                 raise hs.PendingError('排位未正向确认剩余次数归零，不能标记完成')
+                            record.pop('ranking_interleave_wait_checks', None)
                             record.update(status='done', task_completed=True, home_returned=True,
                                           finished_at=hs.now_iso(), last_error='')
                             runner.save()
@@ -977,7 +978,6 @@ class MultiSoloRunner:
                             self.deferred_at.pop(account.name, None)
                             self.event('multi_solo_task_complete', account, task='ranking',
                                        task_completed=True, home_returned=True, remaining=0)
-                            record.pop('ranking_interleave_wait_checks', None)
                             progressed = True
                     except hs.AccountOffline as exc:
                         self.skip_disconnected(account, 'ranking')
