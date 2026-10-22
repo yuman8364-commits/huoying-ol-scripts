@@ -1149,6 +1149,7 @@ class CombatSlot:
     next_poll_at: float = 0.0
     pending_checks: int = 0
     start_confirmed: bool = False
+    start_requested_at: float | None = None
     needs_prepare: bool = False
 
 
@@ -4898,6 +4899,7 @@ class Scheduler:
         slot.victory_confirmed = False
         slot.defeat_confirmed = False
         slot.start_confirmed = False
+        slot.start_requested_at = time.monotonic()
         slot.progress_phase = ""
         slot.progress_changed_at = 0.0
         slot.battle_watchdog = BattleWatchdog.from_config(getattr(self, 'config', {}), started_at=time.monotonic())
@@ -5097,7 +5099,21 @@ class Scheduler:
             status = self.state.action_status(account.name, action)
             slot.victory_confirmed = slot.victory_confirmed or self._arena_attempt_victory_confirmed(account, slot.next_index)
             if not slot.victory_confirmed and not slot.defeat_confirmed:
-                raise PendingError("arena returned without a positively confirmed victory or defeat")
+                if not slot.start_confirmed:
+                    # A just-clicked battle can briefly leave the ready-page
+                    # controls visible while the matching overlay is painting.
+                    # Keep polling this slot without treating that transition
+                    # frame as an unknown result or quarantining it after 6s.
+                    if slot.start_requested_at is None:
+                        slot.start_requested_at = time.monotonic()
+                    elapsed = time.monotonic() - slot.start_requested_at
+                    if elapsed < 30:
+                        self.event('combat_battle_start_transition_pending', account,
+                                   mode='arena', index=slot.next_index,
+                                   elapsed_seconds=round(elapsed, 2), timeout_seconds=30)
+                        self.wait_interruptible(0.4)
+                        return
+                raise PendingError("arena start was requested but no matching/loading/battle page or result was confirmed; refusing duplicate start")
             if status == "pending":
                 outcome = "returned to arena page after positively confirmed victory" if slot.victory_confirmed else "returned to arena page after confirmed defeat"
                 self.commit_action(account, action, outcome)
@@ -5110,6 +5126,7 @@ class Scheduler:
             slot.victory_confirmed = False
             slot.defeat_confirmed = False
             slot.start_confirmed = False
+            slot.start_requested_at = None
             slot.pending_checks = 0
             slot.next_poll_at = 0.0
             self.event(
@@ -6015,6 +6032,8 @@ class Scheduler:
                     action = self._combat_action_name('arena', slot.next_index)
                     if self.state.action_status(slot.account.name, action) == 'pending':
                         slot.running = True
+                        if slot.start_requested_at is None:
+                            slot.start_requested_at = time.monotonic()
                     if not slot.running:
                         if (self.active == slot.account
                                 and not self.ensure_account_main_before_release(slot.account, mode)):
@@ -6090,6 +6109,8 @@ class Scheduler:
                         action = self._combat_action_name('arena', slot.next_index)
                         if self.state.action_status(slot.account.name, action) == 'pending':
                             slot.running = True
+                            if slot.start_requested_at is None:
+                                slot.start_requested_at = time.monotonic()
                         slot.pending_checks += 1
                         if slot.running:
                             slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
