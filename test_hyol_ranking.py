@@ -142,6 +142,24 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(len(r.actions),15)
         self.assertTrue(all(value=='done' for value in r.actions.values()))
 
+    def test_multi_account_mode_yields_immediately_after_end_click(self):
+        r = self.runner(2)
+        r.mode = 'battle'
+        r.rec.update(before=2, phase='confirmed', status='running')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending')
+        r.interleave_after_end = True
+
+        result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_after_end')
+        self.assertEqual(r.rec['phase'], 'end_sent')
+        self.assertEqual([name for name, _, _ in r.clicks],
+                         ['ranking_end_battle.bmp'])
+        self.assertEqual(r.actions['daily_ranking_1_end'], 'pending')
+        self.assertNotIn('daily_ranking_1_result', r.actions)
+        r.save.assert_called()
+
     def test_preexisting_zero_never_starts_battle(self):
         r=self.runner(0)
         with patch.object(ranking,'stable_remaining',return_value=0):
