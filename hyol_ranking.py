@@ -169,7 +169,9 @@ def run(r):
         main_seen_at = None
         if r.visible('ranking_page.bmp', PAGE, frame, .95) and not r.visible('ranking_power_warning.bmp',(790,505,1130,560),frame,.95):
             try:
-                count = stable_remaining(r)
+                count = stable_remaining(r, seconds=(1.5 if getattr(r, 'interleave_after_end', False)
+
+                                                   and phase in ('end_sent', 'result_sent') else 8))
             except hs.PendingError:
                 if phase == 'ready':
                     raise
@@ -257,7 +259,7 @@ def run(r):
                         completed=index)
             # The result button can appear while the final skill dialogue still
             # intercepts mouse input. Let that animation settle before one click.
-            s.wait_interruptible(3)
+            s.wait_interruptible(.4 if getattr(r, 'interleave_after_end', False) else 3)
             if not r.visible('ranking_result_confirm.bmp',RESULT,threshold=.95):
                 continue
             rec['phase']='result_pending'
