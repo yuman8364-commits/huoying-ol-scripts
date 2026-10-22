@@ -5866,9 +5866,12 @@ class Scheduler:
                     slot.start_requested_at = time.monotonic()
                 elapsed = time.monotonic() - slot.start_requested_at
                 if elapsed < 30:
-                    self.event('survival_battle_start_transition_pending', account,
-                               index=slot.next_index, elapsed_seconds=round(elapsed, 2),
-                               timeout_seconds=30, duplicate_click=False)
+                    last_notice = getattr(slot, 'last_start_transition_event_at', 0.0)
+                    if not last_notice or time.monotonic() - last_notice >= 5:
+                        self.event('survival_battle_start_transition_pending', account,
+                                   index=slot.next_index, elapsed_seconds=round(elapsed, 2),
+                                   timeout_seconds=30, duplicate_click=False)
+                        slot.last_start_transition_event_at = time.monotonic()
                     self.wait_interruptible(.4)
                     return
                 raise PendingError('生存开战点击已发送，但30秒内未确认离开开战页；保留待处理，不重复点击')
