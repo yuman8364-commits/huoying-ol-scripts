@@ -25,7 +25,6 @@ class RunRequest:
     tasks: tuple[str, ...] = DEFAULT_SOLO_OPTIONS
     account_count: int = 6
     arena_wins: int = 5
-    arena_target_mode: str = 'tickets'
     formation: str = 'keep'
     leader: int = 1
     leaders: tuple[int, ...] = ()
@@ -35,6 +34,7 @@ class RunRequest:
     bond_count: int = 5
     new_bond_round: bool = False
     final_managed: bool = True
+    arena_target_mode: str = 'tickets'
 
     def __post_init__(self):
         if self.mode not in MODES:
