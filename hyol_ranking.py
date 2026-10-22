@@ -126,6 +126,15 @@ def sent_result_can_reopen(r, rec):
 
 def run(r):
     s, rec = r.scheduler, r.record('ranking')
+    if rec.get('phase', 'ready') == 'ready':
+        attempt = rec.get('completed', 0) + 1
+        base = f'daily_ranking_{attempt}'
+        pending = [base + '_' + suffix for suffix in ('start', 'confirm', 'end', 'result', 'result_recover')
+                   if s.state.action_status(r.account.name, base + '_' + suffix) == 'pending']
+        if pending:
+            raise hs.PendingError(
+                '排位动作账本仍有未决点击但阶段记录为ready；保留断点，禁止重复开战：' + ','.join(pending))
+
     manual_result = rec.get('manual_defeat_result_evidence')
     recover_manual_result = (rec.get('phase') == 'confirmed'
         and manual_result_witness_valid(rec))
