@@ -86,6 +86,8 @@ class MultiSoloTests(unittest.TestCase):
                 if count['value'] == 1:
                     record.update(phase='end_sent', status='running')
                     return 'yield_after_end'
+                if count['value'] == 2:
+                    return 'yield_waiting_result'
                 record.update(phase='ready', zero_verified=True, remaining=0, completed=2)
                 return None
             runners[account.name] = SimpleNamespace(
@@ -119,6 +121,7 @@ class MultiSoloTests(unittest.TestCase):
         self.assertTrue(coordinator._run_ranking_stage())
 
         self.assertEqual(call_order, [accounts[0].name, accounts[1].name,
+                                      accounts[0].name, accounts[1].name,
                                       accounts[0].name, accounts[1].name])
         self.assertEqual([call.args[0].name for call in scheduler.switch_account_for_combat.call_args_list],
                          call_order)
