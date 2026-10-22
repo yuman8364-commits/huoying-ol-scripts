@@ -12,6 +12,48 @@ import hyol_scheduler as hs
 
 
 class MultiSoloTests(unittest.TestCase):
+    def test_arena_stage_does_not_restart_accounts_already_audited(self):
+        coordinator = object.__new__(multi.MultiSoloRunner)
+        audited = hs.Account(1, ROLE_A, 180)
+        pending = hs.Account(2, ROLE_B, 310)
+        state = SimpleNamespace(global_state={'arena_requests': {}})
+        pending_runner = Mock(account=pending, current=None)
+        pending_record = {'status': 'new'}
+        pending_runner.record.return_value = pending_record
+        scheduler = SimpleNamespace(
+            accounts=[audited, pending],
+            by_name={audited.name: audited, pending.name: pending},
+            state=state,
+            prepare_additional_arena_request=Mock(),
+            run_combat_interleaved=Mock(),
+            _account_module_complete=Mock(return_value=False),
+            _arena_victory_count=Mock(return_value=0),
+        )
+        def prepare(account, wins, *, target_mode):
+            state.global_state['arena_requests'][account.name] = {
+                'status': 'running', 'attempt_limit': 10, 'target_mode': target_mode,
+            }
+        scheduler.prepare_additional_arena_request.side_effect = prepare
+        coordinator.scheduler = scheduler
+        coordinator.startup_returned = {audited.name, pending.name}
+        coordinator.manual_deferred = set()
+        coordinator.deferred = {}
+        coordinator.excluded = set()
+        coordinator.disconnected = set()
+        coordinator.arena_rewards_audited = {audited.name}
+        coordinator.arena_target_mode = 'tickets'
+        coordinator.arena_wins = 5
+        coordinator.check_account = Mock(return_value=True)
+        coordinator.note_skipped = Mock()
+        coordinator.runner_for = Mock(return_value=pending_runner)
+        coordinator.event = Mock()
+        coordinator._run_arena_stage()
+        scheduler.prepare_additional_arena_request.assert_called_once_with(
+            pending, 5, target_mode='tickets')
+        scheduler.run_combat_interleaved.assert_called_once_with('arena')
+        self.assertEqual('pending', pending_record['status'])
+        self.assertEqual(1, coordinator.runner_for.call_count)
+
     def test_scheduler_accepts_seven_configured_solo_identity_candidates(self):
         names = [f'账号{i}' for i in range(7)]
         config = {'AccountMode': 'tab6', 'TabAccountNames': ','.join(names),
