@@ -266,5 +266,12 @@ def run(r):
                 continue  # Button repainted before input; observe the original attempt.
             rec['phase']='end_sent'
             r.save()
+            if getattr(r, 'interleave_after_end', False):
+                # Multi-account mode yields immediately after the guarded end
+                # click. The result dialog/counter is reconciled on this
+                # account's next round-robin turn; never replay the end click.
+                r.event('daily_ranking_end_sent_yield',
+                        detail='结束战斗动作已发送，结果留待下轮核实')
+                return 'yield_after_end'
             deadline=time.monotonic()+60
         s.wait_interruptible(.4)
