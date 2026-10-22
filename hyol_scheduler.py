@@ -4243,9 +4243,9 @@ class Scheduler:
             for index in range(1, limit + 1):
                 if self.state.action_status(account.name, self._combat_action_name(mode, index)) == "pending":
                     return index
-            goal_complete = (self._arena_goal_complete(account)
-                             if getattr(self, 'arena_target_mode', 'wins') == 'tickets'
-                             else self._arena_victory_confirmed(account))
+            # Completion is account-scoped: each account owns its target mode
+            # and ticket/win request record.
+            goal_complete = self._arena_goal_complete(account)
             if goal_complete and self._arena_daily_rewards_complete(account):
                 return limit + 1
             # ``arena_daily_victory`` is an old daily-task marker.  It cannot
