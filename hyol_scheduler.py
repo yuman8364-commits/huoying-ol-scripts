@@ -6002,8 +6002,9 @@ class Scheduler:
                     action = self._combat_action_name('arena', slot.next_index)
                     if self.state.action_status(slot.account.name, action) == 'pending':
                         slot.running = True
-                    if self.active == slot.account and not slot.running:
-                        if not self.ensure_account_main_before_release(slot.account, mode):
+                    if not slot.running:
+                        if (self.active == slot.account
+                                and not self.ensure_account_main_before_release(slot.account, mode)):
                             raise LeaseBlocked(f"{mode} preparation did not return through a verified main page") from exc
                         slot.needs_prepare = True
                     slot.pending_checks += 1
