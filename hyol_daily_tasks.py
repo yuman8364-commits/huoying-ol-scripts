@@ -97,9 +97,53 @@ class DailyScheduler(hs.Scheduler):
         return super()._team_activity_completion_verified(team, leader, spec)
 
     def _open_verified_survival(self, account):
+        # The multi-account interleaved scheduler owns one navigator per tab.
+        # Bind the correct account runner before entering its survival page.
+        runners = getattr(self, '_combat_navigators', {})
+        if account.name in runners:
+            self.navigator = runners[account.name]
+        if getattr(self, 'navigator', None) is None:
+            raise hs.PendingError('生存演习入口缺少当前账号的任务上下文')
         self.navigator.enter("survival")
 
+    def _ensure_survival_battle_x2(self, slot, frame=None):
+        """Set x2 only from positively matched controls; never toggle blindly."""
+        account = slot.account
+        frame = frame or self.capture()
+        action = f'survival_battle_speed_x2_{slot.next_index}'
+        roi = SPEED_ROI
+        if self.template('battle_speed_x2.png', roi, frame, threshold=.84)[0]:
+            if self.state.action_status(account.name, action) == 'pending':
+                self.commit_action(account, action, 'x2 button positively visible after the pending toggle')
+            return True
+        if not self.template('battle_speed_x1.png', roi, frame, threshold=.84)[0]:
+            return False
+        if not self._battle_auto_on_visible(frame):
+            return False
+        status = self.state.action_status(account.name, action)
+        if status == 'pending':
+            raise hs.PendingError('生存二倍速切换结果未核实；禁止重复点击切换按钮')
+        if status == 'done':
+            raise hs.PendingError('本场二倍速曾确认开启，但当前画面又显示x1；保留状态待核实')
+        anchors = ['battle_auto_on.bmp', 'battle_auto_on_current.bmp',
+                   'battle_auto_on_current_core.bmp', 'battle_speed_x1.png']
+        if not self.click_template(
+                account, 'battle_speed_x1.png', roi, 14, 14, action, anchors,
+                irreversible=True, threshold=.84, anchor_threshold=.90,
+                frame_predicate=lambda fresh:
+                    self._battle_auto_on_visible(fresh)
+                    and self.template('battle_speed_x1.png', roi, fresh, threshold=.84)[0]):
+            return False
+        if not self.wait_template('battle_speed_x2.png', roi, 1.2, threshold=.84):
+            raise hs.PendingError('生存二倍速切换已发送，但x2状态尚未确认')
+        self.commit_action(account, action, '生存战斗速度已从x1切换并确认x2')
+        self.event('survival_battle_speed_x2_verified', account, index=slot.next_index)
+        return True
+
     def _finish_survival_slot(self, slot):
+        runners = getattr(self, "_combat_navigators", {})
+        if slot.account.name in runners:
+            self.navigator = runners[slot.account.name]
         # The single-person daily target is one 220-point reward, not a reset.
         if slot.complete:
             return
