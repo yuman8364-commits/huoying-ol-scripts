@@ -294,6 +294,10 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn("return 'tickets_exhausted'", selector)
         start = source.split('def _start_arena_slot', 1)[1].split('def _arena_opening_once', 1)[0]
         self.assertIn('combat_battle_start_requested', start)
+        self.assertIn('start_requested_at', start)
+        poll = source.split('def _poll_arena_slot', 1)[1].split('def _finish_arena_slot', 1)[0]
+        self.assertIn('combat_battle_start_transition_pending', poll)
+        self.assertIn('elapsed < 30', poll)
         self.assertNotIn('transition_deadline', start)
 
     def test_running_battle_waits_through_transient_missing_anchor(self) -> None:
