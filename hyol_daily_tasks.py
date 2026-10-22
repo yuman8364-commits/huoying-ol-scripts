@@ -156,11 +156,14 @@ def selected_sequence(task, selected_tasks=None):
 
 
 class DailyRunner:
-    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, managed_enabled=True):
-        if task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99 or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS or formation not in ("keep", "main", "fast"):
-            raise ValueError("任务无效，次数应为1—99，或0表示打到本日奖励次数归零")
+    def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, arena_target_mode='tickets', managed_enabled=True):
+        if (task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99
+                or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS
+                or formation not in ("keep", "main", "fast")
+                or arena_target_mode not in ('tickets', 'wins')):
+            raise ValueError("任务、竞技场结束条件或次数无效")
         self.task, self.group_count = task, group_count
-        self.arena_wins = arena_wins
+        self.arena_wins, self.arena_target_mode = arena_wins, arena_target_mode
         if not isinstance(managed_enabled, bool):
             raise ValueError("最后托管选项必须为开启或关闭")
         self.managed_enabled = managed_enabled
@@ -191,12 +194,13 @@ class DailyRunner:
         self.wanted_selection_cancelled = False
 
     @classmethod
-    def for_bound_account(cls, scheduler, account, tasks, *, formation='keep', arena_wins=5, managed_enabled=True):
+    def for_bound_account(cls, scheduler, account, tasks, *, formation='keep', arena_wins=5, arena_target_mode='tickets', managed_enabled=True):
         """Share one verified account's task ledger without creating another worker."""
         runner = object.__new__(cls)
         runner.scheduler, runner.account = scheduler, account
         runner.task, runner.current = 'all', ''
         runner.group_count, runner.arena_wins = 0, arena_wins
+        runner.arena_target_mode = arena_target_mode
         runner.managed_enabled = managed_enabled
         runner.selected_tasks = tuple(tasks)
         runner.formation, runner.formation_checked = formation, False
@@ -897,8 +901,10 @@ class DailyRunner:
 
     def arena(self):
         self.scheduler.arena_victory_target = self.arena_wins
+        self.scheduler.arena_target_mode = self.arena_target_mode
         self.scheduler.accounts = [self.account]
-        self.scheduler.prepare_additional_arena_request(self.account, self.arena_wins)
+        self.scheduler.prepare_additional_arena_request(
+            self.account, self.arena_wins, target_mode=self.arena_target_mode)
         self.scheduler.run_combat_interleaved('arena')
         if self.scheduler.state.module_status(self.account.name, 'arena') != 'done':
             raise hs.PendingError('竞技场尚未核实每日目标')
