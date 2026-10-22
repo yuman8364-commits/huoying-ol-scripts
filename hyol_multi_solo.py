@@ -1448,6 +1448,24 @@ class MultiSoloRunner:
                                seconds=round(time.monotonic() - stage_started, 3))
                     self.save_progress(task)
                     continue
+                if task == 'survival':
+                    if not self._run_survival_stage():
+                        self.save_progress('paused')
+                        return 2
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
+                if task == 'ranking':
+                    if not self._run_ranking_stage():
+                        self.save_progress('paused')
+                        return 2
+                    self.event('multi_solo_stage_finished', task=task,
+                               excluded=sorted(self.excluded), disconnected=sorted(self.disconnected),
+                               seconds=round(time.monotonic() - stage_started, 3))
+                    self.save_progress(task)
+                    continue
                 for configured in tuple(s.accounts):
                     s.check_stop()
                     account = s.by_name[configured.name]
