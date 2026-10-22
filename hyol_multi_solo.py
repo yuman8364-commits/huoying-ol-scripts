@@ -924,12 +924,22 @@ class MultiSoloRunner:
                         record.update(status='running', last_error='')
                         runner.save()
                         result = runner.ranking()
-                        if result == 'yield_after_end':
+                        if result in ('yield_after_end', 'yield_waiting_result'):
+                            if result == 'yield_after_end':
+                                record['ranking_interleave_wait_checks'] = 0
+                                detail = '结束战斗动作已发送，立即切换账号；结果和剩余次数延后核实'
+                                event_name = 'multi_solo_ranking_end_sent_yield'
+                            else:
+                                checks = int(record.get('ranking_interleave_wait_checks', 0)) + 1
+                                record['ranking_interleave_wait_checks'] = checks
+                                if checks >= 30:
+                                    raise hs.PendingError('排位结果连续30轮未能核实；保留断点并继续其他账号')
+                                detail = '排位结果尚未稳定，已让出本轮继续处理其他账号'
+                                event_name = 'multi_solo_ranking_wait_yield'
                             record.update(status='pending', task_completed=False, home_returned=False,
-                                          last_error='结束战斗动作已发送，结果留待下一轮核实')
+                                          last_error=detail)
                             runner.save()
-                            self.event('multi_solo_ranking_end_sent_yield', account,
-                                       detail='已发送结束战斗，立即切换账号；结果和剩余次数延后核实')
+                            self.event(event_name, account, detail=detail)
                         else:
                             frame = s.capture()
                             if not (s.main_ready(frame) and s.template(
