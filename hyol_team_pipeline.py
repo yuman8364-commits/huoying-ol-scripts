@@ -1249,7 +1249,7 @@ class LeaderActivityRunner(DailyRunner):
 
 class TeamPipelineRunner:
     def __init__(self, leaders=(), tasks=TEAM_TASKS, solo_tasks=DEFAULT_SOLO_OPTIONS,
-                 *, arena_wins=5, formation='keep', managed_enabled=True, event_sink=None, root=hs.ROOT,
+                 *, arena_wins=5, arena_target_mode='tickets', formation='keep', managed_enabled=True, event_sink=None, root=hs.ROOT,
                  run_context=None):
         if (len(leaders) > 6 or len(set(leaders)) != len(leaders)
                 or any(type(slot) is not int or slot not in range(1,7) for slot in leaders)):
@@ -1259,12 +1259,14 @@ class TeamPipelineRunner:
         if not solo_tasks or len(set(solo_tasks)) != len(solo_tasks) or any(t not in SOLO_OPTIONS for t in solo_tasks):
             raise ValueError('请至少选择一项有效的后续单人任务')
         if type(arena_wins) is not int or not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
-            raise ValueError('竞技场追加胜场须为1～10')
+            raise ValueError('竞技场辅助胜场数须为1～10')
+        if arena_target_mode not in ('tickets', 'wins'):
+            raise ValueError('竞技场结束条件须为战令归零或指定胜场')
         if formation not in ('keep','main','fast') or type(managed_enabled) is not bool:
             raise ValueError('阵容或最后托管选项无效')
         self.leaders = tuple(leaders)
         self.tasks = tuple(t for t in SUPPORTED_TEAM_TASKS if t in tasks)
-        self.solo_tasks, self.arena_wins, self.formation = tuple(solo_tasks), arena_wins, formation
+        self.solo_tasks, self.arena_wins, self.arena_target_mode, self.formation = tuple(solo_tasks), arena_wins, arena_target_mode, formation
         self.managed_enabled, self.root, self.sink = managed_enabled, Path(root), event_sink
         from hyol_run_context import RunContext
         self.run_context = run_context or RunContext.create(self.root)
@@ -1289,7 +1291,8 @@ class TeamPipelineRunner:
 
     def request_key(self):
         return dict(leaders=list(self.leaders),team_tasks=list(self.tasks),solo_tasks=list(self.solo_tasks),
-                    arena_wins=self.arena_wins,formation=self.formation,final_managed=self.managed_enabled)
+                    arena_wins=self.arena_wins,arena_target_mode=self.arena_target_mode,
+                    formation=self.formation,final_managed=self.managed_enabled)
 
 
 
@@ -1764,8 +1767,9 @@ class TeamPipelineRunner:
             self.record['phase'] = 'solo'
             self.save()
             self.solo = MultiSoloRunner(self.solo_tasks,config_path=self.root/'HYOL_Daily.ini',
-                account_count=6,arena_wins=self.arena_wins,formation=self.formation,
-                managed_enabled=self.managed_enabled,event_sink=self.sink,run_context=self.run_context)
+                account_count=6,arena_wins=self.arena_wins,arena_target_mode=self.arena_target_mode,
+                formation=self.formation,managed_enabled=self.managed_enabled,
+                event_sink=self.sink,run_context=self.run_context)
             if self.solo.scheduler.state.day != self.record['execution_day']:
                 raise hs.PendingError('运行期间日期改变，本轮结束；请重新开始')
             self.scheduler = self.solo.scheduler
