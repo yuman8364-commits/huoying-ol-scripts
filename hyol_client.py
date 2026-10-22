@@ -81,6 +81,7 @@ class UnifiedClient(tk.Tk):
         self.events = queue.Queue()
         self.controller = RuntimeController(self.events.put, self.root_path)
         self.active_mode = 'solo'
+        self.active_request = None
         self.scope = tk.StringVar(value='当前账号')
         self.account_count = tk.StringVar(value='6')
         self.arena_wins = tk.StringVar(value='5')
@@ -108,144 +109,285 @@ class UnifiedClient(tk.Tk):
 
     def _build(self):
         style = ttk.Style(self)
-        if 'vista' in style.theme_names():
-            style.theme_use('vista')
-        box = ttk.Frame(self, padding=16)
-        box.pack(fill='both', expand=True)
-        ttk.Label(box, text='火影OL · 完整客户端', font=('Microsoft YaHei UI', 19, 'bold')).pack(anchor='w')
-        ttk.Label(box, text='同一工作线程执行任务与收尾；次数、奖励、木叶回村和托管均逐账号核实。').pack(anchor='w', pady=(7, 11))
-        self.tabs = ttk.Notebook(box)
-        self.tabs.pack(fill='x')
-        daily = ttk.Frame(self.tabs, padding=12)
-        team = ttk.Frame(self.tabs, padding=12)
-        independent = ttk.Frame(self.tabs, padding=12)
+        if 'clam' in style.theme_names():
+            style.theme_use('clam')
+        self.configure(background='#FFFFFF')
+        font = ('Microsoft YaHei UI', 10)
+        style.configure('.', font=font, background='#FFFFFF', foreground='#202124')
+        style.configure('TFrame', background='#FFFFFF')
+        style.configure('TLabel', background='#FFFFFF', foreground='#202124')
+        style.configure('Muted.TLabel', foreground='#6B7280')
+        style.configure('TLabelframe', background='#FFFFFF', bordercolor='#E5E7EB', relief='solid')
+        style.configure('TLabelframe.Label', background='#FFFFFF', foreground='#202124',
+                        font=('Microsoft YaHei UI', 10, 'bold'))
+        style.configure('TButton', background='#FFFFFF', foreground='#202124',
+                        bordercolor='#D1D5DB', padding=(9, 5))
+        style.map('TButton', background=[('active', '#F3F4F6'), ('disabled', '#F9FAFB')],
+                  foreground=[('disabled', '#9CA3AF')])
+        style.configure('Primary.TButton', background='#202124', foreground='#FFFFFF',
+                        bordercolor='#202124', padding=(14, 7), font=('Microsoft YaHei UI', 10, 'bold'))
+        style.map('Primary.TButton', background=[('active', '#111827'), ('disabled', '#D1D5DB')],
+                  foreground=[('disabled', '#FFFFFF')])
+        style.configure('Nav.TButton', background='#FFFFFF', foreground='#374151',
+                        bordercolor='#FFFFFF', anchor='w', padding=(10, 8))
+        style.map('Nav.TButton', background=[('active', '#F3F4F6')])
+        style.configure('Selected.Nav.TButton', background='#F3F4F6', foreground='#111827',
+                        bordercolor='#E5E7EB', anchor='w', padding=(10, 8),
+                        font=('Microsoft YaHei UI', 10, 'bold'))
+        style.map('Selected.Nav.TButton', background=[('active', '#F3F4F6')])
+        style.configure('TCheckbutton', background='#FFFFFF', foreground='#202124')
+        style.configure('TRadiobutton', background='#FFFFFF', foreground='#202124')
+        style.configure('TCombobox', fieldbackground='#FFFFFF', background='#FFFFFF',
+                        foreground='#202124', arrowcolor='#374151')
+        style.map('TCombobox', fieldbackground=[('readonly', '#FFFFFF')],
+                  selectbackground=[('readonly', '#FFFFFF')],
+                  selectforeground=[('readonly', '#202124')])
+        style.configure('TSpinbox', fieldbackground='#FFFFFF', foreground='#202124')
+        style.configure('Treeview', background='#FFFFFF', fieldbackground='#FFFFFF',
+                        foreground='#202124', rowheight=25, borderwidth=0)
+        style.configure('Treeview.Heading', background='#F9FAFB', foreground='#374151',
+                        relief='flat', padding=(5, 5))
+        style.map('Treeview', background=[('selected', '#E5E7EB')],
+                  foreground=[('selected', '#111827')])
+        try:
+            style.layout('Hidden.TNotebook', [('Notebook.client', {'sticky': 'nswe'})])
+        except tk.TclError:
+            pass
+        style.configure('Hidden.TNotebook', background='#FFFFFF', borderwidth=0, tabmargins=0)
+
+        self.geometry('1180x820+35+45')
+        self.minsize(1000, 720)
+        shell = ttk.Frame(self)
+        shell.pack(fill='both', expand=True)
+
+        sidebar = ttk.Frame(shell, width=158, padding=(12, 14))
+        sidebar.pack(side='left', fill='y')
+        sidebar.pack_propagate(False)
+        ttk.Label(sidebar, text='火影OL', font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
+        ttk.Label(sidebar, text='完整客户端', style='Muted.TLabel').pack(anchor='w', pady=(1, 16))
+        ttk.Separator(sidebar, orient='horizontal').pack(fill='x', pady=(0, 10))
+        self.nav_buttons = []
+        for index, label in enumerate(('单人 / 多账号', '组队任务', '独立任务')):
+            button = ttk.Button(sidebar, text=label, style='Nav.TButton',
+                                command=lambda page=index: self._show_page(page))
+            button.pack(fill='x', pady=2)
+            self.nav_buttons.append(button)
+        ttk.Separator(sidebar, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Button(sidebar, text='运行日志', style='Nav.TButton',
+                   command=self._focus_log).pack(fill='x', pady=2)
+        ttk.Label(sidebar, text=VERSION, style='Muted.TLabel').pack(side='bottom', anchor='w')
+
+        content = ttk.Frame(shell, padding=(16, 12))
+        content.pack(side='left', fill='both', expand=True)
+        self.page_title = tk.StringVar(value='单人 / 多账号')
+        self.page_description = tk.StringVar(value='选择账号范围和任务；开始后按设置执行。')
+        header = ttk.Frame(content)
+        header.pack(fill='x', pady=(0, 10))
+        ttk.Label(header, textvariable=self.page_title,
+                  font=('Microsoft YaHei UI', 16, 'bold')).pack(anchor='w')
+        ttk.Label(header, textvariable=self.page_description, style='Muted.TLabel').pack(anchor='w', pady=(3, 0))
+
+        workspace = ttk.Frame(content)
+        workspace.pack(fill='both', expand=True)
+        left = ttk.Frame(workspace)
+        left.pack(side='left', fill='both', expand=True, padx=(0, 12))
+        right = ttk.Frame(workspace, width=325)
+        right.pack(side='right', fill='both')
+        right.pack_propagate(False)
+
+        self.tabs = ttk.Notebook(left, style='Hidden.TNotebook')
+        self.tabs.pack(fill='both', expand=True)
+        daily = ttk.Frame(self.tabs, padding=(0, 2))
+        team = ttk.Frame(self.tabs, padding=(0, 2))
+        independent = ttk.Frame(self.tabs, padding=(0, 2))
         self.tabs.add(daily, text='单人 / 多账号')
         self.tabs.add(team, text='组队任务')
         self.tabs.add(independent, text='独立任务')
-        line = ttk.Frame(daily)
+
+        scope_box = ttk.LabelFrame(daily, text='账号范围', padding=10)
+        scope_box.pack(fill='x', pady=(0, 10))
+        line = ttk.Frame(scope_box)
         line.pack(fill='x')
         for name in ('当前账号', '多个账号'):
-            ttk.Radiobutton(line, text=name, variable=self.scope, value=name).pack(side='left', padx=(0, 14))
-        ttk.Label(line, text='最多账号数').pack(side='left')
-        ttk.Spinbox(line, from_=1, to=6, width=4, textvariable=self.account_count).pack(side='left', padx=8)
-        tasks = ttk.Frame(daily)
-        tasks.pack(fill='x', pady=(10, 5))
+            ttk.Radiobutton(line, text=name, variable=self.scope, value=name,
+                            command=self._refresh_task_settings).pack(side='left', padx=(0, 14))
+        ttk.Label(line, text='最多账号数').pack(side='left', padx=(8, 4))
+        ttk.Spinbox(line, from_=1, to=6, width=4, textvariable=self.account_count).pack(side='left')
+        ttk.Label(scope_box, text='多账号按当前配置顺序执行；账号身份会在运行时重新核实。',
+                  style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(7, 0))
+
+        task_box = ttk.LabelFrame(daily, text='任务选择', padding=10)
+        task_box.pack(fill='x', pady=(0, 8))
         for index, task in enumerate(SOLO_OPTIONS):
-            ttk.Checkbutton(tasks, text=SOLO_LABELS[task], variable=self.task_vars[task]).grid(
-                row=index//4, column=index%4, sticky='w', padx=(0, 22), pady=4)
-        ttk.Label(daily, text='挖宝默认不选；每账号独立计时300秒，只用已有藏宝图。').pack(anchor='w', pady=(5, 0))
+            ttk.Checkbutton(task_box, text=SOLO_LABELS[task], variable=self.task_vars[task],
+                            command=self._refresh_task_settings).grid(
+                row=index // 3, column=index % 3, sticky='w', padx=(0, 12), pady=5)
+        ttk.Label(daily, text='周末任务、达摩和挖宝默认不选；活动开放状态由运行时核实。',
+                  style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(2, 0))
+
         mode_line = ttk.Frame(team)
-        mode_line.pack(fill='x',pady=(0,8))
-        for mode in ('自动建队','已有队伍 → 多人单人'):
-            ttk.Radiobutton(mode_line,text=mode,variable=self.team_mode,value=mode,
-                            command=self._team_mode_changed).pack(side='left',padx=(0,18))
-        self.legacy_team_box = ttk.Frame(team)
-        self.legacy_team_box.pack(fill='x')
-        self.pipeline_box = ttk.Frame(team)
-        line = ttk.Frame(self.pipeline_box)
-        line.pack(fill='x')
-        self.pipeline_leader_controls = []
-        for i,variable in enumerate(self.pipeline_leaders,1):
-            ttk.Label(line,text=f'第{i}队队长标签'+('（可不选）' if i == 2 else '')).pack(side='left')
-            values = tuple(str(n) for n in range(1,7))
-            control = ttk.Combobox(line,values=(('不选',)+values if i == 2 else values),state='readonly',
-                                  width=4,textvariable=variable)
-            control.pack(side='left',padx=(8,20))
-            self.pipeline_leader_controls.append(control)
-        ttk.Checkbutton(line,text='自动发现当前队伍',variable=self.pipeline_auto,
-                        command=self._pipeline_auto_changed).pack(side='left')
-        self._pipeline_auto_changed()
-        self.detect_leaders_button = ttk.Button(line,text='查看当前队长',command=self._detect_leaders)
-        self.detect_leaders_button.pack(side='left')
-        line = ttk.Frame(self.pipeline_box)
-        line.pack(fill='x',pady=8)
-        for task,variable in self.pipeline_task_vars.items():
-            ttk.Checkbutton(line,text=TEAM_LABELS[task],variable=variable).pack(side='left',padx=(0,20))
-        ttk.Label(self.pipeline_box,text='沿用已有队伍，只操作队长。两队开战后固定等待一队结算，再等待另一队；两队完成后开始下一轮。',
-                  wraplength=840).pack(anchor='w')
-        next_tasks = ttk.LabelFrame(self.pipeline_box,text='解散后：所有可运行的在线标签执行单人任务',padding=5)
-        next_tasks.pack(fill='x',pady=8)
-        for i,task in enumerate(SOLO_OPTIONS):
-            ttk.Checkbutton(next_tasks,text=SOLO_LABELS[task],variable=self.task_vars[task]).grid(
-                row=i//4,column=i%4,sticky='w',padx=(0,18),pady=3)
-        ttk.Label(self.pipeline_box,text='掉线影响的整队本轮暂缓；其他队伍和无队在线账号继续。周末、挖宝默认不选。',
-                  wraplength=840).pack(anchor='w')
+        mode_line.pack(fill='x', pady=(0, 8))
+        for mode in ('自动建队', '已有队伍 → 多人单人'):
+            ttk.Radiobutton(mode_line, text=mode, variable=self.team_mode, value=mode,
+                            command=self._team_mode_changed).pack(side='left', padx=(0, 16))
+        self.legacy_team_box = ttk.LabelFrame(team, text='自动建队设置', padding=9)
         line = ttk.Frame(self.legacy_team_box)
         line.pack(fill='x')
         ttk.Label(line, text='队长标签').pack(side='left')
         ttk.Combobox(line, values=tuple(str(index) for index in range(1, 7)), width=4,
                      state='readonly', textvariable=self.leader).pack(side='left', padx=8)
         ttk.Checkbutton(line, text='按好友列表邀请两名队员', variable=self.friend_shortcut,
-                        command=self._friend_changed).pack(side='left', padx=15)
+                        command=self._friend_changed).pack(side='left', padx=12)
         line = ttk.Frame(self.legacy_team_box)
         line.pack(fill='x', pady=8)
-        ttk.Label(line, text='队员标签（选1名或2名）：').pack(side='left')
+        ttk.Label(line, text='队员标签（选1名或2名）').pack(side='left')
         self.member_controls = []
         for index, variable in self.member_vars.items():
             button = ttk.Checkbutton(line, text=str(index), variable=variable)
-            button.pack(side='left', padx=8)
+            button.pack(side='left', padx=6)
             self.member_controls.append(button)
-        tasks = ttk.Frame(self.legacy_team_box)
-        tasks.pack(fill='x')
+        team_tasks = ttk.LabelFrame(self.legacy_team_box, text='组队任务', padding=8)
+        team_tasks.pack(fill='x')
         for index, task in enumerate(TEAM_TASKS):
-            ttk.Checkbutton(tasks, text=TEAM_LABELS[task], variable=self.team_vars[task]).grid(
-                row=index//3, column=index%3, sticky='w', padx=(0, 20), pady=4)
-        ttk.Label(self.legacy_team_box, text='只显示标签序号；全队真实次数、自动战斗和奖励核实后解散，逐成员进入托管。').pack(anchor='w', pady=(6, 0))
-        line = ttk.Frame(independent)
+            ttk.Checkbutton(team_tasks, text=TEAM_LABELS[task], variable=self.team_vars[task]).grid(
+                row=index // 3, column=index % 3, sticky='w', padx=(0, 14), pady=4)
+        ttk.Label(self.legacy_team_box, text='完成后核实奖励与回村；未确认的操作保留待处理。',
+                  style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(8, 0))
+
+        self.pipeline_box = ttk.LabelFrame(team, text='已有队伍 → 多人单人设置', padding=9)
+        line = ttk.Frame(self.pipeline_box)
+        line.pack(fill='x')
+        self.pipeline_leader_controls = []
+        for i, variable in enumerate(self.pipeline_leaders, 1):
+            ttk.Label(line, text=f'第{i}队队长'+('（可不选）' if i == 2 else '')).pack(side='left')
+            values = tuple(str(n) for n in range(1, 7))
+            control = ttk.Combobox(line, values=(('不选',) + values if i == 2 else values),
+                                   state='readonly', width=4, textvariable=variable)
+            control.pack(side='left', padx=(6, 12))
+            self.pipeline_leader_controls.append(control)
+        ttk.Checkbutton(line, text='自动发现当前队伍', variable=self.pipeline_auto,
+                        command=self._pipeline_auto_changed).pack(side='left', padx=(0, 8))
+        self._pipeline_auto_changed()
+        self.detect_leaders_button = ttk.Button(line, text='查看当前队长', command=self._detect_leaders)
+        self.detect_leaders_button.pack(side='left')
+        line = ttk.Frame(self.pipeline_box)
         line.pack(fill='x', pady=8)
-        ttk.Label(line, text='任务').pack(side='left')
-        ttk.Combobox(line, values=tuple(INDEPENDENT), state='readonly', width=20,
-                     textvariable=self.independent).pack(side='left', padx=12)
-        ttk.Label(line, text='羁绊场数').pack(side='left', padx=(15, 0))
-        ttk.Spinbox(line, from_=1, to=99, width=5, textvariable=self.bond_count).pack(side='left', padx=8)
-        ttk.Checkbutton(line, text='开始新一轮羁绊', variable=self.new_bond_round).pack(side='left', padx=8)
-        ttk.Label(independent, text='竞技场、周末与挖宝使用当前账号。羁绊从准备页续接；收尾未确认时保留待处理。',
-                  wraplength=840).pack(anchor='w', pady=12)
-        common = ttk.Frame(box)
-        common.pack(fill='x', pady=(12, 8))
-        ttk.Label(common, text='竞技场结束：战令归零（默认）').pack(side='left', padx=(0, 10))
-        self.arena_target_control = ttk.Checkbutton(
-            common, text='按指定胜场数停止（辅助）', variable=self.arena_use_win_target,
-            command=self._arena_target_changed)
-        self.arena_target_control.pack(side='left', padx=(0, 8))
-        ttk.Label(common, text='胜场').pack(side='left')
-        self.arena_wins_control = ttk.Spinbox(common, from_=1, to=10, width=5,
-                                              textvariable=self.arena_wins, state='disabled')
-        self.arena_wins_control.pack(side='left', padx=(6, 18))
-        ttk.Label(common, text='阵容').pack(side='left')
-        ttk.Combobox(common, values=('保持不变', '主力阵容', '速刷阵容'), state='readonly', width=12,
-                     textvariable=self.formation).pack(side='left', padx=8)
+        for task, variable in self.pipeline_task_vars.items():
+            ttk.Checkbutton(line, text=TEAM_LABELS[task], variable=variable).pack(side='left', padx=(0, 12))
+        ttk.Label(self.pipeline_box,
+                  text='只操作已核实队长。两队先开战，再依次等待结算；两队完成后才进入下一轮。',
+                  style='Muted.TLabel', wraplength=560).pack(anchor='w')
+        next_tasks = ttk.LabelFrame(self.pipeline_box, text='解散后执行的单人任务', padding=7)
+        next_tasks.pack(fill='x', pady=(8, 0))
+        for index, task in enumerate(SOLO_OPTIONS):
+            ttk.Checkbutton(next_tasks, text=SOLO_LABELS[task], variable=self.task_vars[task],
+                            command=self._refresh_task_settings).grid(
+                row=index // 3, column=index % 3, sticky='w', padx=(0, 10), pady=3)
+
+        independent_box = ttk.LabelFrame(independent, text='独立任务', padding=10)
+        independent_box.pack(fill='x', pady=(0, 8))
+        line = ttk.Frame(independent_box)
+        line.pack(fill='x')
+        ttk.Label(line, text='任务类型').pack(side='left')
+        self.independent_combo = ttk.Combobox(line, values=tuple(INDEPENDENT), state='readonly',
+                                              width=22, textvariable=self.independent)
+        self.independent_combo.pack(side='left', padx=10)
+        self.independent_combo.bind('<<ComboboxSelected>>',
+                                    lambda _event: self._refresh_task_settings())
+        ttk.Label(independent_box,
+                  text='下方设置会随所选任务变化；只显示当前任务实际支持的参数。',
+                  style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(8, 0))
+
+        self.task_settings_frame = ttk.LabelFrame(left, text='独立任务设置', padding=10)
+        self.task_settings_frame.pack(fill='x', pady=(9, 0))
+        self.task_specific_box = ttk.Frame(self.task_settings_frame)
+        self.task_specific_box.pack(fill='x')
+        common = ttk.Frame(self.task_settings_frame)
+        common.pack(fill='x', pady=(8, 0))
+        ttk.Separator(common, orient='horizontal').pack(fill='x', pady=(0, 8))
+        self.formation_label = ttk.Label(common, text='阵容')
+        self.formation_control = ttk.Combobox(
+            common, values=('保持不变', '主力阵容', '速刷阵容'), state='readonly',
+            width=12, textvariable=self.formation)
         self.managed_control = ttk.Checkbutton(common, text='最后进入托管', variable=self.final_managed)
+        self.formation_label.pack(side='left')
+        self.formation_control.pack(side='left', padx=(8, 18))
         self.managed_control.pack(side='right')
-        ttk.Label(box, text='竞技场先逐号发起战斗，再轮询检查；默认耗尽战令，指定胜场为辅助模式。掉线账号本轮暂缓。',
-                  foreground='#555555', wraplength=900).pack(anchor='w')
-        controls = ttk.Frame(box)
-        controls.pack(fill='x', pady=12)
-        self.start_button = ttk.Button(controls, text='开始', command=self._start)
-        self.start_button.pack(side='left', ipadx=15, ipady=5)
-        self.check_button = ttk.Button(controls, text='检查游戏窗口', command=self._check)
-        self.check_button.pack(side='left', padx=9)
-        self.stop_button = ttk.Button(controls, text='立即停止', command=self._stop, state='disabled')
-        self.stop_button.pack(side='right')
-        ttk.Label(box, textvariable=self.status, wraplength=880, font=('Microsoft YaHei UI', 11, 'bold')).pack(anchor='w')
-        ttk.Label(box, textvariable=self.result, wraplength=880).pack(anchor='w', pady=7)
-        history = ttk.Notebook(box)
-        history.pack(fill='both', expand=True)
-        self.progress_view = ProgressView(history, self.root_path, current_only=True)
-        history.add(self.progress_view, text='完成情况')
-        logbox = ttk.Frame(history)
-        history.add(logbox, text='运行日志')
-        self.log = tk.Text(logbox, height=10, state='disabled', wrap='word', font=('Microsoft YaHei UI', 10))
-        scrollbar = ttk.Scrollbar(logbox, command=self.log.yview)
-        self.log.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
-        self.log.pack(fill='both', expand=True)
-        footer = ttk.Frame(box)
-        footer.pack(side='bottom', fill='x', pady=(9, 0), before=history)
-        ttk.Button(footer, text='打开证据与日志', command=self._open_logs).pack(side='left')
-        ttk.Label(footer, text=VERSION+'  |  桌面独立运行').pack(side='right')
+
+        account_box = ttk.LabelFrame(right, text='账号列表', padding=8)
+        account_box.pack(fill='x')
+        account_actions = ttk.Frame(account_box)
+        account_actions.pack(fill='x')
+        ttk.Button(account_actions, text='刷新', command=self._refresh_account_list).pack(side='right')
+        ttk.Button(account_actions, text='详细进度', command=self._open_progress_window).pack(side='right', padx=(0, 6))
+        account_table = ttk.Frame(account_box)
+        account_table.pack(fill='x', pady=(6, 0))
+        self.account_tree = ttk.Treeview(
+            account_table, columns=('account', 'status', 'task', 'progress'),
+            show='headings', height=6, selectmode='browse')
+        for column, title, width in (
+                ('account', '账号', 82), ('status', '状态', 62),
+                ('task', '当前任务', 98), ('progress', '进度', 48)):
+            self.account_tree.heading(column, text=title)
+            self.account_tree.column(column, width=width, minwidth=48,
+                                     anchor='w', stretch=column in ('account', 'task'))
+        account_scroll = ttk.Scrollbar(account_table, orient='vertical', command=self.account_tree.yview)
+        self.account_tree.configure(yscrollcommand=account_scroll.set)
+        self.account_tree.grid(row=0, column=0, sticky='nsew')
+        account_scroll.grid(row=0, column=1, sticky='ns')
+        account_table.rowconfigure(0, weight=1)
+        account_table.columnconfigure(0, weight=1)
+        self.account_hint = tk.StringVar(value='开始后显示本轮核实账号；未识别身份不会显示为在线。')
+        ttk.Label(account_box, textvariable=self.account_hint, style='Muted.TLabel',
+                  wraplength=290).pack(anchor='w', pady=(6, 0))
+
+        log_box = ttk.LabelFrame(right, text='运行日志', padding=8)
+        log_box.pack(fill='both', expand=True, pady=(10, 0))
+        log_actions = ttk.Frame(log_box)
+        log_actions.pack(fill='x', pady=(0, 6))
+        ttk.Button(log_actions, text='清空', command=self._clear_log).pack(side='right')
+        ttk.Button(log_actions, text='打开目录', command=self._open_logs).pack(side='right', padx=(0, 6))
+        log_body = ttk.Frame(log_box)
+        log_body.pack(fill='both', expand=True)
+        self.log = tk.Text(log_body, height=10, state='disabled', wrap='word',
+                           font=('Microsoft YaHei UI', 9), bg='#FFFFFF', fg='#202124',
+                           insertbackground='#202124', relief='solid', borderwidth=1,
+                           highlightthickness=1, highlightbackground='#E5E7EB')
+        log_scroll = ttk.Scrollbar(log_body, command=self.log.yview)
+        self.log.configure(yscrollcommand=log_scroll.set)
+        self.log.pack(side='left', fill='both', expand=True)
+        log_scroll.pack(side='right', fill='y')
+
+        status_frame = ttk.Frame(content)
+        status_frame.pack(fill='x', pady=(8, 0))
+        ttk.Label(status_frame, textvariable=self.status,
+                  font=('Microsoft YaHei UI', 10, 'bold'), wraplength=850).pack(anchor='w')
+        ttk.Label(status_frame, textvariable=self.result, style='Muted.TLabel',
+                  wraplength=850).pack(anchor='w', pady=(3, 0))
+        controls = ttk.Frame(content)
+        controls.pack(fill='x', pady=(8, 0))
+        self.start_button = ttk.Button(controls, text='开始', style='Primary.TButton', command=self._start)
+        self.start_button.pack(side='left', ipadx=12, ipady=3)
+        self.stop_button = ttk.Button(controls, text='停止', command=self._stop, state='disabled')
+        self.stop_button.pack(side='left', padx=8, ipadx=8, ipady=3)
+        self.check_button = ttk.Button(controls, text='检查窗口', command=self._check)
+        self.check_button.pack(side='left', ipadx=4, ipady=3)
+        ttk.Label(controls, text='运行中可按 F12 紧急停止', style='Muted.TLabel').pack(side='right')
+
+        self.progress_window = tk.Toplevel(self)
+        self.progress_window.title('详细进度')
+        self.progress_window.geometry('1020x600')
+        self.progress_window.withdraw()
+        self.progress_view = ProgressView(self.progress_window, self.root_path, current_only=True)
+        self.progress_view.pack(fill='both', expand=True)
+        self.progress_window.protocol('WM_DELETE_WINDOW', self.progress_window.withdraw)
+        self.tabs.bind('<<NotebookTabChanged>>', self._on_page_changed)
+        self._team_mode_changed()
+        self._on_page_changed()
+        self.after(1000, self._tick_account_list)
 
     def request(self):
+        self._refresh_task_settings()
         selected = self.tabs.index(self.tabs.select())
         mode = ('multi' if self.scope.get() == '多个账号' else 'solo') if selected == 0 else (
             'team' if selected == 1 else INDEPENDENT[self.independent.get()])
@@ -265,18 +407,209 @@ class UnifiedClient(tk.Tk):
                           bond_count=int(self.bond_count.get()), new_bond_round=mode == 'bond' and self.new_bond_round.get(),
                           final_managed=self.final_managed.get())
 
+    def _show_page(self, page):
+        self.tabs.select(page)
+        self._on_page_changed()
+
+    def _on_page_changed(self, _event=None):
+        page = self.tabs.index(self.tabs.select())
+        titles = (
+            ('单人 / 多账号', '选择账号范围和任务；开始后按设置执行。'),
+            ('组队任务', '选择建队方式、队长与要执行的组队活动。'),
+            ('独立任务', '每次只运行一个独立任务；参数显示在下方。'),
+        )
+        self.page_title.set(titles[page][0])
+        self.page_description.set(titles[page][1])
+        for index, button in enumerate(self.nav_buttons):
+            button.configure(style='Selected.Nav.TButton' if index == page else 'Nav.TButton')
+        self._refresh_task_settings()
+
+    def _refresh_task_settings(self):
+        if not hasattr(self, 'task_specific_box') or not hasattr(self, 'tabs'):
+            return
+        for child in self.task_specific_box.winfo_children():
+            child.destroy()
+        self.arena_target_control = None
+        self.arena_wins_control = None
+        page = self.tabs.index(self.tabs.select())
+        if page == 2:
+            codes = (INDEPENDENT.get(self.independent.get(), 'arena'),)
+        elif page == 1 and self.team_mode.get() != '已有队伍 → 多人单人':
+            codes = ()
+        else:
+            codes = tuple(task for task, variable in self.task_vars.items() if variable.get())
+        self.current_setting_codes = tuple(codes)
+        row = 0
+        if 'arena' in codes:
+            arena_box = ttk.LabelFrame(self.task_specific_box, text='竞技场', padding=7)
+            arena_box.grid(row=row, column=0, sticky='ew', pady=(0, 5))
+            self.task_specific_box.columnconfigure(0, weight=1)
+            ttk.Label(arena_box, text='结束条件').pack(side='left', padx=(0, 8))
+            ttk.Radiobutton(arena_box, text='战令归零（默认）',
+                            variable=self.arena_use_win_target, value=False,
+                            command=self._arena_target_changed).pack(side='left', padx=(0, 10))
+            ttk.Radiobutton(arena_box, text='指定胜场（辅助）',
+                            variable=self.arena_use_win_target, value=True,
+                            command=self._arena_target_changed).pack(side='left', padx=(0, 8))
+            ttk.Label(arena_box, text='胜场').pack(side='left')
+            self.arena_wins_control = ttk.Spinbox(
+                arena_box, from_=1, to=10, width=4, textvariable=self.arena_wins,
+                state='normal' if self.arena_use_win_target.get() else 'disabled')
+            self.arena_wins_control.pack(side='left', padx=(5, 0))
+            self.arena_target_control = True
+            row += 1
+        if 'bond' in codes:
+            bond_box = ttk.Frame(self.task_specific_box)
+            bond_box.grid(row=row, column=0, sticky='w', pady=(0, 5))
+            ttk.Label(bond_box, text='羁绊场数').pack(side='left')
+            self.bond_count_control = ttk.Spinbox(
+                bond_box, from_=1, to=99, width=5, textvariable=self.bond_count)
+            self.bond_count_control.pack(side='left', padx=8)
+            self.new_bond_round_control = ttk.Checkbutton(
+                bond_box, text='开始新一轮羁绊', variable=self.new_bond_round)
+            self.new_bond_round_control.pack(side='left', padx=8)
+            row += 1
+        for code, message in (
+                ('weekend', '周末任务：拼图三难度＋达摩；仅在活动开放日执行。'),
+                ('treasure', '挖宝：每账号固定 5 分钟，到时自动暂停并回村。'),
+                ('daruma', '达摩：自动执行至奖励次数核实归零。'),
+                ('quiz', '忍者测验：沿用现有规则，不增加额外参数。'),
+                ('ranking', '排位赛：沿用现有规则，核实剩余次数后结束。')):
+            if code in codes:
+                ttk.Label(self.task_specific_box, text=message, style='Muted.TLabel',
+                          wraplength=560).grid(row=row, column=0, sticky='w', pady=(0, 5))
+                row += 1
+        if not row:
+            ttk.Label(self.task_specific_box, text='当前所选任务无需额外参数。',
+                      style='Muted.TLabel').grid(row=0, column=0, sticky='w')
+        bond_only = page == 2 and codes == ('bond',)
+        if bond_only:
+            self.formation_label.pack_forget()
+            self.formation_control.pack_forget()
+            self.managed_control.pack_forget()
+        else:
+            if not self.formation_label.winfo_manager():
+                self.formation_label.pack(side='left')
+            if not self.formation_control.winfo_manager():
+                self.formation_control.pack(side='left', padx=(8, 18))
+            if not self.managed_control.winfo_manager():
+                self.managed_control.pack(side='right')
+
     def _arena_target_changed(self):
-        self.arena_wins_control.configure(state='normal' if self.arena_use_win_target.get() else 'disabled')
+        if self.arena_wins_control is not None and self.arena_wins_control.winfo_exists():
+            self.arena_wins_control.configure(
+                state='normal' if self.arena_use_win_target.get() else 'disabled')
 
     def _team_mode_changed(self):
         pipeline = self.team_mode.get() == '已有队伍 → 多人单人'
         self.legacy_team_box.pack_forget()
         self.pipeline_box.pack_forget()
         (self.pipeline_box if pipeline else self.legacy_team_box).pack(fill='x')
+        self._refresh_task_settings()
 
     def _pipeline_auto_changed(self):
         for control in self.pipeline_leader_controls:
             control.configure(state='disabled' if self.pipeline_auto.get() else 'readonly')
+
+    def _active_task_codes(self):
+        request = self.active_request
+        if request is None:
+            return ()
+        if request.mode in ('solo', 'multi', 'team_then_multi'):
+            codes = list(request.tasks)
+        elif request.mode in ('arena', 'weekend', 'treasure'):
+            codes = [request.mode]
+        elif request.mode == 'bond':
+            codes = ['bond']
+        else:
+            codes = []
+        if request.final_managed:
+            codes.append('managed')
+        return tuple(codes)
+
+    def _refresh_account_list(self):
+        if not hasattr(self, 'account_tree') or not hasattr(self, 'progress_view'):
+            return
+        try:
+            self.progress_view.refresh()
+            rows = self.progress_view.snapshot.get('rows', [])
+            current = set(self.account_tree.get_children())
+            if not rows:
+                for item in current:
+                    self.account_tree.delete(item)
+                self.account_hint.set('开始后显示本轮核实账号；未识别身份不会显示为在线。')
+                return
+            selected = self._active_task_codes()
+            for row in rows:
+                index = str(row.get('index', ''))
+                if not index:
+                    continue
+                account = str(row.get('account') or row.get('label') or f'账号{index}')
+                if account.startswith('当前窗口标签'):
+                    account = str(row.get('label') or f'标签{index}')
+                task_rows = row.get('tasks', {})
+                relevant = [(task, task_rows.get(task, {})) for task in selected if task in task_rows]
+                running = next(((task, rec) for task, rec in relevant if rec.get('status') == 'running'), None)
+                pending = next(((task, rec) for task, rec in relevant if rec.get('status') in ('pending', 'offline')), None)
+                done_count = sum(rec.get('status') == 'done' for _, rec in relevant)
+                total = len(relevant)
+                health = str(row.get('health') or '')
+                if pending:
+                    status = '待处理'
+                    task_label = pending[0]
+                elif running:
+                    status = '运行中'
+                    task_label = running[0]
+                elif total and done_count == total:
+                    status = '已完成'
+                    task_label = '—'
+                elif health and health not in ('已绑定', '身份待核实'):
+                    status = '离线'
+                    task_label = '—'
+                elif health == '身份待核实':
+                    status = '待核验'
+                    task_label = '—'
+                elif done_count:
+                    status = '进行中'
+                    task_label = next((task for task, rec in relevant if rec.get('status') not in ('done', 'unselected')), '—')
+                else:
+                    status = '待开始'
+                    task_label = next((task for task, rec in relevant if rec.get('status') not in ('done', 'unselected')), '—')
+                task_text = SOLO_LABELS.get(task_label, {'managed': '托管', 'bond': '羁绊'}.get(task_label, task_label))
+                progress = f'{done_count}/{total}' if total else '—'
+                values = (account, status, task_text, progress)
+                if index in current:
+                    self.account_tree.item(index, values=values)
+                    current.remove(index)
+                else:
+                    self.account_tree.insert('', 'end', iid=index, values=values)
+            for item in current:
+                self.account_tree.delete(item)
+            self.account_hint.set(f'本轮账号：{len(rows)} 个；状态仅来自已记录的识别与任务证据。')
+        except (tk.TclError, OSError, ValueError, TypeError, KeyError):
+            return
+
+    def _tick_account_list(self):
+        self._refresh_account_list()
+        try:
+            self.after(1000, self._tick_account_list)
+        except tk.TclError:
+            pass
+
+    def _open_progress_window(self):
+        if self.controller.busy:
+            self.status.set('运行中暂不打开详细进度，避免抢占游戏前台。')
+            return
+        self.progress_window.deiconify()
+        self.progress_window.lift()
+
+    def _focus_log(self):
+        self.log.focus_set()
+
+    def _clear_log(self):
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.configure(state='disabled')
 
     def _detect_leaders(self):
         if self.controller.detect_team_leaders():
