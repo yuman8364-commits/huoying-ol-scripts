@@ -170,7 +170,6 @@ def run(r):
         if r.visible('ranking_page.bmp', PAGE, frame, .95) and not r.visible('ranking_power_warning.bmp',(790,505,1130,560),frame,.95):
             try:
                 count = stable_remaining(r, seconds=(1.5 if getattr(r, 'interleave_after_end', False)
-
                                                    and phase in ('end_sent', 'result_sent') else 8))
             except hs.PendingError:
                 if phase == 'ready':
