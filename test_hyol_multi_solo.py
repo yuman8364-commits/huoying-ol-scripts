@@ -97,6 +97,7 @@ class MultiSoloTests(unittest.TestCase):
             )
         scheduler = SimpleNamespace(
             accounts=list(accounts), by_name={account.name: account for account in accounts},
+            state=SimpleNamespace(action_status=Mock(return_value='new')),
             check_pause_boundary=Mock(return_value=False), check_stop=Mock(),
             switch_account_for_combat=Mock(),
             capture=Mock(return_value=Image.new('RGB', (1920, 1032))),
