@@ -538,7 +538,27 @@ class UnifiedClient(tk.Tk):
             if not rows:
                 for item in current:
                     self.account_tree.delete(item)
-                self.account_hint.set('开始后显示本轮核实账号；未识别身份不会显示为在线。')
+                request = self.active_request
+                if request is not None and request.mode in ('solo', 'arena', 'bond', 'weekend', 'treasure'):
+                    task_codes = [code for code in self._active_task_codes() if code != 'managed']
+                    task_label = (SOLO_LABELS.get(task_codes[0], task_codes[0])
+                                  if len(task_codes) == 1 else '多项任务')
+                    run_status = str(self.status.get())
+                    if self.controller.busy:
+                        status = '运行中'
+                    elif '待处理项' in run_status:
+                        status = '待处理'
+                    elif '已确认完成' in run_status:
+                        status = '已完成'
+                    elif '已停止' in run_status:
+                        status = '已停止'
+                    else:
+                        status = '待核验'
+                    self.account_tree.insert('', 'end', iid='current-window',
+                                             values=('当前窗口', status, task_label, '—'))
+                    self.account_hint.set('单窗口任务；账号身份与完成情况以日志和任务证据为准。')
+                else:
+                    self.account_hint.set('开始后显示本轮核实账号；未识别身份不会显示为在线。')
                 return
             selected = self._active_task_codes()
             for row in rows:
