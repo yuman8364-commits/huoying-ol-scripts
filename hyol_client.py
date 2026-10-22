@@ -576,7 +576,10 @@ class UnifiedClient(tk.Tk):
                 done_count = sum(rec.get('status') == 'done' for _, rec in relevant)
                 total = len(relevant)
                 health = str(row.get('health') or '')
-                if pending:
+                if health and health not in ('已绑定', '身份待核实'):
+                    status = '离线'
+                    task_label = '—'
+                elif pending:
                     status = '待处理'
                     task_label = pending[0]
                 elif running:
@@ -584,9 +587,6 @@ class UnifiedClient(tk.Tk):
                     task_label = running[0]
                 elif total and done_count == total:
                     status = '已完成'
-                    task_label = '—'
-                elif health and health not in ('已绑定', '身份待核实'):
-                    status = '离线'
                     task_label = '—'
                 elif health == '身份待核实':
                     status = '待核验'
