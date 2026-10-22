@@ -924,6 +924,7 @@ class MultiSoloRunner:
                     running = phase != 'ready' or has_pending_action
                     s.navigator = runner
                     runner.interleave_after_end = True
+                    persist_progress = True
                     try:
                         s.switch_account_for_combat(account, 'ranking', running=running)
                         record.update(status='running', last_error='')
@@ -934,6 +935,7 @@ class MultiSoloRunner:
                                 record['ranking_interleave_wait_checks'] = 0
                                 detail = '结束战斗动作已发送，立即切换账号；结果和剩余次数延后核实'
                                 event_name = 'multi_solo_ranking_end_sent_yield'
+                                progressed = True
                             else:
                                 checks = int(record.get('ranking_interleave_wait_checks', 0)) + 1
                                 record['ranking_interleave_wait_checks'] = checks
@@ -941,10 +943,12 @@ class MultiSoloRunner:
                                     raise hs.PendingError('排位结果连续30轮未能核实；保留断点并继续其他账号')
                                 detail = '排位结果尚未稳定，已让出本轮继续处理其他账号'
                                 event_name = 'multi_solo_ranking_wait_yield'
+                                persist_progress = checks == 1 or checks % 5 == 0
                             record.update(status='pending', task_completed=False, home_returned=False,
                                           last_error=detail)
-                            runner.save()
-                            self.event(event_name, account, detail=detail)
+                            if persist_progress or result == 'yield_after_end':
+                                runner.save()
+                                self.event(event_name, account, detail=detail)
                         else:
                             frame = s.capture()
                             if not (s.main_ready(frame) and s.template(
@@ -966,7 +970,8 @@ class MultiSoloRunner:
                             self.deferred_at.pop(account.name, None)
                             self.event('multi_solo_task_complete', account, task='ranking',
                                        task_completed=True, home_returned=True, remaining=0)
-                        progressed = True
+                            record.pop('ranking_interleave_wait_checks', None)
+                            progressed = True
                     except hs.AccountOffline as exc:
                         self.skip_disconnected(account, 'ranking')
                         pending.pop(account.name, None)
@@ -986,7 +991,8 @@ class MultiSoloRunner:
                         progressed = True
                     finally:
                         runner.interleave_after_end = False
-                    self.save_progress('ranking')
+                    if persist_progress:
+                        self.save_progress('ranking')
                 if not progressed:
                     s.wait_interruptible(.4)
             self.event('multi_solo_ranking_stage_elapsed',
