@@ -174,7 +174,7 @@ class SchedulerUnitTests(unittest.TestCase):
             ),
             arena_victory_target=7,
             arena_attempt_limit=12,
-            _combat_limit=lambda _mode: 12,
+            _combat_limit=lambda _mode, _account=None: 12,
             _combat_action_name=lambda _mode, index: f"arena_casual_battle_{index}",
             _arena_victory_count=lambda _account: 2,
             _arena_victory_confirmed=lambda _account: False,
@@ -246,6 +246,55 @@ class SchedulerUnitTests(unittest.TestCase):
         scheduler._arena_victory_count.return_value = 13
         hs.Scheduler.prepare_additional_arena_request(scheduler, account, 1)
         self.assertEqual(14, scheduler.arena_victory_target)
+
+
+    def test_ticket_exhaustion_requires_three_positive_zero_count_frames(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = object.__new__(hs.Scheduler)
+        scheduler.capture = Mock(side_effect=[object(), object(), object()])
+        scheduler._combat_ready_visible = Mock(return_value=True)
+        scheduler._arena_token_count = Mock(return_value=0)
+        scheduler.wait_interruptible = Mock()
+        scheduler.event = Mock()
+        self.assertTrue(hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account))
+        self.assertEqual(3, scheduler.capture.call_count)
+        scheduler._arena_token_count = Mock(return_value=None)
+        with self.assertRaisesRegex(hs.PendingError, '无法唯一识别'):
+            hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account)
+
+    def test_ticket_mode_ignores_win_target_until_tickets_are_verified_exhausted(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = object.__new__(hs.Scheduler)
+        request = {'target_mode': 'tickets', 'status': 'running', 'target': 1, 'tickets_exhausted': False}
+        scheduler.state = SimpleNamespace(global_state={'arena_requests': {account.name: request}})
+        scheduler.arena_victory_target = 1
+        scheduler._arena_victory_count = Mock(return_value=20)
+        self.assertFalse(hs.Scheduler._arena_victory_confirmed(scheduler, account))
+        self.assertFalse(hs.Scheduler._arena_goal_complete(scheduler, account))
+        request.update(status='done', tickets_exhausted=True)
+        self.assertTrue(hs.Scheduler._arena_goal_complete(scheduler, account))
+
+    def test_ticket_request_has_bounded_attempt_limit_and_does_not_use_win_count_as_stop(self) -> None:
+        account = hs.Account(2, ROLE_E, 180)
+        scheduler = SimpleNamespace(
+            state=SimpleNamespace(global_state={}, accounts={account.name: {'actions': {}}}, save_global=Mock()),
+            _arena_victory_count=Mock(return_value=0), event=Mock(),
+        )
+        hs.Scheduler.prepare_additional_arena_request(scheduler, account, 5, target_mode='tickets')
+        request = scheduler.state.global_state['arena_requests'][account.name]
+        self.assertEqual('tickets', request['target_mode'])
+        self.assertEqual(hs.ARENA_MAX_ATTEMPTS, request['attempt_limit'])
+        self.assertFalse(request['tickets_exhausted'])
+        self.assertEqual(5, request['requested_wins'])
+
+    def test_ticket_mode_never_clicks_casual_when_tokens_are_zero(self) -> None:
+        source = Path(hs.__file__).read_text(encoding='utf-8')
+        selector = source.split('def _click_arena_mode_when_stable', 1)[1].split('def _combat_progress_watchdog', 1)[0]
+        self.assertIn("self._arena_target_mode_for(account) == 'tickets'", selector)
+        self.assertIn("return 'tickets_exhausted'", selector)
+        start = source.split('def _start_arena_slot', 1)[1].split('def _arena_opening_once', 1)[0]
+        self.assertIn('combat_battle_start_requested', start)
+        self.assertNotIn('transition_deadline', start)
 
     def test_running_battle_waits_through_transient_missing_anchor(self) -> None:
         account = hs.Account(2, ROLE_E, 180)
