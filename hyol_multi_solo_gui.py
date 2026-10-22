@@ -166,6 +166,7 @@ class MultiSoloApp(tk.Tk):
                 return
             self.events.put(("status", f"预检通过，开始识别最多 {count} 个账号。"))
             runner = MultiSoloRunner(tasks, account_count=count, arena_wins=arena_wins,
+                                     arena_target_mode='wins',
                                      formation=formation,
                                      managed_enabled=managed_enabled,run_context=context,
                                      event_sink=lambda event: self.events.put(("event", event)))

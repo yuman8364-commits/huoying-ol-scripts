@@ -134,7 +134,7 @@ class RankingTests(unittest.TestCase):
 
     def test_five_end_clicks_and_actual_zero_required(self):
         r=self.runner()
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'],5)
         self.assertTrue(r.rec['zero_verified'])
@@ -248,7 +248,7 @@ class RankingTests(unittest.TestCase):
                 r.clicks.append((name,args[0],args[3]))
             else: original_click(name,*args)
         r.visible,r.click=visible,click
-        def count(r):
+        def count(r, seconds=8):
             self.assertNotEqual(r.mode,'warning')
             return r.count
         with patch.object(ranking,'stable_remaining',side_effect=count):
@@ -263,7 +263,7 @@ class RankingTests(unittest.TestCase):
         original_visible=r.visible
         r.visible=lambda name,*args,**kwargs: (True if name=='arena_defeat_banner.bmp'
                          and r.mode=='result' else original_visible(name,*args,**kwargs))
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'],1)
         self.assertEqual(r.rec['remaining'],0)
@@ -284,7 +284,7 @@ class RankingTests(unittest.TestCase):
                     raise hs.SafetyError('page anchor guard failed: transient animation')
             original_click(name,roi,dx,dy,label,anchors,irreversible)
         r.click=click
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             with self.assertRaises(hs.SafetyError):
                 ranking.run(r)
             self.assertEqual(r.rec['phase'],'end_pending')
@@ -342,7 +342,7 @@ class RankingTests(unittest.TestCase):
                 original_click(name, *args)
         r.click = click
         with patch.object(ranking, 'sent_result_can_reopen', return_value=True), \
-                patch.object(ranking, 'stable_remaining', side_effect=lambda r: r.count):
+                patch.object(ranking, 'stable_remaining', side_effect=lambda r, seconds=8: r.count):
             ranking.run(r)
         self.assertEqual(r.rec['completed'], 2)
         self.assertTrue(r.rec['zero_verified'])
@@ -404,7 +404,7 @@ class RankingTests(unittest.TestCase):
                 else:
                     original_click(name,*args)
             r.click=click
-            with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+            with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
                 ranking.run(r)
             self.assertEqual(r.rec['completed'],5)
             self.assertTrue(r.rec['zero_verified'])
@@ -479,7 +479,7 @@ class RankingTests(unittest.TestCase):
                 waited.append(True)
                 r.mode='page'
         r.scheduler.wait_interruptible.side_effect=after_wait
-        with patch.object(ranking,'stable_remaining',side_effect=lambda r:r.count):
+        with patch.object(ranking,'stable_remaining',side_effect=lambda r, seconds=8:r.count):
             ranking.run(r)
         self.assertTrue(waited)
         self.assertEqual(r.rec['completed'],9)

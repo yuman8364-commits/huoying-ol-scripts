@@ -291,9 +291,10 @@ class DailyTaskTests(unittest.TestCase):
 
     def test_arena_uses_requested_additional_victories(self):
         r = self.runner()
+        r.arena_target_mode = 'wins'
         r.scheduler.state.module_status.return_value = "done"
         r.arena()
-        r.scheduler.prepare_additional_arena_request.assert_called_once_with(r.account, 5)
+        r.scheduler.prepare_additional_arena_request.assert_called_once_with(r.account, 5, target_mode='wins')
         self.assertEqual(5, r.scheduler.arena_victory_target)
         r.scheduler.run_combat_interleaved.assert_called_once_with("arena")
 

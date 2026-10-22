@@ -217,6 +217,7 @@ class SchedulerUnitTests(unittest.TestCase):
             _combat_action_name=lambda _mode, index: f"arena_casual_battle_{index}",
             _arena_victory_count=lambda _account: 2,
             _arena_victory_confirmed=lambda _account: False,
+            _arena_goal_complete=lambda _account: False,
             _arena_daily_rewards_complete=lambda _account: True,
         )
         self.assertEqual(3, hs.Scheduler._next_combat_index(scheduler, account, "arena"))
@@ -298,6 +299,7 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertTrue(hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account))
         self.assertEqual(3, scheduler.capture.call_count)
         scheduler._arena_token_count = Mock(return_value=None)
+        scheduler.capture = Mock(return_value=object())
         with self.assertRaisesRegex(hs.PendingError, '无法唯一识别'):
             hs.Scheduler._arena_tickets_exhausted_on_page(scheduler, account)
 
@@ -2091,6 +2093,7 @@ class SchedulerUnitTests(unittest.TestCase):
             template=Mock(side_effect=match), click_template=Mock(return_value=True),
             event=Mock(), wait_interruptible=Mock(),
         )
+        scheduler._arena_target_mode_for = lambda account: 'wins'
         selected = hs.Scheduler._click_arena_mode_when_stable(scheduler, account, "arena_casual_battle_1")
         self.assertEqual("current_arena_page", selected)
         self.assertEqual(3, scheduler.capture.call_count)
@@ -2163,6 +2166,7 @@ class SchedulerUnitTests(unittest.TestCase):
             save_raw_evidence=Mock(return_value='ranked_unavailable.png'),
             event=Mock(), wait_interruptible=Mock(),
         )
+        scheduler._arena_target_mode_for = lambda account: 'wins'
         selected = hs.Scheduler._click_arena_mode_when_stable(scheduler, account, 'attempt_1')
         self.assertEqual('casual', selected)
         self.assertEqual(3, scheduler.capture.call_count)

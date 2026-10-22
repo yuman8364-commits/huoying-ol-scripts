@@ -880,6 +880,9 @@ class MultiSoloRunner:
         original_observation = getattr(s, '_task_observation', None)
         candidates = []
         pending = {}
+        next_polls = {}
+        waiting_since = {}
+        waiting_keys = {}
         started_at = time.monotonic()
         try:
             for configured in tuple(original_accounts):
@@ -918,6 +921,9 @@ class MultiSoloRunner:
                     if s.check_pause_boundary():
                         self.save_progress('paused')
                         return False
+                    now = time.monotonic()
+                    if now < next_polls.get(account.name, 0):
+                        continue
                     runner = self.runner_for(account)
                     runner.current = 'ranking'
                     record = runner.record('ranking')
@@ -939,19 +945,26 @@ class MultiSoloRunner:
                         if result in ('yield_after_end', 'yield_waiting_result'):
                             if result == 'yield_after_end':
                                 record['ranking_interleave_wait_checks'] = 0
+                                waiting_since[account.name] = time.monotonic()
+                                waiting_keys[account.name] = (record.get('completed', 0), record.get('phase'))
                                 detail = '结束战斗动作已发送，立即切换账号；结果和剩余次数延后核实'
                                 event_name = 'multi_solo_ranking_end_sent_yield'
                                 progressed = True
                             else:
                                 checks = int(record.get('ranking_interleave_wait_checks', 0)) + 1
                                 record['ranking_interleave_wait_checks'] = checks
-                                if checks >= 30:
-                                    raise hs.PendingError('排位结果连续30轮未能核实；保留断点并继续其他账号')
+                                key = (record.get('completed', 0), record.get('phase'))
+                                if waiting_keys.get(account.name) != key:
+                                    waiting_since[account.name] = time.monotonic()
+                                    waiting_keys[account.name] = key
+                                if time.monotonic() - waiting_since.setdefault(account.name, time.monotonic()) >= 30:
+                                    raise hs.PendingError('排位结果连续30秒无进展；保留断点并继续其他账号')
                                 detail = '排位结果尚未稳定，已让出本轮继续处理其他账号'
                                 event_name = 'multi_solo_ranking_wait_yield'
                                 persist_progress = checks == 1 or checks % 5 == 0
                             record.update(status='pending', task_completed=False, home_returned=False,
                                           last_error=detail)
+                            next_polls[account.name] = time.monotonic() + .4
                             if persist_progress or result == 'yield_after_end':
                                 runner.save()
                                 self.event(event_name, account, detail=detail)
@@ -986,10 +999,18 @@ class MultiSoloRunner:
                         self.skip_stalled(account, 'ranking', exc)
                         pending.pop(account.name, None)
                         progressed = True
-                    except hs.PendingError as exc:
+                    except (hs.PendingError, hs.SafetyError) as exc:
                         record.update(status='pending', task_completed=False, home_returned=False,
                                       last_error=str(exc))
                         runner.save()
+                        frame = s.capture()
+                        mapping = s._saved_tab_mapping()
+                        custody = (getattr(s, 'active', None) == account
+                                   and isinstance(mapping, dict) and mapping.get(account.name) == account.tab_x
+                                   and s._generic_active_tab_x(frame) == account.tab_x
+                                   and s._combat_active_visible('ranking', frame))
+                        if not custody and not s.ensure_account_main_before_release(account, 'ranking'):
+                            raise hs.LeaseBlocked(f'{account.name}排位异常后无法确认安全交接') from exc
                         self.deferred[account.name] = 'ranking'
                         self.deferred_at[account.name] = time.monotonic()
                         self.event('multi_solo_ranking_stage_pending', account, detail=str(exc))
@@ -1019,6 +1040,7 @@ class MultiSoloRunner:
         original_target = getattr(s, 'arena_victory_target', None)
         original_limit = getattr(s, 'arena_attempt_limit', None)
         candidates = []
+        runners = {}
         started_at = time.monotonic()
         try:
             for configured in tuple(original_accounts):
@@ -1041,6 +1063,30 @@ class MultiSoloRunner:
                         runner.save()
                     continue
                 if self.check_account(account):
+                    runner = self.runner_for(account)
+                    runners[account.name] = runner
+                    record = runner.record('arena')
+                    request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
+                    same_target = (isinstance(request, dict) and request.get('status') == 'done'
+                                   and request.get('target_mode', 'wins') == self.arena_target_mode
+                                   and (self.arena_target_mode == 'tickets'
+                                        or request.get('requested_wins') == self.arena_wins))
+                    if record.get('task_completed') and same_target:
+                        runner.current = 'arena'
+                        s.recheck_arena_rewards(account)
+                        frame = s.capture()
+                        if not (s._arena_daily_rewards_complete(account) and s.main_ready(frame)
+                                and s.template('leaf_village_name_current.bmp', (1690,110,1920,148), frame,
+                                               threshold=.92)[0]):
+                            raise hs.PendingError('已完成竞技场请求的奖励或回村复查尚未核实；禁止重建目标')
+                        if not hasattr(self, 'arena_rewards_audited'):
+                            self.arena_rewards_audited = set()
+                        self.arena_rewards_audited.add(account.name)
+                        record.update(status='done', home_returned=True, followup_check_due=False, last_error='')
+                        runner.save()
+                        self.event('multi_solo_task_skip_done', account, task='arena',
+                                   detail='持久完成请求已复查奖励及回村，不追加目标')
+                        continue
                     candidates.append(account)
                 else:
                     self.note_skipped(account, 'arena')
@@ -1060,7 +1106,7 @@ class MultiSoloRunner:
             s.arena_victory_target = self.arena_wins
             requests = []
             for account in candidates:
-                runner = self.runner_for(account)
+                runner = runners[account.name]
                 runner.current = 'arena'
                 record = runner.record('arena')
                 record.update(status='running', task_completed=False, home_returned=False,
@@ -1094,7 +1140,7 @@ class MultiSoloRunner:
             if not hasattr(self, 'arena_rewards_audited'):
                 self.arena_rewards_audited = set()
             for account in candidates:
-                runner = self.runner_for(account)
+                runner = runners[account.name]
                 record = runner.record('arena')
                 complete = s._account_module_complete(account, 'arena')
                 if complete:

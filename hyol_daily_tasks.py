@@ -1179,7 +1179,8 @@ class DailyClient(tk.Tk):
                                       config_path=self.config_path,
                                       generic_current_window=self.generic_current_window,
                                       selected_tasks=[key for key,value in self.task_options.items() if value.get()] if self.task_options else None,
-                                      arena_wins=self.arena_wins.get(),managed_enabled=self.managed_enabled.get())
+                                      arena_wins=self.arena_wins.get(),arena_target_mode='wins',
+                                      managed_enabled=self.managed_enabled.get())
         except (ValueError,tk.TclError) as exc:
             self.status.set(str(exc))
             return

@@ -37,6 +37,8 @@ class MultiSoloTests(unittest.TestCase):
             state=state, navigator='original-navigator', _task_observation=None,
             survival_inline_two_runs=False, capture=Mock(return_value=Image.new('RGB', (1920, 1032))),
             _combat_active_visible=Mock(return_value=False),
+            _battle_hud_visible=Mock(return_value=False),
+            template=Mock(return_value=(False, 0.0, 0, 0)),
             run_combat_interleaved=Mock(),
             _account_module_complete=Mock(return_value=True),
         )
@@ -119,7 +121,10 @@ class MultiSoloTests(unittest.TestCase):
         coordinator.event = Mock()
         coordinator.save_progress = Mock()
 
-        self.assertTrue(coordinator._run_ranking_stage())
+        clock = {'value': 0.0}
+        scheduler.wait_interruptible.side_effect = lambda seconds: clock.update(value=clock['value'] + seconds)
+        with patch.object(multi.time, 'monotonic', side_effect=lambda: clock['value']):
+            self.assertTrue(coordinator._run_ranking_stage())
 
         self.assertEqual(call_order, [accounts[0].name, accounts[1].name,
                                       accounts[0].name, accounts[1].name,

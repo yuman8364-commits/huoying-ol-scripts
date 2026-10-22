@@ -4254,12 +4254,6 @@ class Scheduler:
             # satisfy a newly requested additional-victory target by itself.
             # Only the current target and positive attempt records may close
             # the module.
-            if (
-                self.state.action_status(account.name, "arena_daily_victory") == "done"
-                and self._arena_victory_count(account) >= (self.arena_victory_target or ARENA_REQUIRED_WINS)
-                and self._arena_daily_rewards_complete(account)
-            ):
-                return limit + 1
         for index in range(1, limit + 1):
             if self.state.action_status(account.name, self._combat_action_name(mode, index)) != "done":
                 return index
@@ -5137,7 +5131,7 @@ class Scheduler:
                                    elapsed_seconds=round(elapsed, 2), timeout_seconds=30)
                         self.wait_interruptible(0.4)
                         return
-                raise PendingError("arena start was requested but no matching/loading/battle page or result was confirmed; refusing duplicate start")
+                raise PendingError("arena returned without a positively confirmed victory or defeat; no matching/loading/battle page or result was confirmed; refusing duplicate start")
             if status == "pending":
                 outcome = "returned to arena page after positively confirmed victory" if slot.victory_confirmed else "returned to arena page after confirmed defeat"
                 self.commit_action(account, action, outcome)
@@ -5851,6 +5845,53 @@ class Scheduler:
             raise PendingError("survival fight-start click sent; transition still pending, refusing duplicate")
         self.state.set_action(account.name, label, "done", "fight-start control disappeared and battle transition began")
 
+    def _reconcile_survival_start_transition(self, slot: CombatSlot, frame: Image.Image) -> bool:
+        """Confirm a delayed start from fresh bound battle/result evidence without input."""
+        account = slot.account
+        action = self._combat_action_name('survival', slot.next_index)
+        label = action + '_start'
+        original = self.state.action_record(account.name, action)
+        if (not isinstance(original, dict) or original.get('status') != 'pending'
+                or not original.get('before_evidence')
+                or self.state.action_status(account.name, label) == 'done'):
+            return False
+        positive = (self._battle_hud_visible(frame) or self.template(
+            'survival_result_confirm.bmp', (701,519,1151,819), frame, threshold=.98)[0])
+        if not positive:
+            return False
+        fresh = self._content_guard_once(account, (
+            'survival_battle_hud_left_current.bmp', 'survival_result_confirm.bmp'), .98)
+        if not (self._battle_hud_visible(fresh) or self.template(
+                'survival_result_confirm.bmp', (701,519,1151,819), fresh, threshold=.98)[0]):
+            return False
+        if not self.verify_identity(account, fresh)[0]:
+            from hyol_run_context import RunContext
+            context = getattr(self, 'run_context', None)
+            if (not isinstance(context, RunContext) or not context.binding
+                    or self.active != account or not context.layout_matches(fresh)
+                    or context.binding['mapping'].get(account.index) != self.state.aliases.get(account.name, account.name)
+                    or self._saved_tab_mapping().get(account.name) != account.tab_x
+                    or self._generic_active_tab_x(fresh) != account.tab_x):
+                raise PendingError('延迟开战画面缺少本运行账号与当前标签的唯一绑定')
+            context.check_window(self)
+        observations, key = self._survival_attempt_evidence(account, action)
+        row = self.state.accounts[account.name]
+        scope = row.get('survival_operation_scope')
+        run = 2 if self.state.action_status(account.name, 'survival_second_run_started') == 'done' else 1
+        expected = (f'{scope}:run_{run}:{action}' if scope else
+                    f"{row.get('continuation_scope')}:{action}")
+        start = self.state.action_record(account.name, label)
+        if (not (scope or row.get('continuation_scope')) or original.get('operation_id') != expected
+                or original.get('checkpoint_conflict') or start.get('checkpoint_conflict')
+                or (start.get('operation_id') and start['operation_id'] != expected + '_start')
+                or type(observations.get(key, {}).get('score_before')) is not int):
+            raise PendingError('延迟生存开战凭据与本账号、本轮积分基线不一致')
+        self.state.set_action(account.name, label, 'done', '后续轮询已从新鲜战斗或结果画面确认原开战转场')
+        slot.start_confirmed = True
+        self.event('survival_delayed_start_verified', account, index=slot.next_index,
+                   duplicate_click=False)
+        return True
+
     def _poll_survival_slot(self, slot: CombatSlot, frame: Image.Image | None = None) -> None:
         account = slot.account
         frame = frame or self.capture()
@@ -5881,6 +5922,7 @@ class Scheduler:
             slot.start_confirmed = True
             self.event("combat_battle_started", account, mode="survival", index=slot.next_index, resumed=True)
             return
+        self._reconcile_survival_start_transition(slot, frame)
         # Check the result modal before the background battle badge.  This is
         # important on the shared client where the auto badge can outlive the
         # fight-result repaint by one or more frames.
