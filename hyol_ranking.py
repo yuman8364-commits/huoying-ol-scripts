@@ -155,6 +155,10 @@ def run(r):
                 main_seen_at = None
                 s.wait_interruptible(.4)
                 continue
+            if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                r.event('daily_ranking_waiting_result_yield',
+                        detail='排位结果页尚未稳定，先轮询其他账号')
+                return 'yield_waiting_result'
             if main_seen_at is None:
                 main_seen_at = time.monotonic()
             if time.monotonic() - main_seen_at < 3:
@@ -169,6 +173,10 @@ def run(r):
             except hs.PendingError:
                 if phase == 'ready':
                     raise
+                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                    r.event('daily_ranking_waiting_result_yield',
+                            detail='排位剩余次数暂不可读，先轮询其他账号')
+                    return 'yield_waiting_result'
                 # The challenge starts between two captures. Observe the
                 # existing attempt; never interpret a repaint as zero/new work.
                 s.wait_interruptible(.4)
@@ -179,6 +187,10 @@ def run(r):
                 continue
             if phase != 'ready':
                 if count == rec.get('before'):
+                    if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                        r.event('daily_ranking_waiting_result_yield',
+                                detail='结算后的剩余次数尚未变化，先轮询其他账号')
+                        return 'yield_waiting_result'
                     s.wait_interruptible(.4)
                     continue
                 manual_decrement = (phase == 'confirmed'
@@ -227,6 +239,10 @@ def run(r):
             deadline=time.monotonic()+60
         elif r.visible('ranking_result_confirm.bmp',RESULT,frame,.95) and r.visible('ranking_result_stats.bmp',(890,605,1035,653),frame,.95):
             if phase == 'result_sent' or (phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'pending'):
+                if getattr(r, 'interleave_after_end', False):
+                    r.event('daily_ranking_waiting_result_yield',
+                            detail='结果确认仍在处理，先轮询其他账号')
+                    return 'yield_waiting_result'
                 s.wait_interruptible(.4)
                 continue
             if phase == 'result_pending' and s.state.action_status(r.account.name,base+'_result') == 'new':
@@ -274,4 +290,8 @@ def run(r):
                         detail='结束战斗动作已发送，结果留待下轮核实')
                 return 'yield_after_end'
             deadline=time.monotonic()+60
+        if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+            r.event('daily_ranking_waiting_result_yield',
+                    detail='当前账号尚无可核实的排位结算状态，先轮询其他账号')
+            return 'yield_waiting_result'
         s.wait_interruptible(.4)
