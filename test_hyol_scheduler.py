@@ -1726,6 +1726,10 @@ class SchedulerUnitTests(unittest.TestCase):
         self.assertIn('click_may_have_been_sent', poll)
         self.assertIn('duplicate_click=False', poll)
         self.assertIn('elapsed < 30', poll)
+        self.assertIn('slot.start_requested_at = time.monotonic()', start)
+        self.assertIn('score_before=before_score', start)
+        self.assertIn('battle_speed_x1.png', source)
+        self.assertIn('battle_speed_x2.png', source)
         self.assertIn('"survival_auto_enable_recheck"', poll)
         self.assertNotIn("survival auto-battle was not positively enabled", poll)
 
