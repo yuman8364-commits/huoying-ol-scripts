@@ -214,9 +214,12 @@ class RankingTests(unittest.TestCase):
         r.interleave_after_end = True
 
         with patch.object(ranking, 'stable_remaining', side_effect=lambda runner, seconds=8: runner.count):
-            result = ranking.run(r)
+            first_result = ranking.run(r)
+            self.assertEqual(first_result, 'yield_waiting_result')
+            self.assertEqual([name for name, _, _ in r.clicks], ['ranking_result_confirm.bmp'])
+            second_result = ranking.run(r)
 
-        self.assertEqual(result, 'yield_after_end')
+        self.assertEqual(second_result, 'yield_after_end')
         self.assertEqual([name for name, _, _ in r.clicks],
                          ['ranking_result_confirm.bmp',
                           'ranking_challenge.bmp',
