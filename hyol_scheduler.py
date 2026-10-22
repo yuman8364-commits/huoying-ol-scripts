@@ -5811,9 +5811,9 @@ class Scheduler:
         self._click_survival_fight_start(slot)
         slot.start_confirmed = True
         slot.running = True
-        ensure_speed = getattr(self, "_ensure_survival_battle_x2", None)
-        if callable(ensure_speed):
-            ensure_speed(slot, self.capture())
+        # Yield to the next account immediately after the guarded start action.
+        # Speed is verified and set to x2 on this slot's next poll, so a slow
+        # speed-control repaint cannot delay other accounts' battle starts.
         self.event("combat_battle_started", account, mode="survival", index=slot.next_index)
 
     def _click_survival_fight_start(self, slot: CombatSlot) -> None:
@@ -5872,7 +5872,9 @@ class Scheduler:
                                    index=slot.next_index, elapsed_seconds=round(elapsed, 2),
                                    timeout_seconds=30, duplicate_click=False)
                         slot.last_start_transition_event_at = time.monotonic()
-                    self.wait_interruptible(.4)
+                    # This is a cooperative scheduler: do not sleep here.
+                    # Returning lets the caller poll other accounts while this
+                    # tab's start transition is still pending.
                     return
                 raise PendingError('生存开战点击已发送，但30秒内未确认离开开战页；保留待处理，不重复点击')
             self._click_survival_fight_start(slot)
