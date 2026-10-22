@@ -204,6 +204,26 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(r.clicks, [])
         self.assertEqual(r.rec['phase'], 'ready')
 
+    def test_result_reconciliation_starts_next_battle_before_yielding_at_its_end(self):
+        r = self.runner(2)
+        r.mode = 'result'
+        r.rec.update(completed=0, before=2, phase='end_sent', status='pending')
+        r.actions.update(daily_ranking_1_start='pending',
+                         daily_ranking_1_confirm='pending',
+                         daily_ranking_1_end='pending')
+        r.interleave_after_end = True
+
+        with patch.object(ranking, 'stable_remaining', side_effect=lambda runner, seconds=8: runner.count):
+            result = ranking.run(r)
+
+        self.assertEqual(result, 'yield_after_end')
+        self.assertEqual([name for name, _, _ in r.clicks],
+                         ['ranking_result_confirm.bmp',
+                          'ranking_challenge.bmp',
+                          'ranking_end_battle.bmp'])
+        self.assertEqual(r.rec['completed'], 1)
+        self.assertEqual(r.rec['phase'], 'end_sent')
+
     def test_preexisting_zero_never_starts_battle(self):
         r=self.runner(0)
         with patch.object(ranking,'stable_remaining',return_value=0):
