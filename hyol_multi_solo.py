@@ -774,13 +774,20 @@ class MultiSoloRunner:
                 s.navigator = runner
                 frame = s.capture()
                 page_visible = runner.visible('survival_anchor.bmp', (201, 69, 601, 419), frame)
-                in_combat = s._combat_active_visible('survival', frame)
                 actions = s.state.accounts.get(account.name, {}).get('actions', {})
                 has_pending_battle = any(
                     key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
                     and isinstance(value, dict) and value.get('status') == 'pending'
                     for key, value in actions.items())
-                if in_combat or has_pending_battle or (page_visible and record.get('followup_check_due')):
+                has_survival_attempt = any(
+                    key.startswith('survival_battle_step_') and isinstance(value, dict)
+                    and value.get('status') in ('pending', 'done')
+                    for key, value in actions.items())
+                in_combat = (s._battle_hud_visible(frame)
+                             or s.template('survival_result_confirm.bmp', (701, 519, 1151, 819), frame)[0]
+                             or s.template('survival_reward_result_confirm.bmp', (701, 569, 1151, 819), frame)[0])
+                if (in_combat or has_pending_battle
+                        or (page_visible and (has_survival_attempt or record.get('followup_check_due')))):
                     # Resume the exact page/attempt. Never change formation while
                     # a battle or an unresolved result may still be active.
                     runner.formation_checked = True
