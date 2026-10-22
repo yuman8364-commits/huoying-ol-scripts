@@ -46,9 +46,11 @@ class EventMessageTests(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
-    def test_defaults_keep_five_wins_and_treasure_unselected(self):
+    def test_defaults_exhaust_tickets_and_keep_five_wins_as_auxiliary(self):
         request = runtime.RunRequest()
         self.assertEqual(request.arena_wins, 5)
+        self.assertEqual(request.arena_target_mode, 'tickets')
+        self.assertEqual(runtime.RunRequest(arena_target_mode='wins', arena_wins=3).arena_target_mode, 'wins')
         self.assertEqual(request.account_count, 6)
         self.assertNotIn('treasure', request.tasks)
         self.assertTrue(request.final_managed)
@@ -56,7 +58,7 @@ class RequestTests(unittest.TestCase):
     def test_invalid_team_members_or_duplicate_tasks_are_rejected(self):
         for options in ({'mode': 'team', 'leader': 1, 'members': (1,)},
                         {'mode': 'team', 'members': (2, 2)},
-                        {'tasks': ('mail', 'mail')}, {'account_count': 7}):
+                        {'tasks': ('mail', 'mail')}, {'account_count': 7}, {'arena_target_mode': 'unknown'}):
             with self.assertRaises(ValueError):
                 runtime.RunRequest(**options)
 
@@ -79,6 +81,7 @@ class RequestTests(unittest.TestCase):
                 self.assertEqual(create.call_args.args, ('all',))
                 self.assertEqual(create.call_args.kwargs['selected_tasks'], ('mail',) if mode == 'solo' else (mode,))
                 self.assertTrue(create.call_args.kwargs['generic_current_window'])
+                self.assertEqual(create.call_args.kwargs['arena_target_mode'], 'tickets')
                 self.assertFalse(fake.scheduler.allow_purchase)
                 self.assertEqual(fake.scheduler.config['AllowMarketPurchase'], '0')
                 self.assertEqual(fake.scheduler.config['ManagedSafetyVerified'], '1')
@@ -86,9 +89,10 @@ class RequestTests(unittest.TestCase):
     def test_multi_and_bond_parameters_reach_their_existing_runners(self):
         fake = finished_daily()
         with patch.object(runtime, 'MultiSoloRunner', return_value=fake) as create:
-            runtime.make_runner(runtime.RunRequest(mode='multi', account_count=3, arena_wins=7), Mock(), Path('unused'))
+            runtime.make_runner(runtime.RunRequest(mode='multi', account_count=3, arena_wins=7, arena_target_mode='wins'), Mock(), Path('unused'))
             self.assertEqual(create.call_args.kwargs['account_count'], 3)
             self.assertEqual(create.call_args.kwargs['arena_wins'], 7)
+            self.assertEqual(create.call_args.kwargs['arena_target_mode'], 'wins')
         with patch.object(runtime, 'BondRunner', return_value=fake) as create:
             runtime.make_runner(runtime.RunRequest(mode='bond', bond_count=8), Mock(), Path('unused'))
             self.assertEqual(create.call_args.args, (8,))
