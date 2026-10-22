@@ -579,6 +579,9 @@ class UnifiedClient(tk.Tk):
                 if health and health not in ('已绑定', '身份待核实'):
                     status = '离线'
                     task_label = '—'
+                elif health == '身份待核实':
+                    status = '待核验'
+                    task_label = '—'
                 elif pending:
                     status = '待处理'
                     task_label = pending[0]
@@ -588,6 +591,12 @@ class UnifiedClient(tk.Tk):
                 elif total and done_count == total:
                     status = '已完成'
                     task_label = '—'
+                elif self.active_request is not None and self.active_request.mode == 'team':
+                    status = '运行中' if self.controller.busy else '待核验'
+                    task_label = '组队任务'
+                elif self.active_request is not None and self.active_request.mode == 'team_then_multi' and self.controller.busy:
+                    status = '运行中'
+                    task_label = '组队阶段'
                 elif health == '身份待核实':
                     status = '待核验'
                     task_label = '—'
