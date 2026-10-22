@@ -191,6 +191,19 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(r.clicks, [])
         self.assertEqual(r.rec['phase'], 'result_sent')
 
+    def test_ready_phase_with_pending_action_never_replays_challenge(self):
+        r = self.runner(2)
+        r.mode = 'page'
+        r.rec.update(completed=0, phase='ready')
+        r.actions['daily_ranking_1_start'] = 'pending'
+        r.interleave_after_end = True
+
+        with self.assertRaises(hs.PendingError):
+            ranking.run(r)
+
+        self.assertEqual(r.clicks, [])
+        self.assertEqual(r.rec['phase'], 'ready')
+
     def test_preexisting_zero_never_starts_battle(self):
         r=self.runner(0)
         with patch.object(ranking,'stable_remaining',return_value=0):
