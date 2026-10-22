@@ -594,12 +594,12 @@ class UnifiedClient(tk.Tk):
                 elif self.active_request is not None and self.active_request.mode == 'team':
                     status = '运行中' if self.controller.busy else '待核验'
                     task_label = '组队任务'
-                elif self.active_request is not None and self.active_request.mode == 'team_then_multi' and self.controller.busy:
-                    status = '运行中'
-                    task_label = '组队阶段'
                 elif done_count:
                     status = '进行中'
                     task_label = next((task for task, rec in relevant if rec.get('status') not in ('done', 'unselected')), '—')
+                elif self.active_request is not None and self.active_request.mode == 'team_then_multi' and self.controller.busy:
+                    status = '运行中'
+                    task_label = '组队阶段'
                 else:
                     status = '待开始'
                     task_label = next((task for task, rec in relevant if rec.get('status') not in ('done', 'unselected')), '—')
