@@ -8,6 +8,49 @@ import hyol_scheduler as hs
 
 
 class DailyTaskTests(unittest.TestCase):
+    def test_survival_speed_switch_is_verified_and_scoped_per_run(self):
+        scheduler = object.__new__(daily.DailyScheduler)
+        account = hs.Account(1, 'speed-test', 180)
+        slot = type('Slot', (), {'account': account, 'next_index': 3})()
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler.state = type('State', (), {'action_status': Mock(return_value='new')})()
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name == 'battle_speed_x1.png', 1.0, 0, 0))
+        scheduler._battle_auto_on_visible = Mock(return_value=True)
+        scheduler.click_template = Mock(return_value=True)
+        scheduler.wait_template = Mock(return_value=True)
+        scheduler.commit_action = Mock()
+        scheduler.event = Mock()
+
+        self.assertTrue(scheduler._ensure_survival_battle_x2(slot, frame))
+
+        self.assertEqual(scheduler.click_template.call_args.args[1], 'battle_speed_x1.png')
+        self.assertEqual(scheduler.click_template.call_args.args[5],
+                         'survival_run_1_battle_speed_x2_3')
+        self.assertTrue(scheduler.click_template.call_args.kwargs['irreversible'])
+        scheduler.commit_action.assert_called_once_with(
+            account, 'survival_run_1_battle_speed_x2_3',
+            '生存战斗速度已从x1切换并确认x2')
+
+    def test_survival_speed_already_x2_never_toggles_again(self):
+        scheduler = object.__new__(daily.DailyScheduler)
+        account = hs.Account(1, 'speed-test', 180)
+        slot = type('Slot', (), {'account': account, 'next_index': 1})()
+        frame = Image.new('RGB', (1920, 1032))
+        scheduler.state = type('State', (), {'action_status': Mock(return_value='new')})()
+        scheduler.template = Mock(side_effect=lambda name, *args, **kwargs:
+                                  (name == 'battle_speed_x2.png', 1.0, 0, 0))
+        scheduler._battle_auto_on_visible = Mock()
+        scheduler.click_template = Mock()
+        scheduler.wait_template = Mock()
+        scheduler.commit_action = Mock()
+        scheduler.event = Mock()
+
+        self.assertTrue(scheduler._ensure_survival_battle_x2(slot, frame))
+
+        scheduler.click_template.assert_not_called()
+        scheduler.wait_template.assert_not_called()
+
     def test_quiz_is_solo_option_only(self):
         self.assertEqual(daily.selected_sequence('all',['quiz']), ('quiz',))
         with self.assertRaises(ValueError):
