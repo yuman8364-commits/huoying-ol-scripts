@@ -784,7 +784,19 @@ class MultiSoloRunner:
                     # a battle or an unresolved result may still be active.
                     runner.formation_checked = True
                 elif not runner.formation_checked:
-                    runner.ensure_formation_once()
+                    try:
+                        runner.ensure_formation_once()
+                    except hs.AccountOffline as exc:
+                        self.skip_disconnected(account, 'survival')
+                        continue
+                    except hs.PendingError as exc:
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error=str(exc))
+                        runner.save()
+                        self.deferred[account.name] = 'survival'
+                        self.deferred_at[account.name] = time.monotonic()
+                        self.event('multi_solo_survival_prepare_pending', account, detail=str(exc))
+                        continue
                 record.update(status='running', last_error='')
                 runner.save()
                 runners[account.name] = runner
