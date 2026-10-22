@@ -304,7 +304,7 @@ def run(r):
                         detail='结束战斗动作已发送，结果留待下轮核实')
                 return 'yield_after_end'
             deadline=time.monotonic()+60
-        if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+        if getattr(r, 'interleave_after_end', False) and rec.get('phase', phase) in ('end_sent', 'result_sent'):
             r.event('daily_ranking_waiting_result_yield',
                     detail='当前账号尚无可核实的排位结算状态，先轮询其他账号')
             return 'yield_waiting_result'
