@@ -914,7 +914,7 @@ class MultiSoloRunner:
                         return False
                     runner = self.runner_for(account)
                     runner.current = 'ranking'
-                record = runner.record('ranking')
+                    record = runner.record('ranking')
                     phase = record.get('phase', 'ready')
                     running = phase != 'ready'
                     s.navigator = runner
