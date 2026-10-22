@@ -12,6 +12,121 @@ import hyol_scheduler as hs
 
 
 class MultiSoloTests(unittest.TestCase):
+    def test_survival_stage_starts_all_accounts_in_one_interleaved_scheduler(self):
+        coordinator = object.__new__(multi.MultiSoloRunner)
+        accounts = [hs.Account(1, ROLE_A, 180), hs.Account(2, ROLE_B, 310)]
+        runners = {}
+        records = {}
+        for account in accounts:
+            record = {'status': 'new', 'task_completed': False,
+                      'home_returned': False, 'followup_check_due': False}
+            records[account.name] = record
+            runners[account.name] = SimpleNamespace(
+                account=account, formation_checked=False,
+                record=lambda task, record=record: record,
+                visible=Mock(return_value=False),
+                ensure_formation_once=Mock(),
+                save=Mock(),
+            )
+        state = SimpleNamespace(
+            accounts={account.name: {'actions': {}} for account in accounts},
+            action_status=Mock(return_value='new'),
+        )
+        scheduler = SimpleNamespace(
+            accounts=list(accounts), by_name={account.name: account for account in accounts},
+            state=state, navigator='original-navigator', _task_observation=None,
+            survival_inline_two_runs=False, capture=Mock(return_value=Image.new('RGB', (1920, 1032))),
+            _combat_active_visible=Mock(return_value=False),
+            run_combat_interleaved=Mock(),
+            _account_module_complete=Mock(return_value=True),
+        )
+        def run_interleaved(mode):
+            self.assertEqual(mode, 'survival')
+            self.assertEqual(scheduler.accounts, accounts)
+            self.assertEqual(set(scheduler._combat_navigators), {account.name for account in accounts})
+        scheduler.run_combat_interleaved.side_effect = run_interleaved
+        coordinator.scheduler = scheduler
+        coordinator.startup_returned = {account.name for account in accounts}
+        coordinator.manual_deferred = set()
+        coordinator.deferred = {}
+        coordinator.deferred_at = {}
+        coordinator.excluded = set()
+        coordinator.disconnected = set()
+        coordinator.blocked_tasks = {}
+        coordinator.check_account = Mock(return_value=True)
+        coordinator.runner_for = lambda account: runners[account.name]
+        coordinator.note_skipped = Mock()
+        coordinator.event = Mock()
+        coordinator.save_progress = Mock()
+
+        self.assertTrue(coordinator._run_survival_stage())
+
+        scheduler.run_combat_interleaved.assert_called_once_with('survival')
+        self.assertEqual(scheduler.accounts, accounts)
+        self.assertEqual(scheduler.navigator, 'original-navigator')
+        self.assertFalse(scheduler.survival_inline_two_runs)
+        for account in accounts:
+            self.assertEqual(records[account.name]['status'], 'done')
+            self.assertFalse(records[account.name]['followup_check_due'])
+
+    def test_ranking_stage_round_robins_after_each_end_battle_yield(self):
+        coordinator = object.__new__(multi.MultiSoloRunner)
+        accounts = [hs.Account(1, ROLE_A, 180), hs.Account(2, ROLE_B, 310)]
+        runners = {}
+        records = {}
+        call_order = []
+        for account in accounts:
+            record = {'status': 'new', 'phase': 'ready', 'completed': 0,
+                      'remaining': 2, 'zero_verified': False}
+            records[account.name] = record
+            count = {'value': 0}
+            def ranking_step(account=account, record=record, count=count):
+                count['value'] += 1
+                call_order.append(account.name)
+                if count['value'] == 1:
+                    record.update(phase='end_sent', status='running')
+                    return 'yield_after_end'
+                record.update(phase='ready', zero_verified=True, remaining=0, completed=2)
+                return None
+            runners[account.name] = SimpleNamespace(
+                account=account, record=lambda task, record=record: record,
+                save=Mock(), ranking=Mock(side_effect=ranking_step),
+                return_to_main=Mock(), interleave_after_end=False,
+            )
+        scheduler = SimpleNamespace(
+            accounts=list(accounts), by_name={account.name: account for account in accounts},
+            check_pause_boundary=Mock(return_value=False), check_stop=Mock(),
+            switch_account_for_combat=Mock(),
+            capture=Mock(return_value=Image.new('RGB', (1920, 1032))),
+            main_ready=Mock(return_value=True),
+            template=Mock(return_value=(True, 1.0, 0, 0)),
+        )
+        coordinator.scheduler = scheduler
+        coordinator.startup_returned = {account.name for account in accounts}
+        coordinator.manual_deferred = set()
+        coordinator.deferred = {}
+        coordinator.deferred_at = {}
+        coordinator.excluded = set()
+        coordinator.disconnected = set()
+        coordinator.blocked_tasks = {}
+        coordinator.runner_for = lambda account: runners[account.name]
+        coordinator.note_skipped = Mock()
+        coordinator.skip_disconnected = Mock()
+        coordinator.skip_stalled = Mock()
+        coordinator.event = Mock()
+        coordinator.save_progress = Mock()
+
+        self.assertTrue(coordinator._run_ranking_stage())
+
+        self.assertEqual(call_order, [accounts[0].name, accounts[1].name,
+                                      accounts[0].name, accounts[1].name])
+        self.assertEqual([call.args[0].name for call in scheduler.switch_account_for_combat.call_args_list],
+                         call_order)
+        for account in accounts:
+            self.assertEqual(records[account.name]['status'], 'done')
+            self.assertTrue(records[account.name]['zero_verified'])
+            self.assertEqual(records[account.name]['remaining'], 0)
+
     def test_arena_stage_does_not_restart_accounts_already_audited(self):
         coordinator = object.__new__(multi.MultiSoloRunner)
         audited = hs.Account(1, ROLE_A, 180)
