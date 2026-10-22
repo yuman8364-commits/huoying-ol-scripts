@@ -2045,7 +2045,12 @@ class Scheduler:
     def switch_account(self, account: Account, verify: bool = True) -> Image.Image:
         context = getattr(self, 'run_context', None)
         if context and context.binding and not context.probing:
-            return context.select(self, account)
+            # A running battle/result modal hides the in-game identity strip.
+            # In the full client, permit tab-title-verified observation of that
+            # hidden page so the round robin can switch away and revisit it.
+            # Content actions still require their own fresh identity/page gates.
+            return context.select(self, account,
+                                  allow_hidden=running, allow_transition=running)
         # Click near the upper tab body rather than the close glyph.  The
         # browser recalculates tab widths as titles repaint; using the title
         # band keeps a fixed enrolled x-coordinate from landing on an adjacent
