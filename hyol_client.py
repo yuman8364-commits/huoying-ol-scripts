@@ -541,7 +541,8 @@ class UnifiedClient(tk.Tk):
                 request = self.active_request
                 if request is not None and request.mode in ('solo', 'arena', 'bond', 'weekend', 'treasure'):
                     task_codes = [code for code in self._active_task_codes() if code != 'managed']
-                    task_label = (SOLO_LABELS.get(task_codes[0], task_codes[0])
+                    task_label = ('羁绊' if request.mode == 'bond' else
+                                  SOLO_LABELS.get(task_codes[0], task_codes[0])
                                   if len(task_codes) == 1 else '多项任务')
                     run_status = str(self.status.get())
                     if self.controller.busy:
