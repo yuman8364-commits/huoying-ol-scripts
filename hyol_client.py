@@ -27,7 +27,11 @@ EVENT_LABELS = {'daily_task_started': '任务开始', 'daily_task_complete': '�
                 'generic_team_managed_pending': '托管待处理', 'multi_solo_managed_complete': '托管已确认',
                 'multi_solo_managed_pending': '托管待处理', 'account_disconnected_skipped': '账号掉线，已跳过',
                 'navigation_step_verified': '退出与回村阶段已确认', 'navigation_pending': '回村待处理',
-                'combat_battle_started': '战斗已开始', 'arena_victory_confirmed': '胜利已确认',
+                'combat_battle_start_requested': '已发送开战请求，稍后轮询确认',
+                'combat_battle_started': '已确认进入战斗或匹配',
+                'combat_slot_quarantined_after_pending': '该账号状态待核实，已继续处理其他账号',
+                'arena_tickets_exhausted_verified': '战令次数已核实归零',
+                'arena_victory_confirmed': '胜利已确认',
                 'arena_defeat_confirmed': '失败，不计入胜场', 'treasure_started': '挖宝计时已开始',
                 'treasure_complete': '挖宝已暂停并回村', 'bond_command_summary': '羁绊结果',
                 'puzzle_difficulty_complete': '拼图该难度已通关并领奖',
@@ -76,6 +80,7 @@ class UnifiedClient(tk.Tk):
         self.scope = tk.StringVar(value='当前账号')
         self.account_count = tk.StringVar(value='6')
         self.arena_wins = tk.StringVar(value='5')
+        self.arena_use_win_target = tk.BooleanVar(value=False)
         self.formation = tk.StringVar(value='保持不变')
         self.bond_count = tk.StringVar(value='5')
         self.new_bond_round = tk.BooleanVar(value=False)
@@ -194,14 +199,22 @@ class UnifiedClient(tk.Tk):
                   wraplength=840).pack(anchor='w', pady=12)
         common = ttk.Frame(box)
         common.pack(fill='x', pady=(12, 8))
-        ttk.Label(common, text='竞技场追加胜场').pack(side='left')
-        ttk.Spinbox(common, from_=1, to=10, width=5, textvariable=self.arena_wins).pack(side='left', padx=(8, 18))
+        ttk.Label(common, text='竞技场结束：战令归零（默认）').pack(side='left', padx=(0, 10))
+        self.arena_target_control = ttk.Checkbutton(
+            common, text='按指定胜场数停止（辅助）', variable=self.arena_use_win_target,
+            command=self._arena_target_changed)
+        self.arena_target_control.pack(side='left', padx=(0, 8))
+        ttk.Label(common, text='胜场').pack(side='left')
+        self.arena_wins_control = ttk.Spinbox(common, from_=1, to=10, width=5,
+                                              textvariable=self.arena_wins, state='disabled')
+        self.arena_wins_control.pack(side='left', padx=(6, 18))
         ttk.Label(common, text='阵容').pack(side='left')
         ttk.Combobox(common, values=('保持不变', '主力阵容', '速刷阵容'), state='readonly', width=12,
                      textvariable=self.formation).pack(side='left', padx=8)
         self.managed_control = ttk.Checkbutton(common, text='最后进入托管', variable=self.final_managed)
         self.managed_control.pack(side='right')
-        ttk.Label(box, text='每次开始按当前画面执行 · 等待时减少切换 · 掉线账号本轮暂缓', foreground='#555555').pack(anchor='w')
+        ttk.Label(box, text='竞技场先逐号发起战斗，再轮询检查；默认耗尽战令，指定胜场为辅助模式。掉线账号本轮暂缓。',
+                  foreground='#555555', wraplength=900).pack(anchor='w')
         controls = ttk.Frame(box)
         controls.pack(fill='x', pady=12)
         self.start_button = ttk.Button(controls, text='开始', command=self._start)
@@ -237,7 +250,9 @@ class UnifiedClient(tk.Tk):
         leaders = (tuple(int(v.get()) for v in self.pipeline_leaders if v.get() != '不选')
                    if mode == 'team_then_multi' and not self.pipeline_auto.get() else ())
         return RunRequest(mode=mode, tasks=tuple(task for task, variable in self.task_vars.items() if variable.get()),
-                          account_count=6 if mode == 'team_then_multi' else int(self.account_count.get()), arena_wins=int(self.arena_wins.get()),
+                          account_count=6 if mode == 'team_then_multi' else int(self.account_count.get()),
+                          arena_wins=int(self.arena_wins.get()),
+                          arena_target_mode='wins' if self.arena_use_win_target.get() else 'tickets',
                           formation={'保持不变':'keep', '主力阵容':'main', '速刷阵容':'fast'}[self.formation.get()],
                           leader=int(self.leader.get()), members=tuple(index for index, variable in self.member_vars.items() if variable.get()),
                           leaders=leaders,
@@ -245,6 +260,9 @@ class UnifiedClient(tk.Tk):
                           team_tasks=tuple(task for task, variable in (self.pipeline_task_vars if mode == 'team_then_multi' else self.team_vars).items() if variable.get()),
                           bond_count=int(self.bond_count.get()), new_bond_round=mode == 'bond' and self.new_bond_round.get(),
                           final_managed=self.final_managed.get())
+
+    def _arena_target_changed(self):
+        self.arena_wins_control.configure(state='normal' if self.arena_use_win_target.get() else 'disabled')
 
     def _team_mode_changed(self):
         pipeline = self.team_mode.get() == '已有队伍 → 多人单人'
