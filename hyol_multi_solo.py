@@ -751,17 +751,33 @@ class MultiSoloRunner:
         try:
             for configured in tuple(original_accounts):
                 account = s.by_name.get(configured.name, configured)
+                if account.name in getattr(self, 'arena_rewards_audited', set()):
+                    self.event('multi_solo_task_skip_done', account, task='arena',
+                               detail='本轮已核实战令归零和奖励领取，不重复开启')
+                    continue
                 if (account.name not in self.startup_returned
                         or account.name in self.manual_deferred
                         or account.name in self.deferred
                         or account.name in self.excluded
                         or account.name in self.disconnected):
                     self.note_skipped(account, 'arena')
+                    runner = self.runner_for(account)
+                    record = runner.record('arena')
+                    if record.get('status') == 'running':
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error='账号本轮暂缓，未执行竞技场')
+                        runner.save()
                     continue
                 if self.check_account(account):
                     candidates.append(account)
                 else:
                     self.note_skipped(account, 'arena')
+                    runner = self.runner_for(account)
+                    record = runner.record('arena')
+                    if record.get('status') == 'running':
+                        record.update(status='pending', task_completed=False, home_returned=False,
+                                      last_error='账号身份或在线状态未确认，本轮暂缓竞技场')
+                        runner.save()
             if not candidates:
                 self.event('multi_solo_arena_no_eligible_accounts',
                            detail='没有通过身份与在线检查的竞技场账号')
