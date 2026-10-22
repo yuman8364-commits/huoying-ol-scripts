@@ -754,6 +754,7 @@ class MultiSoloRunner:
             for configured in tuple(original_accounts):
                 account = s.by_name.get(configured.name, configured)
                 runner = self.runner_for(account)
+                runner.current = 'survival'
                 record = runner.record('survival')
                 if (record.get('status') == 'done' and record.get('task_completed')
                         and record.get('home_returned') and not record.get('followup_check_due')):
@@ -912,7 +913,8 @@ class MultiSoloRunner:
                         self.save_progress('paused')
                         return False
                     runner = self.runner_for(account)
-                    record = runner.record('ranking')
+                    runner.current = 'ranking'
+                record = runner.record('ranking')
                     phase = record.get('phase', 'ready')
                     running = phase != 'ready'
                     s.navigator = runner
