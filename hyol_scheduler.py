@@ -6040,8 +6040,9 @@ class Scheduler:
                         self._start_arena_slot(slot)
                     else:
                         self._start_survival_slot(slot)
-                if mode == 'arena' and slot.running:
-                    slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
+                if slot.running:
+                    slot.next_poll_at = time.monotonic() + (
+                        ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
             except AccountOffline as exc:
                 slot.unavailable = True
                 self.state.set_module(slot.account.name, mode, 'pending', str(exc))
@@ -6051,11 +6052,11 @@ class Scheduler:
                 self.state.set_module(slot.account.name, mode, "pending", str(exc))
                 self.state.add_pending(slot.account.name, mode, str(exc))
                 self.event("combat_slot_pending", slot.account, mode=mode, detail=str(exc))
-                if mode == 'arena':
-                    action = self._combat_action_name('arena', slot.next_index)
+                if mode in ('arena', 'survival'):
+                    action = self._combat_action_name(mode, slot.next_index)
                     if self.state.action_status(slot.account.name, action) == 'pending':
                         slot.running = True
-                        if slot.start_requested_at is None:
+                        if mode == 'arena' and slot.start_requested_at is None:
                             slot.start_requested_at = time.monotonic()
                     if not slot.running:
                         if (self.active == slot.account
@@ -6063,8 +6064,10 @@ class Scheduler:
                             raise LeaseBlocked(f"{mode} preparation did not return through a verified main page") from exc
                         slot.needs_prepare = True
                     slot.pending_checks += 1
-                    slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
-                    if slot.pending_checks >= ARENA_SLOT_PENDING_LIMIT:
+                    slot.next_poll_at = time.monotonic() + (
+                        ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
+                    limit = ARENA_SLOT_PENDING_LIMIT if mode == 'arena' else SURVIVAL_SLOT_PENDING_LIMIT
+                    if slot.pending_checks >= limit:
                         slot.unavailable = True
                         self.event('combat_slot_quarantined_after_pending', slot.account, mode=mode,
                                    checks=slot.pending_checks, detail=str(exc))
@@ -6081,7 +6084,7 @@ class Scheduler:
             for slot in slots:
                 if slot.complete or slot.unavailable:
                     continue
-                if mode == 'arena' and time.monotonic() < slot.next_poll_at:
+                if mode in ('arena', 'survival') and time.monotonic() < slot.next_poll_at:
                     continue
                 if pause_requested and not slot.running:
                     continue
@@ -6100,16 +6103,20 @@ class Scheduler:
                             if not slot.complete and not slot.running:
                                 self._start_arena_slot(slot)
                         else:
-                            self._start_survival_slot(slot)
+                            if slot.needs_prepare:
+                                self._prepare_survival_slot(slot)
+                                slot.needs_prepare = False
+                            if not slot.complete and not slot.running:
+                                self._start_survival_slot(slot)
                     if not slot.running and slot.next_index > self._combat_limit(mode, slot.account):
                         if mode == "arena":
                             self._finish_arena_slot(slot)
                         else:
                             self._finish_survival_slot(slot)
-                    if mode == 'arena':
-                        slot.pending_checks = 0
-                        if slot.running:
-                            slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
+                    slot.pending_checks = 0
+                    if slot.running:
+                        slot.next_poll_at = time.monotonic() + (
+                            ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4)
                     progress = True
                 except AccountOffline as exc:
                     slot.unavailable = True
@@ -6128,21 +6135,23 @@ class Scheduler:
                     self.state.set_module(slot.account.name, mode, "pending", str(exc))
                     self.state.add_pending(slot.account.name, mode, str(exc))
                     self.event("combat_slot_pending", slot.account, mode=mode, detail=str(exc), running=slot.running)
-                    if mode == 'arena':
-                        action = self._combat_action_name('arena', slot.next_index)
+                    if mode in ('arena', 'survival'):
+                        action = self._combat_action_name(mode, slot.next_index)
                         if self.state.action_status(slot.account.name, action) == 'pending':
                             slot.running = True
-                            if slot.start_requested_at is None:
+                            if mode == 'arena' and slot.start_requested_at is None:
                                 slot.start_requested_at = time.monotonic()
                         slot.pending_checks += 1
+                        interval = ARENA_POLL_INTERVAL_SECONDS if mode == 'arena' else 0.4
                         if slot.running:
-                            slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
+                            slot.next_poll_at = time.monotonic() + interval
                         else:
                             if self.active == slot.account and not self.ensure_account_main_before_release(slot.account, mode):
                                 raise LeaseBlocked(f"{mode} slot did not return through a verified main page") from exc
                             slot.needs_prepare = True
-                            slot.next_poll_at = time.monotonic() + ARENA_POLL_INTERVAL_SECONDS
-                        if slot.pending_checks >= ARENA_SLOT_PENDING_LIMIT:
+                            slot.next_poll_at = time.monotonic() + interval
+                        limit = ARENA_SLOT_PENDING_LIMIT if mode == 'arena' else SURVIVAL_SLOT_PENDING_LIMIT
+                        if slot.pending_checks >= limit:
                             slot.unavailable = True
                             self.event('combat_slot_quarantined_after_pending', slot.account, mode=mode,
                                        checks=slot.pending_checks, detail=str(exc))
