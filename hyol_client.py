@@ -151,9 +151,11 @@ class UnifiedClient(tk.Tk):
                   foreground=[('selected', '#111827')])
         try:
             style.layout('Hidden.TNotebook', [('Notebook.client', {'sticky': 'nswe'})])
+            style.layout('Hidden.TNotebook.Tab', [])
         except tk.TclError:
             pass
         style.configure('Hidden.TNotebook', background='#FFFFFF', borderwidth=0, tabmargins=0)
+        style.configure('Hidden.TNotebook.Tab', padding=0, borderwidth=0)
 
         self.geometry('1180x820+35+45')
         self.minsize(1000, 720)
