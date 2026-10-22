@@ -153,6 +153,10 @@ def run(r):
                 and not r.visible('ranking_page.bmp', PAGE, frame, .95)):
             if transition_loading_visible(frame):
                 main_seen_at = None
+                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                    r.event('daily_ranking_waiting_result_yield',
+                            detail='排位结算页面正在加载，先轮询其他账号')
+                    return 'yield_waiting_result'
                 s.wait_interruptible(.4)
                 continue
             if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
