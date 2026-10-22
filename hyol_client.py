@@ -445,18 +445,19 @@ class UnifiedClient(tk.Tk):
             arena_box.grid(row=row, column=0, sticky='ew', pady=(0, 5))
             self.task_specific_box.columnconfigure(0, weight=1)
             ttk.Label(arena_box, text='结束条件').pack(side='left', padx=(0, 8))
-            ttk.Radiobutton(arena_box, text='战令归零（默认）',
-                            variable=self.arena_use_win_target, value=False,
-                            command=self._arena_target_changed).pack(side='left', padx=(0, 10))
-            ttk.Radiobutton(arena_box, text='指定胜场（辅助）',
-                            variable=self.arena_use_win_target, value=True,
-                            command=self._arena_target_changed).pack(side='left', padx=(0, 8))
+            self.arena_tickets_control = ttk.Radiobutton(
+                arena_box, text='战令归零（默认）', variable=self.arena_use_win_target,
+                value=False, command=self._arena_target_changed)
+            self.arena_tickets_control.pack(side='left', padx=(0, 10))
+            self.arena_target_control = ttk.Radiobutton(
+                arena_box, text='指定胜场（辅助）', variable=self.arena_use_win_target,
+                value=True, command=self._arena_target_changed)
+            self.arena_target_control.pack(side='left', padx=(0, 8))
             ttk.Label(arena_box, text='胜场').pack(side='left')
             self.arena_wins_control = ttk.Spinbox(
                 arena_box, from_=1, to=10, width=4, textvariable=self.arena_wins,
                 state='normal' if self.arena_use_win_target.get() else 'disabled')
             self.arena_wins_control.pack(side='left', padx=(5, 0))
-            self.arena_target_control = True
             row += 1
         if 'bond' in codes:
             bond_box = ttk.Frame(self.task_specific_box)
@@ -627,6 +628,8 @@ class UnifiedClient(tk.Tk):
             if self.controller.start(request):
                 self.new_bond_round.set(False)
                 self.progress_view.set_run(self.controller.identifier)
+                self.active_request = request
+                self._refresh_account_list()
                 self.log.configure(state='normal')
                 self.log.delete('1.0','end')
                 self.log.configure(state='disabled')
