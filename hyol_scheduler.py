@@ -4775,7 +4775,12 @@ class Scheduler:
                            detail="排位按钮点击前刷新，重新核对战令可用状态")
             elif ready and casual and tokens == 0:
                 casual_only_frames += 1
-                if casual_only_frames >= 3:
+                if self._arena_target_mode_for(account) == 'tickets':
+                    if casual_only_frames >= 3:
+                        self.event('arena_tickets_exhausted_verified', account,
+                                   remaining=0, samples=casual_only_frames)
+                        return 'tickets_exhausted'
+                elif casual_only_frames >= 3:
                     evidence = self.save_raw_evidence(frame, account,
                                                       "arena_ranked_unavailable", "verified")
                     self.event("arena_ranked_unavailable", account,
@@ -4783,8 +4788,8 @@ class Scheduler:
                     if self.click_template(account, "arena_casual_button_current.bmp",
                                            (760, 719, 1050, 919), 88, 29, action,
                                            ["arena_ready_anchor.bmp", "arena_casual_button_current.bmp"],
-                                   irreversible=True,
-                                   frame_predicate=lambda fresh: self._arena_token_count(fresh) == 0):
+                                           irreversible=True,
+                                           frame_predicate=lambda fresh: self._arena_token_count(fresh) == 0):
                         self.event("arena_battle_mode_selected", account,
                                    battle_mode="casual", target=action)
                         return "casual"
@@ -4794,6 +4799,10 @@ class Scheduler:
                 current_fight_frames += 1
                 casual_only_frames = 0
                 if current_fight_frames >= 3:
+                    if self._arena_target_mode_for(account) == 'tickets':
+                        self.event('arena_tickets_exhausted_verified', account,
+                                   remaining=0, samples=current_fight_frames)
+                        return 'tickets_exhausted'
                     if self.click_template(
                         account,
                         "arena_battle_button_current.bmp",
@@ -4877,6 +4886,10 @@ class Scheduler:
         # reward claims.  Require a successful guarded revalidation, while
         # allowing a transient frame replacement to retry without any click.
         battle_mode = self._click_arena_mode_when_stable(account, action)
+        if battle_mode == 'tickets_exhausted':
+            slot.next_index = self._combat_limit('arena', account) + 1
+            self._finish_arena_slot(slot)
+            return
         if battle_mode is None:
             if self._arena_victory_confirmed(account):
                 self._finish_arena_slot(slot)
