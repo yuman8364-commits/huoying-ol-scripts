@@ -158,6 +158,7 @@ def run(r):
                     detail='只重进原排位页核对次数；未重复开战或发送结算')
     watchdog = hs.BattleWatchdog(mode='ranking')
     main_seen_at = None
+    unchanged_page_since = None
     while True:
         s.check_stop()
         frame = s.capture()
@@ -202,10 +203,16 @@ def run(r):
                 continue
             if phase != 'ready':
                 if count == rec.get('before'):
-                    if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                        return _yield_waiting_result(r, rec, '结算后的剩余次数尚未变化，先轮询其他账号')
+                    if getattr(r, 'interleave_after_end', False):
+                        return _yield_waiting_result(r, rec, '原挑战的剩余次数尚未变化，保留动作并轮询其他账号')
+                    if unchanged_page_since is None:
+                        unchanged_page_since = time.monotonic()
+                    if time.monotonic() - unchanged_page_since >= 30:
+                        evidence = s.save_raw_evidence(frame, r.account, 'ranking_unchanged_after_input', 'pending')
+                        raise hs.PendingError(f'排位原动作后次数连续30秒未变化；保留阶段与动作，不重复挑战：{evidence}')
                     s.wait_interruptible(.4)
                     continue
+                unchanged_page_since = None
                 manual_decrement = (phase == 'confirmed'
                     and manual_result_witness_valid(rec))
                 if (phase not in ('end_sent', 'result_sent') and not manual_decrement) or count != rec.get('before', -1)-1:
@@ -303,4 +310,6 @@ def run(r):
             deadline=time.monotonic()+60
         if getattr(r, 'interleave_after_end', False) and rec.get('phase', phase) in ('end_sent', 'result_sent'):
             return _yield_waiting_result(r, rec, '当前账号尚无可核实的排位结算状态，先轮询其他账号')
+        if not r.visible('ranking_page.bmp', PAGE, frame, .95):
+            unchanged_page_since = None
         s.wait_interruptible(.4)

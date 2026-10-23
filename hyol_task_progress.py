@@ -14,6 +14,17 @@ STATUSES = dict(new='未执行', running='执行中', done='已完成', pending=
                 skipped='跳过', unselected='未选择', offline='掉线')
 
 
+def mail_cleanup_required(record):
+    return (record.get('status') == 'pending'
+            and '普通背包已满' in str(record.get('last_error') or ''))
+
+
+def task_status_text(task, record):
+    if task == 'mail' and mail_cleanup_required(record):
+        return '背包满需清理'
+    return STATUSES.get(record.get('status'), '待核实')
+
+
 def local_day():
     return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 

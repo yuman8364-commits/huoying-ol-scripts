@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.22.2'
+VERSION = '2026.10.23.8'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -435,7 +435,12 @@ class RuntimeController:
                 complete = completion_verified(request, self.runner, code)
             if code == 0 and not complete:
                 code = 2
-                detail = '当前任务、领奖、木叶回村'+('或最后托管' if request.final_managed else '')+'证据未齐全；保留待处理。'
+                calendar = getattr(self.runner, 'calendar_plan', None)
+                if (isinstance(calendar, dict) and calendar.get('calendar_skipped')
+                        and not calendar.get('effective_tasks')):
+                    detail = f"执行日{calendar.get('execution_day', '')}：所选活动当前未开放，未执行；不计完成。"
+                else:
+                    detail = '当前任务、领奖、木叶回村'+('或最后托管' if request.final_managed else '')+'证据未齐全；保留待处理。'
                 if request.mode == 'team' and self.runner.team:
                     source_day = self.runner._run_record(self.runner.team).get('source_day')
                     if source_day != self.runner.scheduler.state.day:

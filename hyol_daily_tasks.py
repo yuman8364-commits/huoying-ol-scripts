@@ -7,7 +7,7 @@ import queue
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
@@ -16,7 +16,7 @@ import numpy as np
 import hyol_scheduler as hs
 from hyol_daruma_task import verified as daruma_verified
 
-VERSION = '2026.10.20.1'
+VERSION = '2026.10.23.8'
 TASKS = ("group", "survival", "wanted")
 TEAM_OPTIONS = ("group", "wanted", "strong", "sealed")
 SOLO_OPTIONS = ('mail', 'welfare', 'daruma', 'ranking', 'survival', 'quiz', 'arena', 'weekend', 'treasure')
@@ -112,6 +112,8 @@ class DailyScheduler(hs.Scheduler):
         frame = frame or self.capture()
         run_index = 2 if self.state.action_status(account.name, 'survival_second_run_started') == 'done' else 1
         action = f'survival_run_{run_index}_battle_speed_x2_{slot.next_index}'
+        if self.state.action_status(account.name, action) == 'expired':
+            return False  # The original toggle remains unverified and must never be retried.
         roi = SPEED_ROI
         if self.template('battle_speed_x2.png', roi, frame, threshold=.84)[0]:
             if self.state.action_status(account.name, action) == 'pending':
@@ -200,6 +202,25 @@ def selected_sequence(task, selected_tasks=None):
     return tuple(t for t in allowed if t in selected)
 
 
+def calendar_task_plan(tasks, execution_day=None):
+    """Keep the request intact; calendar skips never settle a task ledger."""
+    day = datetime.now().date().isoformat() if execution_day is None else execution_day
+    if type(day) is not str or date.fromisoformat(day).isoformat() != day:
+        raise ValueError('执行日期必须是YYYY-MM-DD，不能按当前日期重解旧运行')
+    calendar_day = date.fromisoformat(day)
+    # A dated request uses that civil day, independent of the current clock or
+    # the puzzle page's separate 05:00 deadline. Noon avoids carrying Monday's
+    # early-hours puzzle grace period into a non-weekend batch request.
+    from hyol_weekend import is_weekend
+    opened = is_weekend(datetime.combine(calendar_day, datetime.min.time()).replace(hour=12))
+    requested = list(tasks)
+    skipped = {task: dict(reason='non_weekend', execution_day=day, weekday=calendar_day.weekday())
+               for task in requested if task in ('daruma', 'weekend') and not opened}
+    return dict(execution_day=day, requested_tasks=requested,
+                effective_tasks=[task for task in requested if task not in skipped],
+                calendar_skipped=skipped)
+
+
 class DailyRunner:
     def __init__(self, task="all", group_count=5, event_sink=None, *, formation="keep", config_path=None, generic_current_window=True, selected_tasks=None, arena_wins=5, arena_target_mode='tickets', managed_enabled=True):
         if (task not in (*TASKS, *TASK_SEQUENCES, *SOLO_OPTIONS) or not 0 <= group_count <= 99
@@ -212,10 +233,9 @@ class DailyRunner:
         if not isinstance(managed_enabled, bool):
             raise ValueError("最后托管选项必须为开启或关闭")
         self.managed_enabled = managed_enabled
-        self.selected_tasks = selected_sequence(task, selected_tasks)
-        from hyol_weekend import is_weekend
-        if not is_weekend():
-            self.selected_tasks = tuple(t for t in self.selected_tasks if t != 'weekend')
+        self.requested_tasks = selected_sequence(task, selected_tasks)
+        self.calendar_plan = calendar_task_plan(self.requested_tasks)
+        self.selected_tasks = tuple(self.calendar_plan['effective_tasks'])
         self.track_friendship = task == 'team'
         self.formation = formation
         self.formation_checked = False
@@ -247,7 +267,9 @@ class DailyRunner:
         runner.group_count, runner.arena_wins = 0, arena_wins
         runner.arena_target_mode = arena_target_mode
         runner.managed_enabled = managed_enabled
-        runner.selected_tasks = tuple(tasks)
+        runner.requested_tasks = tuple(tasks)
+        runner.calendar_plan = calendar_task_plan(tasks, getattr(scheduler.state, 'day', None))
+        runner.selected_tasks = tuple(runner.calendar_plan['effective_tasks'])
         runner.formation, runner.formation_checked = formation, False
         runner.generic_current_window = scheduler.generic_current_tab_x is not None
         runner.track_friendship = False
@@ -968,8 +990,13 @@ class DailyRunner:
         self.save()
 
     def run(self):
+        calendar = getattr(self, 'calendar_plan', {})
+        if calendar.get('calendar_skipped'):
+            self.scheduler.event('solo_calendar_filtered', **calendar,
+                                 detail='执行日非周末，跳过达摩和周末活动；原请求及旧断点保留')
         if not getattr(self, 'selected_tasks', TASK_SEQUENCES.get(self.task, (self.task,))):
-            self.scheduler.event('weekend_calendar_skip', detail='非周末；未绑定或识别游戏窗口')
+            self.scheduler.event('weekend_calendar_skip', **calendar,
+                                 detail='执行日非周末；未绑定或识别游戏窗口，未计任务完成')
             return 0
         lease = hs.ForegroundRuntimeLease()
         owned = False
@@ -987,14 +1014,6 @@ class DailyRunner:
             for task in getattr(self, 'selected_tasks', TASK_SEQUENCES.get(self.task, (self.task,))):
                 self.current = task
                 rec = self.record(task)
-                if task == 'quiz':
-                    from hyol_quiz import solo_verified
-                    if not solo_verified(self, self.scheduler.capture()):
-                        rec.update(status='pending',last_error='忍者测验仅限单人：当前组队或单人状态未确认，已跳过')
-                        skipped.append('忍者测验需要单人状态')
-                        self.save()
-                        self.event('daily_task_pending',task=task,detail=rec['last_error'])
-                        continue
                 from hyol_checkpoints import complete
                 if (complete(rec) and (task != "group" or not self.group_needs_more(rec))
                         and (task != 'ranking' or rec.get('zero_verified'))
@@ -1003,6 +1022,14 @@ class DailyRunner:
                     self.save()
                     self.event("daily_task_skipped",task=task,detail="本日已有完整完成记录")
                     continue
+                if task == 'quiz':
+                    from hyol_quiz import solo_verified
+                    if not solo_verified(self, self.scheduler.capture()):
+                        rec.update(status='pending',last_error='忍者测验仅限单人：当前组队或单人状态未确认，已跳过')
+                        skipped.append('忍者测验需要单人状态')
+                        self.save()
+                        self.event('daily_task_pending',task=task,detail=rec['last_error'])
+                        continue
                 rec["status"] = "running"
                 self.save()
                 self.event("daily_task_started",task=task,detail=LABELS[task]+"开始")
@@ -1067,6 +1094,7 @@ class DailyRunner:
                 lease.release()
             summary = dict(result=code,task=self.task,current=self.current,detail=detail,
                            records=self.records,managed_enabled=getattr(self, 'managed_enabled', True),
+                           calendar_plan=getattr(self, 'calendar_plan', {}),
                            external_input_sessions=getattr(self.scheduler, 'external_input_sessions', 0),
                            external_input_count=getattr(self.scheduler, 'external_input_count', 0),
                            clicks=self.scheduler.content_click_count,ts=hs.now_iso())

@@ -6,7 +6,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 
-from hyol_task_progress import ProgressReader, TASK_LABELS, STATUSES, local_day
+from hyol_task_progress import ProgressReader, TASK_LABELS, STATUSES, local_day, task_status_text
 
 
 class ProgressView(ttk.Frame):
@@ -42,7 +42,7 @@ class ProgressView(ttk.Frame):
         self.tree = ttk.Treeview(table, columns=columns, show='headings', height=6, selectmode='browse')
         for column in columns:
             self.tree.heading(column, text={'label': '标签', 'health': '账号状态'}.get(column, TASK_LABELS.get(column, column)))
-            self.tree.column(column, width=100 if column == 'health' else 72, minwidth=60, stretch=False)
+            self.tree.column(column, width=112 if column == 'mail' else 100 if column == 'health' else 72, minwidth=60, stretch=False)
         vertical = ttk.Scrollbar(table, orient='vertical', command=self.tree.yview)
         horizontal = ttk.Scrollbar(table, orient='horizontal', command=self.tree.xview)
         self.tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
@@ -97,7 +97,7 @@ class ProgressView(ttk.Frame):
             for row in snapshot['rows']:
                 key = str(row['index'])
                 values = [row['label'], row['health']]
-                values.extend(STATUSES.get(row['tasks'][task]['status'], '待核实') for task in TASK_LABELS)
+                values.extend(task_status_text(task, row['tasks'][task]) for task in TASK_LABELS)
                 if key in current:
                     self.tree.item(key, values=values)
                     current.remove(key)
@@ -128,7 +128,7 @@ class ProgressView(ttk.Frame):
         if row is None:
             return
         rec = row['tasks'][task]
-        lines = [f'{row["label"]} · {row.get("account") or "身份待核实"} · {TASK_LABELS[task]} · {STATUSES.get(rec["status"], "待核实")}']
+        lines = [f'{row["label"]} · {row.get("account") or "身份待核实"} · {TASK_LABELS[task]} · {task_status_text(task, rec)}']
         fields = dict(completed='已核实轮次/次数', verified_battles='已核实战斗总数',
                       verified_first_round_battles='已归档首轮战斗', verified_current_round_battles='当前轮战斗',
                       remaining='剩余次数', verified_wins='已确认新增胜场',

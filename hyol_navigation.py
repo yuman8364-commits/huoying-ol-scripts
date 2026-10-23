@@ -300,6 +300,11 @@ def _return_to_leaf(scheduler, account, allow_pending_navigation, timeout, audit
         s.check_stop()
         frame = s.capture()
         audit['frame'] = frame
+        if s.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+            from hyol_identity_overlays import dismiss_identity_overlays
+            dismiss_identity_overlays(s,account,frame,only_kind='recharge_activity')
+            move_cursor_clear(s)
+            continue
         if close_black_market(s, account, frame=frame):
             move_cursor_clear(s)
             continue

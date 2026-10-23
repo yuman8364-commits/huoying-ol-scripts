@@ -11,6 +11,7 @@ from tkinter import ttk
 import hyol_scheduler as hs
 from hyol_runtime import RuntimeController, RunRequest, VERSION
 from hyol_progress_view import ProgressView
+from hyol_task_progress import mail_cleanup_required
 from hyol_daily_tasks import SOLO_OPTIONS, DEFAULT_SOLO_OPTIONS
 from hyol_team_six import TASKS as TEAM_TASKS, DEFAULT_TASKS, TASK_LABELS as TEAM_LABELS
 from hyol_team_pipeline import TEAM_TASKS as PIPELINE_DEFAULTS, SUPPORTED_TEAM_TASKS
@@ -60,6 +61,7 @@ EVENT_LABELS['pipeline_group_remaining'] = '继续多人副本'
 EVENT_LABELS['pipeline_round_started'] = '两队开始本轮'
 EVENT_LABELS['pipeline_round_focus'] = '固定检查当前队伍'
 EVENT_LABELS['pipeline_round_completed'] = '两队本轮已完成'
+EVENT_LABELS['mail_backpack_full'] = '邮件附件未领：普通背包已满，需清理'
 
 
 def format_task_event(event, mode):
@@ -569,7 +571,7 @@ class UnifiedClient(tk.Tk):
                 if not index:
                     continue
                 account = str(row.get('account') or row.get('label') or f'账号{index}')
-                if account.startswith('当前窗口标签'):
+                if account.startswith('当前窗口标签') or (account.startswith('account_') and len(account)==40):
                     account = str(row.get('label') or f'标签{index}')
                 task_rows = row.get('tasks', {})
                 relevant = [(task, task_rows.get(task, {})) for task in selected if task in task_rows]
@@ -584,6 +586,9 @@ class UnifiedClient(tk.Tk):
                 elif health == '身份待核实':
                     status = '待核验'
                     task_label = '—'
+                elif 'mail' in selected and mail_cleanup_required(task_rows.get('mail', {})):
+                    status = '背包满需清理'
+                    task_label = 'mail'
                 elif pending:
                     status = '待处理'
                     task_label = pending[0]

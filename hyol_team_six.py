@@ -199,6 +199,7 @@ class SixTabScheduler(hs.Scheduler):
         self._bound_identity_masks: dict[int, np.ndarray] = {}
         self._bound_identity_names: dict[int, str] = {}
         self.automatic_accounts = True
+        self.portable_accounts = self.config.get('PortableAccounts', '1') == '1'
         self.config['AccountDiscovery'] = 'automatic'
 
     @staticmethod

@@ -1363,6 +1363,7 @@ class Scheduler:
         self.config = config
         self.account_mode = config.get("AccountMode", "tab6").strip().lower()
         self.automatic_accounts = self.account_mode == 'dynamic' or config.get('AccountDiscovery') == 'automatic'
+        self.portable_accounts = self.automatic_accounts and config.get('PortableAccounts', '1') == '1'
         names = parse_csv(config.get("TabAccountNames", ""))
         tab_xs = parse_int_csv(config.get("TabXs", "180,310,445,590,730,860"))
         if self.account_mode == 'dynamic':
@@ -1585,40 +1586,86 @@ class Scheduler:
                         self.run_context.bind_window(self)
                     self.event("window_bound", rect=Win32.rect(self.hwnd), pid=Win32.pid(self.hwnd))
                     return
+                if Scheduler._readonly_identity_discovery(self):
+                    try:
+                        chrome = self._blank_discovery_chrome_frame()
+                    except SafetyError:
+                        chrome = None
+                    if chrome is not None:
+                        if getattr(self, 'run_context', None):
+                            self.run_context.bind_window(self)
+                        self.event('window_bound_chrome_only', rect=Win32.rect(self.hwnd),
+                                   content_available=False, content_clicks=0)
+                        return
             if deadline is not None and time.monotonic() >= deadline:
-                self.event("window_wait_timeout", count=len(windows), reason="expected_one_healthy_game_window")
-                if len(windows) == 1:
-                    hwnd = windows[0]
-                    if Win32.user32.IsIconic(hwnd):
-                        raise SafetyError("游戏窗口已最小化，请恢复游戏主界面后重试")
-                    rect = Win32.rect(hwnd)
-                    if rect != EXPECTED_WINDOW:
-                        raise SafetyError(f"游戏窗口位置或尺寸不符：当前{rect}，要求{EXPECTED_WINDOW}；请恢复窗口后重试")
-                    raise SafetyError("游戏窗口未取得前台焦点，请恢复游戏窗口后重试")
-                raise SafetyError(f"expected one healthy game window; found {len(windows)}")
+                detail, fields = Scheduler._window_binding_failure(self, windows)
+                self.event("window_wait_timeout", **fields)
+                raise SafetyError(detail)
             self.event("window_wait", count=len(windows), reason="expected_one_healthy_game_window")
             if not wait:
-                if len(windows) == 1:
-                    if Win32.user32.IsIconic(windows[0]):
-                        raise SafetyError("游戏窗口已最小化，请恢复游戏主界面后重试")
-                    raise SafetyError(f"游戏窗口位置或尺寸不符：当前{Win32.rect(windows[0])}，要求{EXPECTED_WINDOW}；请恢复窗口后重试")
-                raise SafetyError(f"expected one healthy game window; found {len(windows)}")
+                detail, fields = Scheduler._window_binding_failure(self, windows)
+                self.event("window_binding_failed", **fields)
+                raise SafetyError(detail)
             time.sleep(3)
+
+    def _window_binding_failure(self, windows) -> tuple[str, dict]:
+        """Diagnose a refused binding with read-only probes, without recovery."""
+        fields = dict(count=len(windows), reason="expected_one_healthy_game_window")
+        if len(windows) != 1:
+            return f"expected one healthy game window; found {len(windows)}", fields
+        hwnd = windows[0]
+        fields['expected_hwnd'] = hwnd
+        if Win32.user32.IsIconic(hwnd):
+            fields['reason'] = 'window_minimized'
+            return "游戏窗口已最小化，请恢复游戏主界面后重试", fields
+        rect = Win32.rect(hwnd)
+        fields['rect'] = rect
+        if rect != EXPECTED_WINDOW:
+            fields['reason'] = 'window_geometry_mismatch'
+            return f"游戏窗口位置或尺寸不符：当前{rect}，要求{EXPECTED_WINDOW}；请恢复窗口后重试", fields
+        foreground = Win32.foreground()
+        fields['foreground_hwnd'] = foreground
+        if foreground != hwnd:
+            fields['reason'] = 'window_not_foreground'
+            return f"游戏窗口未取得前台焦点：当前前台{foreground}，游戏窗口{hwnd}；请恢复游戏窗口后重试", fields
+        try:
+            if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
+                content = Win32.game_content_rect(hwnd)
+                fields['content_rect'] = content
+                GameGeometry(rect, content)
+        except (SafetyError, ValueError) as exc:
+            fields.update(reason='game_geometry_unavailable', error_type=type(exc).__name__,
+                          error=str(exc))
+            return f"游戏窗口已在前台，但游戏内容区域或几何不可用：{type(exc).__name__}: {exc}", fields
+        fields['reason'] = 'window_validation_failed'
+        return "游戏窗口已在前台，但未通过窗口健康检查；请检查游戏内容后重试", fields
 
     def validate_geometry(self, activate: bool = False) -> bool:
         try:
-            if self.hwnd not in Win32.game_windows():
-                return False
-            if activate and self.auto_foreground:
-                Win32.activate(self.hwnd)
-                time.sleep(0.4)
-            if Win32.user32.IsIconic(self.hwnd):
-                return False
-            if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
-                GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd))
-            elif Win32.rect(self.hwnd) != EXPECTED_WINDOW:
-                return False
-            return not activate or Win32.foreground() == self.hwnd
+            attempts = 3 if activate and self.auto_foreground else 1
+            for attempt in range(attempts):
+                if self.hwnd not in Win32.game_windows():
+                    return False
+                if activate and self.auto_foreground:
+                    self.check_stop()
+                    Win32.activate(self.hwnd)
+                    self.wait_interruptible(0.4)
+                if Win32.user32.IsIconic(self.hwnd):
+                    return False
+                if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
+                    GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd))
+                elif Win32.rect(self.hwnd) != EXPECTED_WINDOW:
+                    return False
+                foreground = Win32.foreground() if activate else None
+                if not activate or foreground == self.hwnd:
+                    return True
+                # A desktop panel can briefly win focus while it repaints.
+                # Retry only this read-only check, with fresh geometry each
+                # time; never replay the click or extend the account's task.
+                if attempt + 1 < attempts:
+                    self.event("window_focus_retry", attempt=attempt + 1,
+                               foreground_hwnd=foreground)
+            return False
         except (SafetyError, ValueError):
             return False
 
@@ -1640,6 +1687,54 @@ class Scheduler:
             if len(windows) == 1:
                 self.hwnd = windows[0]
             self.check_stop()
+
+    def _readonly_identity_discovery(self) -> bool:
+        return (getattr(self, 'no_content_clicks', False)
+                and getattr(self, '_capture_binding_probe', False))
+
+    def _blank_discovery_chrome_frame(self) -> Image.Image:
+        if not self._readonly_identity_discovery():
+            raise SafetyError('raw browser capture requires read-only identity discovery')
+        return self._blank_browser_chrome_frame()
+
+    def _blank_browser_chrome_frame(self) -> Image.Image:
+        """An unnormalized browser frame may prove native tabs, never content."""
+        self.check_stop()
+        if getattr(self, 'run_context', None):
+            self.run_context.check_window(self)
+
+        def guarded_window():
+            if (not self.hwnd or Win32.game_windows() != [self.hwnd]
+                    or Win32.foreground() != self.hwnd
+                    or Win32.rect(self.hwnd) != EXPECTED_WINDOW
+                    or Win32.user32.IsIconic(self.hwnd)):
+                raise SafetyError('read-only blank-tab browser window is not uniquely stable')
+            try:
+                Win32.game_content_rect(self.hwnd)
+            except SafetyError as exc:
+                if str(exc) != 'game content surface is ambiguous: 0 visible regions':
+                    raise
+            else:
+                raise SafetyError('blank-tab content changed during browser-only observation')
+
+        guarded_window()
+        frame = ImageGrab.grab(bbox=EXPECTED_WINDOW, all_screens=True).convert('RGB')
+        self.check_stop()
+        guarded_window()
+        frame._hyol_chrome_only = True
+        frame._hyol_chrome_only_geometry = dict(window=EXPECTED_WINDOW, content=None, normalized=False)
+        frame._hyol_observations = {}
+        # Do not replace _last_frame, _capture_geometry or the template cache.
+        return frame
+
+    def capture_account_observation(self) -> Image.Image:
+        try:
+            return self.capture()
+        except SafetyError as exc:
+            if (not self._readonly_identity_discovery()
+                    or str(exc) != 'game content surface is ambiguous: 0 visible regions'):
+                raise
+        return self._blank_discovery_chrome_frame()
 
     def capture(self) -> Image.Image:
         self.check_stop()
@@ -1664,6 +1759,11 @@ class Scheduler:
             raise SafetyError("game geometry changed before capture")
         geometry = GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd)) if adaptive else GameGeometry(EXPECTED_WINDOW, VIEW)
         raw = ImageGrab.grab(bbox=geometry.window, all_screens=True).convert("RGB")
+        captured_foreground = Win32.foreground()
+        if captured_foreground != self.hwnd:
+            self.event("capture_rejected", reason="game_not_foreground_during_capture",
+                       foreground_hwnd=captured_foreground)
+            raise SafetyError("game lost foreground during capture; discard stale frame")
         if Win32.rect(self.hwnd) != geometry.window or (adaptive and Win32.game_content_rect(self.hwnd) != geometry.content):
             raise SafetyError("game geometry changed during capture; discard stale frame")
         frame = geometry.normalize(raw)
@@ -1753,11 +1853,15 @@ class Scheduler:
 
     @staticmethod
     def healthy(frame: Image.Image) -> bool:
+        if getattr(frame, '_hyol_chrome_only', False):
+            return False
         crop = np.asarray(frame.crop(VIEW).resize((96, 48)).convert("L"), dtype=np.float64)
         return float(crop.std()) >= 8.0 and float(crop.mean()) not in (0.0, 255.0)
 
     def template(self, name: str, roi: tuple[int, int, int, int], frame: Image.Image | None = None, threshold: float | None = None) -> tuple[bool, float, int, int]:
         frame = frame or self.capture()
+        if getattr(frame, '_hyol_chrome_only', False):
+            raise SafetyError('browser-only discovery frame cannot authorize a content template')
         result = self.templates.match(frame, ASSETS / name, roi, threshold)
         # The reconnect dialog has multiple live skins with identical safety
         # meaning.  Either positive template classifies the tab as offline;
@@ -1842,6 +1946,8 @@ class Scheduler:
         if isinstance(getattr(self, '_dynamic_identity_materials', None), dict):
             from hyol_checkpoints import identity_mask_scores, current_identity_mask
             return identity_mask_scores(current_identity_mask(frame, self.templates), self._dynamic_identity_materials)
+        if getattr(self, 'portable_accounts', False):
+            return {}  # A new run must observe the live tabs, never personal bitmap files.
         scores: dict[str, float] = {}
         from hyol_checkpoints import current_identity_mask
         current = current_identity_mask(frame, self.templates)
@@ -1923,7 +2029,28 @@ class Scheduler:
     def chrome_click(self, x: int, y: int, label: str, account: Account | None = None) -> None:
         self.check_input_pause()
         blank_tab_chrome = False
-        if (label.startswith(('rebind_probe:', 'switch_tab:'))
+        discovery_switch = (Scheduler._readonly_identity_discovery(self) and account is not None
+                            and label == f'observe_account:{account.index}'
+                            and (x,y) == (account.tab_x,10))
+        legacy_switch = (account is not None and (x,y) == (account.tab_x,10)
+                         and label in (f'switch_tab:{account.name}',f'switch_tab:{account.index}'))
+        probe = re.fullmatch(r'rebind_probe:([1-6])', label) if y == 10 else None
+        blank_markers = None
+
+        def verify_discovery_target():
+            nonlocal blank_markers
+            from hyol_multi_solo import tab_close_positions, active_tab_centers
+            frame = self._blank_browser_chrome_frame()
+            markers = tab_close_positions(frame)
+            centers = active_tab_centers(markers)
+            if blank_markers is not None and markers != blank_markers:
+                raise SafetyError('browser tab layout changed during blank-tab chrome validation')
+            blank_markers = markers
+            if (x not in centers or probe is not None
+                    and (int(probe[1]) > len(centers) or centers[int(probe[1])-1] != x)):
+                raise SafetyError('read-only blank-tab switch target is not an existing tab title')
+
+        if ((legacy_switch or probe is not None or discovery_switch)
                 and self.hwnd in Win32.game_windows()
                 and Win32.rect(self.hwnd) == EXPECTED_WINDOW
                 and Win32.foreground() == self.hwnd):
@@ -1934,6 +2061,7 @@ class Scheduler:
                     # A white tab has no CEF child, but its verified browser
                     # chrome remains usable for switching to another tab.
                     blank_tab_chrome = True
+                    verify_discovery_target()
                     self.event('blank_tab_chrome_switch', account, target=label)
                 else:
                     raise
@@ -1972,7 +2100,10 @@ class Scheduler:
                 # observing again; an unsafe hit result is never retried.
                 self.event("chrome_hit_test_retry", account, target=label, attempt=attempt)
                 self.wait_interruptible(.2)
-                self.ensure_window()
+                if blank_tab_chrome:
+                    verify_discovery_target()
+                else:
+                    self.ensure_window()
                 self.check_input_pause()
                 if Win32.foreground() != self.hwnd:
                     raise SafetyError("window changed during chrome target validation") from exc
@@ -1990,6 +2121,8 @@ class Scheduler:
             raise SafetyError("window changed during chrome target validation")
         if blank_tab_chrome and Win32.rect(self.hwnd) != EXPECTED_WINDOW:
             raise SafetyError("window changed during blank-tab chrome validation")
+        if blank_tab_chrome:
+            verify_discovery_target()
         if not blank_tab_chrome and hasattr(self,"screen_point") and self.screen_point(x,y) != (physical_x,physical_y):
             raise SafetyError("window changed during chrome target validation")
         self.check_input_pause()
@@ -2221,6 +2354,15 @@ class Scheduler:
         # are not sufficient and can drag the client when the page is absent.
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
             raise PendingError("offline login prompt requires manual login")
+        from hyol_managed import first_card_prompt_visible
+        if first_card_prompt_visible(self, frame):
+            # Spending a card belongs to the audited managed start, even when
+            # this dialog shares a generic orange confirmation button.
+            return False
+        if self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+            from hyol_identity_overlays import dismiss_identity_overlays
+            following=dismiss_identity_overlays(self,account,frame,only_kind='recharge_activity')
+            return not self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),following,threshold=.98)[0]
         from hyol_managed import stopped_panel_visible
         if stopped_panel_visible(self, frame):
             if not self.click_template(account, 'managed_settings_close_current.bmp',
@@ -3005,7 +3147,11 @@ class Scheduler:
             ok, scores = True, {account.name: 1.0}
             reference = getattr(self, '_verified_current_mask', None)
             if reference is not None and self.main_ready(frame):
-                current = identity_text_mask(frame.crop(IDENTITY_ROI))
+                from hyol_checkpoints import current_identity_mask
+                # Binding excludes animated map pixels and compensates only
+                # positively anchored dimmed modals. Reuse that exact layout
+                # here so a quiz overlay cannot masquerade as a role change.
+                current = current_identity_mask(frame, self.templates)
                 score = mask_f1(reference, current)
                 if score < .92:
                     raise SafetyError('当前入口已关联账号的身份发生变化，禁止点击')
@@ -3208,6 +3354,7 @@ class Scheduler:
             ("welfare_close.bmp", (1301, 219, 1451, 369)),
             ("welfare_title_current.bmp", (1120,230,1320,380)),
             ("daruma_weekend_page.bmp", (850,230,1180,360)),
+            ('interference_recharge_title_20261022.bmp',(900,235,1250,325)),
             ("daily_practice_anchor.bmp", (951, 119, 1501, 369)),
             ("survival_anchor.bmp", (201, 69, 601, 419)),
             ("wanted_team_anchor.bmp", (500, 200, 1450, 850)),
@@ -3238,6 +3385,16 @@ class Scheduler:
         """Return a verified close-X match, including bounded scale drift."""
         frame = frame or self.capture()
         roi = (1865, 700, 1919, 780)
+        # This round X is shared by enrolled merchant and group notices.
+        # Duel notifications use the same design at a larger native size.
+        # Require a known notice body before matching either exact button.
+        if self._activity_notice_anchor(frame) is not None:
+            for name in ('activity_notice_merchant_close_current.bmp',
+                         'activity_notice_round_large_close_current.bmp'):
+                matched, score, x, y = self.template(name, roi, frame, threshold=.98)
+                if matched:
+                    asset = self.templates.load(ASSETS / name)
+                    return name, score, x, y, 1.0, int(asset.shape[1]), int(asset.shape[0])
         # Current clients render a dark one-pixel border around the X.  Keep
         # both exact assets as the first choice.  Some activity cards are
         # painted at 1.2x in the fixed client, so retry the same two assets at
@@ -3270,6 +3427,14 @@ class Scheduler:
         match = self._activity_notice_close_match(frame)
         return match[0] if match else None
 
+    def _activity_notice_anchor(self, frame: Image.Image) -> str | None:
+        name = 'activity_notice_merchant_title_current.bmp'
+        if self.template(name, (1680,700,1880,760), frame, threshold=.98)[0]:
+            return name
+        if self.template('activity_notice_anchor.bmp', (1680,730,1919,930), frame, threshold=.50)[0]:
+            return 'activity_notice_anchor.bmp'
+        return None
+
     def clear_transient_notifications(self, account: Account, frame: Image.Image | None = None) -> Image.Image:
         """Close only positively identified lower-right activity notices via their own X."""
         frame = frame or self.capture()
@@ -3284,7 +3449,8 @@ class Scheduler:
         # (seven cards were observed live). Keep a finite ceiling, but allow
         # the verified card, X, and changed-frame loop to drain that queue.
         for _ in range(12):
-            notice = self.template("activity_notice_anchor.bmp", notice_roi, frame, threshold=notice_threshold)[0]
+            notice_anchor = self._activity_notice_anchor(frame)
+            notice = notice_anchor is not None
             close_match = self._activity_notice_close_match(frame)
             close_name = close_match[0] if close_match else None
             if notice and not close_name:
@@ -3297,10 +3463,11 @@ class Scheduler:
                     account,
                     close_name,
                     close_roi,
-                    19,
-                    19,
+                    close_match[5] // 2,
+                    close_match[6] // 2,
                     "close_lower_right_activity_notice",
-                    ["activity_notice_anchor.bmp", close_name],
+                    [notice_anchor, close_name],
+                    frame_predicate=lambda fresh: self._activity_notice_anchor(fresh) is not None,
                 ):
                     raise PendingError("lower-right activity notice X disappeared before click")
             else:
@@ -3319,20 +3486,18 @@ class Scheduler:
                     x + width // 2,
                     y + height // 2,
                     "close_lower_right_activity_notice",
-                    ["activity_notice_anchor.bmp"],
+                    [notice_anchor],
                     anchor_threshold=notice_threshold,
+                    frame_predicate=lambda fresh: (self._activity_notice_anchor(fresh) is not None
+                        and (current := self._activity_notice_close_match(fresh)) is not None
+                        and current[2:4] == close_match[2:4]),
                 )
             self.event("activity_notice_closed", account, location="lower_right")
             replacement = False
             for settle_index in range(12):
                 self.wait_interruptible(0.5)
                 next_frame = self.capture()
-                notice_after = self.template(
-                    "activity_notice_anchor.bmp",
-                    notice_roi,
-                    next_frame,
-                    threshold=notice_threshold,
-                )[0]
+                notice_after = self._activity_notice_anchor(next_frame) is not None
                 close_after = self._activity_notice_close_match(next_frame)
                 if not notice_after and not close_after:
                     return next_frame
@@ -3381,6 +3546,10 @@ class Scheduler:
         leave_hot_spring(self, account)
         for _ in range(5):
             frame = self.content_guard(account)
+            if self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+                from hyol_identity_overlays import dismiss_identity_overlays
+                dismiss_identity_overlays(self,account,frame,only_kind='recharge_activity')
+                continue
             if (self.template('daruma_weekend_page.bmp', (850,230,1180,360), frame, threshold=.98)[0]
                     and self.template('daruma_weekend_close.bmp', (1290,260,1420,370), frame, threshold=.98)[0]):
                 if not self.click_template(account, 'daruma_weekend_close.bmp', (1290,260,1420,370),
@@ -3717,8 +3886,8 @@ class Scheduler:
                 and self.template('mail_backpack_full_current.bmp', (740,450,1180,580), frame, threshold=.985)[0]):
             evidence = evidence or self.save_raw_evidence(frame,account,'mail_backpack_full','pending')
             self.event('mail_backpack_full',account,evidence=str(evidence),capacity='ordinary_backpack',
-                       detail='普通背包已满，邮件附件保留待领取；未清理或购买')
-            raise PendingError('普通背包已满，邮件附件保留待领取；证据='+str(evidence))
+                       detail='邮件附件未领：普通背包已满，需清理；附件保留待领取')
+            raise PendingError('邮件附件未领：普通背包已满，需清理；证据='+str(evidence))
 
     def module_mail(self, account: Account) -> None:
         self.ensure_assets(["mail_toolbar_icon.bmp", "mail_ready_anchor.bmp", "mail_close.bmp", "mail_attachment_warehouse.bmp", "mail_empty_list.bmp", "mail_warehouse_anchor.bmp", "mail_warehouse_close.bmp", "mail_claim_all.bmp", "mail_claim_all_disabled.bmp", "mail_claimed_stamp.bmp", "mail_backpack_full_current.bmp"])
@@ -3996,7 +4165,29 @@ class Scheduler:
         return self.state.action_status(account.name, current) == "pending" or self.state.action_status(account.name, legacy) == "pending"
 
     def _arena_daily_rewards_complete(self, account: Account) -> bool:
-        return all(self._arena_reward_claim_done(account, index) for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
+        account_state = getattr(self.state, 'accounts', {}).get(account.name, {})
+        actions = account_state.get('actions', {}) if isinstance(account_state, dict) else {}
+        if any(key.startswith(('arena_daily_reward_claim_', 'arena_reward_claim_'))
+               and isinstance(value, dict) and value.get('status') == 'pending'
+               for key, value in actions.items()):
+            return False
+        if all(self._arena_reward_claim_done(account, index) for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1)):
+            return True
+        record = account_state.get('arena_daily_reward_exhaustion', {}) if isinstance(account_state, dict) else {}
+        return (isinstance(record, dict) and record.get('status') == 'verified'
+                and record.get('account') == account.name
+                and record.get('day') == self.state.day
+                and record.get('run_id') == getattr(getattr(self, 'diagnostics', None), 'identifier', None)
+                and type(record.get('observations')) is int
+                and record['observations'] >= 2 and bool(record.get('evidence')))
+
+    def _arena_daily_rows_exhausted(self, frame: Image.Image) -> bool:
+        """Both explicit 'no challenge tasks' messages, never blank-row absence."""
+        return (self.template('arena_ready_anchor.bmp', (851,199,1451,449), frame)[0]
+                and all(self.template('arena_daily_no_tasks_current.bmp', roi, frame, threshold=.98)[0]
+                        for roi in ((330,480,485,585), (330,600,485,710)))
+                and not self._combat_active_visible('arena', frame)
+                and not self._arena_victory_visible(frame) and not self._arena_defeat_visible(frame))
 
     def _arena_difficulties_lowered_complete(self, account: Account) -> bool:
         return all(
@@ -4336,7 +4527,13 @@ class Scheduler:
         green = ((title[:, :, 1] > title[:, :, 0] * 1.15)
                  & (title[:, :, 1] > title[:, :, 2] * 1.10)
                  & (title[:, :, 1] > 85)).sum()
-        return bool(green >= 900 and rgb[150:900, 300:1600].mean() < 80)
+        if not (green >= 900 and rgb[150:900, 300:1600].mean() < 80):
+            return False
+        # Dark forest maps also satisfy the color heuristic. Require the
+        # independent fixed queue title before blocking navigation.
+        store = getattr(self, 'templates', None) or TemplateStore(.94)
+        return store.match(frame, ASSETS/'arena_waiting_title_current.bmp',
+                           (790,455,1100,545), .94)[0]
 
     def _combat_ready_visible(self, mode: str, frame: Image.Image | None = None) -> bool:
         frame = frame or self.capture()
@@ -4421,7 +4618,7 @@ class Scheduler:
             # The bound tab-title mask authorizes observation/switching only;
             # subsequent content clicks still require fresh page and identity gates.
             return context.select(self, account,
-                                  allow_hidden=running, allow_transition=running)
+                                  allow_hidden=running, allow_transition=running, combat_mode=mode)
         if not running:
             if (getattr(self, 'active', None) == account
                     and self._saved_tab_mapping().get(account.name) == account.tab_x):
@@ -4549,6 +4746,16 @@ class Scheduler:
                 confirmed = self.capture()
                 if (ready_before and self.template('arena_ready_anchor.bmp', (851,199,1451,449), confirmed)[0]
                         and not self.template('arena_reward_claim.bmp', (301,469,521,879), confirmed)[0]):
+                    if (self._arena_daily_rows_exhausted(frame)
+                            and self._arena_daily_rows_exhausted(confirmed)):
+                        evidence = self.save_raw_evidence(confirmed, account, 'arena_daily_rows_exhausted', 'verified')
+                        self.state.accounts[account.name]['arena_daily_reward_exhaustion'] = dict(
+                            status='verified', account=account.name, day=self.state.day,
+                            run_id=self.diagnostics.identifier, observations=2, evidence=str(evidence),
+                            claim_clicks_inferred=0)
+                        self.state.save_account(account.name)
+                        self.event('arena_daily_rewards_exhausted_verified', account, observations=2,
+                                   evidence=str(evidence), claim_clicks_inferred=0)
                     break
                 continue
             action = f"arena_daily_reward_claim_{claim_index}"
@@ -4586,9 +4793,13 @@ class Scheduler:
         else:
             raise PendingError("arena reward claim sequence exceeded safe bound")
         if self._arena_daily_rewards_complete(account):
+            claims = sum(self._arena_reward_claim_done(account, index)
+                         for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
             if self.state.action_status(account.name, "arena_daily_rewards") != "done":
-                self.state.set_action(account.name, "arena_daily_rewards", "done", "two left-side daily reward claims verified")
-            self.event("arena_daily_rewards_verified", account, claims=ARENA_DAILY_REWARD_CLAIMS, target="arena_daily_rewards")
+                self.state.set_action(account.name, "arena_daily_rewards", "done",
+                    "two left-side daily reward claims verified" if claims == ARENA_DAILY_REWARD_CLAIMS
+                    else "both daily task rows explicitly exhausted on two ready frames; no claim inferred")
+            self.event("arena_daily_rewards_verified", account, claims=claims, target="arena_daily_rewards")
 
     def recheck_arena_rewards(self, account: Account) -> None:
         """Sweep refreshed rows after an older completed run, without another battle."""
@@ -5198,13 +5409,17 @@ class Scheduler:
             if target_mode == 'tickets':
                 request['ticket_count_at_completion'] = 0
             self.state.save_global()
-        detail = ('ranked tickets exhausted and two daily reward claims verified'
-                  if target_mode == 'tickets'
-                  else f'{self._arena_target_for(account)} arena victories and two daily reward claims verified')
+        claims = sum(self._arena_reward_claim_done(account, index)
+                     for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
+        rewards_detail = ('two daily reward claims verified' if claims == ARENA_DAILY_REWARD_CLAIMS
+                          else 'both daily task rows explicitly exhausted; no additional claim inferred')
+        detail = ('ranked tickets exhausted' if target_mode == 'tickets'
+                  else f'{self._arena_target_for(account)} arena victories') + '; ' + rewards_detail
         self.state.set_module(account.name, "arena", "done", detail)
         self.event("combat_module_done", account, mode="arena", target_mode=target_mode,
                    wins=self._arena_victory_count(account), target=self._arena_target_for(account),
-                   tickets_exhausted=target_mode == 'tickets', claims=ARENA_DAILY_REWARD_CLAIMS)
+                   tickets_exhausted=target_mode == 'tickets', claims=claims,
+                   daily_rows_exhausted=claims < ARENA_DAILY_REWARD_CLAIMS)
 
     def _observe_survival_pending_page(self, slot: CombatSlot, frame: Image.Image) -> bool:
         """A ready page is progress evidence, never an invented battle outcome."""
@@ -5973,6 +6188,7 @@ class Scheduler:
                                    f"本场保持待续，不重复开战；{evidence}")
             self.commit_action(account, label, "result closed; point increase independently confirmed")
             self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
+            self.reconcile_survival_finished_speed_controls(account)
             slot.running = False
             slot.next_index += 1
             slot.start_confirmed = False
@@ -6004,6 +6220,73 @@ class Scheduler:
                     and self.state.action_status(account.name, action) == "done"
                     and self.state.action_status(account.name, action + "_start") == "done"):
                 self.commit_action(account, label, "旧版结算确认补记：同关开战及结算返回均已有完成记录")
+        self.reconcile_survival_finished_speed_controls(account)
+
+    def reconcile_survival_finished_speed_controls(self, account: Account) -> int:
+        """Expire an unverified UI toggle only after its exact battle settled.
+
+        Expired is not a successful x2 observation. Preserve the pending input
+        and its evidence, and never use this path for starts, rewards or resets.
+        """
+        from copy import deepcopy
+        from hyol_run_context import RunContext
+        context = getattr(self, 'run_context', None)
+        if (not isinstance(context, RunContext)
+                or Path(self.state.directory).resolve() != context.directory.resolve()):
+            return 0
+        data = self.state.accounts.get(account.name, {})
+        scope = f'survival:{context.identifier}:{account.account_id}'
+        if data.get('survival_operation_scope') != scope:
+            return 0
+        actions = data.get('actions', {})
+        observations = data.get('survival_attempt_observations', {})
+        if not isinstance(actions, dict) or not isinstance(observations, dict):
+            return 0
+        changed = 0
+        for key, row in tuple(actions.items()):
+            match = re.fullmatch(r'survival_run_([12])_battle_speed_x2_([1-9][0-9]*)', key)
+            if not match or not isinstance(row, dict) or row.get('status') != 'pending':
+                continue
+            run, step = match.groups()
+            names = (f'survival_battle_step_{step}', f'survival_battle_step_{step}_start',
+                     f'survival_result_confirm_{step}')
+            parents = [actions.get(name, {}) for name in names]
+            records = [row, *parents]
+            if any(not isinstance(record, dict) or record.get('origin') or record.get('checkpoint_conflict')
+                   for record in records):
+                continue
+            prefix = f'{scope}:run_{run}:'
+            if row.get('operation_id') != prefix + key or any(
+                    record.get('status') != 'done' or record.get('operation_id') != prefix + name
+                    for name, record in zip(names, parents)):
+                continue
+            points = re.fullmatch(r'survival score confirmed: ([0-9]+)->([0-9]+)', str(parents[0].get('detail', '')))
+            observed = observations.get(f'run_{run}:{names[0]}', {})
+            if (not points or not isinstance(observed, dict) or type(observed.get('score_before')) is not int
+                    or observed['score_before'] != int(points[1])
+                    or not 0 <= int(points[1]) < int(points[2]) <= 220):
+                continue
+            try:
+                sent = datetime.fromisoformat(row['updated_at'])
+                settled = datetime.fromisoformat(parents[0]['updated_at'])
+                if sent > settled or sent.date().isoformat() != self.state.day or settled.date() != sent.date():
+                    continue
+                evidence = {name: str(record['before_evidence']) for name, record in
+                            ((key, row), (names[0], parents[0]), (names[2], parents[2]))}
+                if not all(Path(path).is_file() for path in evidence.values()):
+                    continue
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
+            original = deepcopy(row)
+            self.state.set_action(account.name, key, 'expired', '原二倍速效果未知；同账号同轮同场开战、积分增加及结算已核实，按钮已失效，禁止重试')
+            actions[key].update(speed_verified=False, original_pending=original,
+                resolution=dict(reason='parent_battle_completed', parents={name: deepcopy(record)
+                                for name, record in zip(names, parents)}, evidence=evidence))
+            self.state.save_account(account.name)
+            self.event('survival_speed_observation_expired', account, action=key,
+                       operation_id=original['operation_id'], speed_verified=False, evidence=evidence)
+            changed += 1
+        return changed
 
     def _finish_survival_slot(self, slot: CombatSlot) -> None:
         if slot.complete:
@@ -6114,6 +6397,7 @@ class Scheduler:
             try:
                 if slot.complete:
                     continue
+                self.event('combat_slot_prepare_started', slot.account, mode=mode)
                 if mode == "arena":
                     self._prepare_arena_slot(slot)
                 else:
@@ -9586,6 +9870,10 @@ class Scheduler:
         return best
 
     def run_managed_gate(self, account: Account) -> None:
+        from hyol_managed import (CARD_ACTION, first_card_prompt_visible,
+                                  confirm_first_card, reconcile_card_confirmation,
+                                  stopped_panel_visible)
+        from hyol_network_retry import run as retry_network
         self.switch_account(account)
         if not (ASSETS / "managed_active.bmp").exists() or not (ASSETS / "managed_exit.bmp").exists():
             raise PendingError("managed_active.bmp and managed_exit.bmp are required")
@@ -9603,35 +9891,57 @@ class Scheduler:
                 self.wait_interruptible(0.3)
                 frame = self.capture()
         if stable_samples == 10:
-            if self.state.action_status(account.name, "start_managed") != "done":
+            actions = self.state.accounts[account.name].get('actions', {})
+            pending_network = any(key.startswith('start_managed_network_')
+                and isinstance(row, dict) and row.get('status') == 'pending'
+                for key,row in actions.items())
+            if pending_network:
+                retry_network(self, account, 'start_managed', '开始托管',
+                              lambda: True, lambda: False, lambda _label: False)
+            elif self.state.action_status(account.name, "start_managed") != "done":
                 self.commit_action(account, "start_managed", "managed active was positively reconciled across ten consecutive samples")
+            reconcile_card_confirmation(self, account)
             self.state.set_module(account.name, "managed", "done")
             return
         if seen_active:
             raise PendingError("managed active recognition was not stable for ten consecutive samples; no start click made")
         if self.config.get("ManagedSafetyVerified", "0") != "1":
             raise PendingError("managed state not active and ManagedSafetyVerified is not enabled; no managed click made")
+        self.reconcile_survival_finished_speed_controls(account)
         unresolved = [key for key, value in self.state.accounts[account.name].get('actions', {}).items()
                       if isinstance(value, dict) and value.get('status') == 'pending'
-                      and key != 'start_managed' and not key.startswith('start_managed_network_')]
+                      and key not in ('start_managed', CARD_ACTION)
+                      and not key.startswith('start_managed_network_')]
         if unresolved:
             raise PendingError('原操作结果尚未核实，不能开始托管：'+', '.join(unresolved))
         self.ensure_assets(["managed_mode_button.bmp", "managed_start_button.bmp"])
-        self.prepare_main(account)
-        self.open_managed_panel_with_retry(account)
-        from hyol_managed import preserve_existing_options
-        preserve_existing_options(self, account)
-        from hyol_network_retry import run as retry_network
+        if not first_card_prompt_visible(self, frame):
+            self.prepare_main(account)
+            self.open_managed_panel_with_retry(account)
+            from hyol_managed import preserve_existing_options
+            preserve_existing_options(self, account)
         hits = 0
         def active_verified():
             nonlocal hits
-            hits = hits + 1 if self.managed_active_score(self.capture()) >= .70 else 0
+            current = self.capture()
+            if first_card_prompt_visible(self, current):
+                confirm_first_card(self, account, current)
+                hits = 0
+                return False
+            hits = hits + 1 if self.managed_active_score(current) >= .70 else 0
             return hits >= 10
+        def start_ready():
+            current = self.capture()
+            return (not first_card_prompt_visible(self, current)
+                    and self.managed_active_score(current) < .70
+                    and stopped_panel_visible(self, current))
         retry_network(self, account, 'start_managed', '开始托管', active_verified,
-                      lambda: self.managed_active_score(self.capture()) < .70
-                      and self.template('managed_start_button.bmp', (651,619,1051,919))[0],
+                      start_ready,
                       lambda label: self.click_template(account, 'managed_start_button.bmp', (651,619,1051,919),
-                                                        50,12,label,['managed_start_button.bmp'],irreversible=True))
+                          50,12,label,['managed_start_button.bmp'],irreversible=True,
+                          frame_predicate=lambda fresh: (not first_card_prompt_visible(self, fresh)
+                                                         and stopped_panel_visible(self, fresh))))
+        reconcile_card_confirmation(self, account)
         self.state.set_module(account.name, 'managed', 'done')
 
     def open_managed_panel_with_retry(self, account: Account) -> None:

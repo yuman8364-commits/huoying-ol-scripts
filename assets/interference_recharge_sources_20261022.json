@@ -1,0 +1,38 @@
+{
+  "source": "C:\\Users\\Administrator\\Desktop\\可用脚本\\火影OL完整客户端\\logs\\scheduler_evidence\\2026-10-22\\account_ae1662240e\\192931_840724_pending_daily_page_wait_daruma_weekend_menu.png",
+  "source_sha256": "161327a4776e33b0885ad8c4cebab01ab2b1b9820b71f69c50cd3a5eb624d7c9",
+  "assets": [
+    {
+      "asset": "interference_recharge_title_20261022.bmp",
+      "roi": [
+        944,
+        265,
+        1176,
+        307
+      ],
+      "sha256": "4571e24bf99d74e1205c2e7e5a004bb2788cf0a777f9b9759f179d6f28000f39"
+    },
+    {
+      "asset": "interference_recharge_close_20261022.bmp",
+      "roi": [
+        1306,
+        303,
+        1332,
+        331
+      ],
+      "sha256": "5b16ed25c0ac54c3fb26495d559050adbcb94339fa2574e3685e6e27b92d0ffb"
+    },
+    {
+      "asset": "interference_activity_menu_down_20261022.bmp",
+      "roi": [
+        613,
+        755,
+        638,
+        784
+      ],
+      "sha256": "5ef332c8a29640aaed15584da99e427a8e722034179a810921120701070ceb09"
+    }
+  ],
+  "purpose": "Only prove activity shell and its close X; no reward or purchase permission",
+  "input_operations": 0
+}

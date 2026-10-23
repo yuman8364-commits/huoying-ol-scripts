@@ -404,6 +404,9 @@ def _identity_layout(frame, templates=None):
               and matches('hot_spring_panel_close.bmp', (550, 70, 1650, 450)))
     managed = (matches('managed_settings_title_current.bmp', (750, 190, 1170, 290))
                and matches('managed_settings_close_current.bmp', (1320, 230, 1450, 330)))
+    managed_card = (managed
+                    and matches('managed_first_card_prompt_current.bmp', (800,490,1120,570))
+                    and matches('managed_first_card_confirm_current.bmp', (800,565,950,625)))
     welfare = (matches('welfare_title_current.bmp', (1120,230,1320,380))
                and matches('welfare_close_current.bmp', (1320,250,1450,350)))
     weekend = (matches('daruma_weekend_page.bmp', (850,230,1180,360))
@@ -423,14 +426,20 @@ def _identity_layout(frame, templates=None):
     daily = ((matches('daily_practice_anchor.bmp', (951,119,1501,369))
               or matches('daily_practice_title_core_current.bmp',(1190,140,1420,275)))
              and matches('daily_practice_close.bmp', (1370,200,1460,280)))
+    recharge = (matches('interference_recharge_title_20261022.bmp',(900,235,1250,325))
+                and matches('interference_recharge_close_20261022.bmp',(1290,285,1350,350)))
     public_room = (matches('team_public_room_title_current.bmp',(900,230,1100,315))
                    and matches('team_room_close.bmp',(1360,250,1450,340)))
+    quiz = (matches('quiz_page.bmp', (820,380,1060,450))
+            and matches('quiz_close.bmp', (1250,325,1350,410), .95))
+    treasure = (matches('treasure_page_anchor.bmp', (560,250,1380,810))
+                and matches('treasure_close.bmp', (1290,295,1370,375)))
     canyon = matches('identity_wanted_canyon_map_title_current.bmp',(1700,110,1850,145))
     roi = hs.IDENTITY_ROI
     if any(matches(name, (106,75,139,105)) for name in (
             'identity_team_badge_core_current.bmp', 'identity_team_badge_core_forest_current.bmp')):
         roi = (roi[0]+15, roi[1], roi[2]+15, roi[3])
-    return roi, 56 if welfare or weekend or puzzle or group or wanted or strong or daily or public_room else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
+    return roi, 25 if managed_card else 56 if welfare or weekend or puzzle or group or wanted or strong or daily or public_room or recharge or quiz or treasure else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
 
 
 def current_identity_crop(frame, templates=None):
@@ -440,8 +449,29 @@ def current_identity_crop(frame, templates=None):
 
 def current_identity_mask(frame, templates=None):
     import hyol_scheduler as hs
+    import numpy as np
     roi, threshold = _identity_layout(frame, templates)
-    mask = hs.identity_text_mask(frame.crop(roi), threshold=threshold)
+    crop = frame.crop(roi)
+    if threshold in (25, 50, 56):
+        # Only positively identified modal pages authorize dim compensation.
+        # Their overlay opacity varies (today's daily page has a white peak
+        # of 77/255). Scale brightness and saturation together so the original
+        # glyph definition survives the overlay without admitting colored map
+        # pixels. Account score and ambiguity thresholds remain unchanged.
+        rgb = np.asarray(crop.convert('RGB'), dtype=np.int16)
+        peak = int(rgb[12:].min(axis=2).max())
+        # The enrolled card confirmation adds a second dim layer (23/255
+        # white peak live). Its complete text, panel and button authorize the
+        # same proportional compensation; arbitrary dark dialogs do not.
+        if peak >= (16 if threshold == 25 else 32):
+            factor = peak/255.
+            mask = ((rgb.min(axis=2) >= hs.IDENTITY_TEXT_THRESHOLD*factor)
+                    & ((rgb.max(axis=2)-rgb.min(axis=2))
+                       <= hs.IDENTITY_TEXT_SATURATION*factor+1)).astype(np.uint8)
+        else:
+            mask = hs.identity_text_mask(crop, threshold=threshold)
+    else:
+        mask = hs.identity_text_mask(crop, threshold=threshold)
     # Rows 8-11 are the animated map edge above the fixed name glyphs. A
     # bright repaint there disproportionately changes the narrow server score.
     # Keep the glyph threshold and assignment floor unchanged.
@@ -456,8 +486,11 @@ def identity_mask_scores(mask, identities):
         reference = decode_mask(value['mask'], tuple(value['shape']))
         if reference.shape != mask.shape:
             raise CheckpointError('身份素材尺寸与当前归一化窗口不一致')
+        # Score the server and role glyphs separately. Including the server a
+        # second time in the whole-crop term can make another role on the same
+        # server qualify when that role's tab is absent.
         scores[name] = (.6*hs.mask_f1(reference[:, :hs.IDENTITY_SERVER_WIDTH], mask[:, :hs.IDENTITY_SERVER_WIDTH])
-                        + .4*hs.mask_f1(reference, mask))
+                        + .4*hs.mask_f1(reference[:, hs.IDENTITY_SERVER_WIDTH:], mask[:, hs.IDENTITY_SERVER_WIDTH:]))
     return scores
 
 
@@ -512,8 +545,10 @@ def bind_current_identity(scheduler, anonymous):
     """Promote a session using its discovery rule and a fresh identity recheck."""
     import hyol_scheduler as hs
     directory = scheduler.state.directory
-    shared = directory.parent
-    identities = read_checkpoint(getattr(scheduler,'identity_directory',shared) / 'account_identities.json')
+    context = getattr(scheduler, 'run_context', None)
+    shared = context.directory if context is not None else directory.parent
+    from hyol_accounts import identity_registry_path
+    identities = read_checkpoint(identity_registry_path(scheduler))
     automatic = getattr(scheduler, 'automatic_accounts', False)
     first_frame = scheduler.capture()
     if automatic:
