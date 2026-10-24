@@ -40,6 +40,15 @@
 - `test_market_safety_static.py`、`validate_multi_static.py`、`validate_templates.py`：静态安全、多人逻辑和模板回放验证。
 - `test_multi_discovery.ps1`：只读窗口发现与几何检查，会检查当前实机窗口，不纳入纯离线套件。
 
+## 源码与回放资料分包（本地交付）
+
+本地交付把开发资料拆成两个 ZIP，合并后才具备全部离线验证能力：
+
+- `huoying-ol-source-<版本>.zip`：源码、构建与验证工具（含 `tools/run_optimization_checks.py`、`tools/measure_optimization_memory.py`、`tools/package_source.py`）。
+- `huoying-ol-replay-data-<版本>.zip`：图像与回放夹具，解压到源码根目录后补齐 `tests/fixtures/`、`fixtures/`、`daruma_standalone/tests/` 及 `models/candidates/` 开发候选资料。
+- 需要图像夹具的专项（如 `test_hyol_checkpoints`、`test_offline_full_flow`、达摩独立测试）必须在合并后的目录运行；仅源码包无法执行这些用例。原版未提供的私人历史截图与账号回执始终不在包内。
+- 专项入口：`python -B tools/run_optimization_checks.py --output verification.json`；内存对照：`tools/measure_optimization_memory.py`（原版子进程不受优化版线程默认影响，各自独立配置）。
+
 ## 配置、资源和生成物
 
 - 当前独立配置：`ARENA_Client.ini`、`TEAM_Client.ini`、`HYOL_Daily.ini`。

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sqlite3
 import tkinter as tk
 from tkinter import ttk
 
@@ -56,7 +57,21 @@ class ProgressView(ttk.Frame):
         self.detail.pack(fill='x')
         ttk.Label(self, textvariable=self.note, wraplength=1000).pack(anchor='w', pady=(3, 0))
         self.refresh()
-        self.after(2000, self._tick)
+        self._timer = self.after(2000, self._tick)
+
+    def destroy(self):
+        # __init__ may fail before reader/_timer exist; closing must stay safe.
+        timer = getattr(self, '_timer', None)
+        if timer is not None:
+            try:
+                self.after_cancel(timer)
+            except tk.TclError:
+                pass
+        self._timer = None
+        reader = getattr(self, 'reader', None)
+        if reader is not None:
+            reader.close()
+        super().destroy()
 
     def _change_day(self, _event=None):
         self.run.set('今日累计')
@@ -73,8 +88,14 @@ class ProgressView(ttk.Frame):
         self.refresh()
 
     def _tick(self):
-        self.refresh()
-        self.after(2000, self._tick)
+        # A cancelled or already destroyed widget must not re-arm itself.
+        try:
+            alive = bool(self.winfo_exists())
+        except tk.TclError:
+            alive = False
+        if alive:
+            self.refresh()
+            self._timer = self.after(2000, self._tick)
 
     def refresh(self):
         try:
@@ -110,7 +131,7 @@ class ProgressView(ttk.Frame):
             self.note.set(f'最近记录：{updated}  |  {warning or "只读浏览；标签位置以所选运行的核验记录为准。"}')
             if self.selection:
                 self._show_detail(*self.selection)
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             self.note.set('待刷新，保留已有显示：' + str(exc))
 
     def _select(self, event):

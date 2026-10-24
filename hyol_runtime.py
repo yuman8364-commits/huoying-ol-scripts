@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.23.8'
+VERSION = '2026.10.24.2-local'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
@@ -480,7 +480,28 @@ class RuntimeController:
                 hs.atomic_json(self.root/'logs/unified_latest.json', receipt)
             except OSError as exc:
                 receipt['save_error'] = str(exc)
-            self.emit('unified_finished', **receipt)
-            self.scheduler = None
-            self.run_context = None
+            try:
+                self.emit('unified_finished', **receipt)
+            finally:
+                self._release_run_resources()
             self.emit('unified_idle')
+
+    def _release_run_resources(self):
+        # The receipt owns only plain data. The GUI no longer needs runners or
+        # captures; drop even cyclic nested runners after the worker is finished.
+        pending = [self.runner, self.scheduler]
+        self.runner = self.scheduler = self.run_context = None
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            values = getattr(current, '__dict__', {})
+            pending.extend(values.get(key) for key in ('scheduler', 'solo'))
+            runners = values.get('runners')
+            if isinstance(runners, dict):
+                pending.extend(runners.values())
+            if isinstance(current, hs.Scheduler):
+                current.release_resources()
+
