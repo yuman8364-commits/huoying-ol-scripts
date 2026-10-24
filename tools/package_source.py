@@ -20,7 +20,7 @@ def source_paths(root):
     selected = set()
     for pattern in ('*.py', '*.ps1', '*.ini', '*.md', '*requirements*.txt', '*.cmd', '.gitignore'):
         selected.update(path for path in root.glob(pattern) if path.is_file())
-    for folder in ('assets', 'models', 'daruma_standalone', 'tools', 'tests', 'fixtures', 'docs'):
+    for folder in ('assets', 'models', 'daruma_standalone', 'tools', 'tests', 'fixtures', 'docs', 'web'):
         selected.update(path for path in (root/folder).rglob('*') if path.is_file())
     return sorted(path for path in selected
                   if path.name not in ('PROGRESS.md', 'HANDOFF.md')
@@ -50,7 +50,7 @@ def package_sources(root, output, version):
                 target = relative if data else f'huoying-ol-scripts-{version}/{relative}'
                 bundle.writestr(target, content)
                 manifest.append(dict(path=relative, bytes=len(content), sha256=hashlib.sha256(content).hexdigest()))
-            record = dict(version=version, kind=kind, base_commit='fe51a66014dd76f65c582638df302aee22df9533',
+            record = dict(version=version, kind=kind, base_commit='e1ce1616a38be80d332de111a99e5272e7f63a49',
                           personal_material=False, runtime_data=False, files=manifest)
             target = 'REPLAY_MANIFEST.json' if data else f'huoying-ol-scripts-{version}/SOURCE_MANIFEST.json'
             bundle.writestr(target, json.dumps(record, ensure_ascii=False, indent=2).encode('utf-8'))

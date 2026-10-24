@@ -15,7 +15,7 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
 from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.24.2-local'
+VERSION = '2026.10.24.3-local'
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
 
 
