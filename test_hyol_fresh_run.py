@@ -191,7 +191,10 @@ class BindingTests(FreshRunCase):
         scheduler,frame = self.bind_real_team_scheduler()
         scheduler.healthy.return_value = False
         scheduler.verify_identity.return_value = (False,{})
-        scheduler._bound_role_verified = Mock(return_value=(False,{},not visible))
+        identity_probe = patch('hyol_checkpoints.current_identity_mask',
+            return_value=np.zeros((32,145),dtype=np.uint8) if visible else np.ones((32,145),dtype=np.uint8))
+        identity_probe.start()
+        self.addCleanup(identity_probe.stop)
         scheduler.check_stop = Mock()
         scheduler.wait_interruptible = Mock()
         scheduler.save_raw_evidence = Mock(return_value='pending.png')
@@ -324,10 +327,8 @@ class BindingTests(FreshRunCase):
 
     def test_own_running_battle_can_be_observed_without_claiming_identity(self):
         s=self.scheduler();s.verify_identity.return_value=(False,{})
-        s._bound_role_verified.return_value=(False,{},False)
-        reference=np.ones((10,10),dtype=np.uint8)
-        s._tab_title_masks={1:reference};s._title_mask.return_value=reference
-        self.context.select(s,s.accounts[0],allow_hidden=True)
+        with patch('hyol_checkpoints.current_identity_mask',return_value=np.zeros((32,145),dtype=np.uint8)):
+            self.context.select(s,s.accounts[0],allow_hidden=True)
         s.chrome_click.assert_not_called()
         self.assertEqual(s.event.call_args.args[0],'account_observation_bound')
         self.assertFalse(s.event.call_args.kwargs['content_authorized'])

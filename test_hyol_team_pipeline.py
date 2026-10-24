@@ -32,7 +32,8 @@ def coordinator():
     owner.scheduler.template.return_value = (False, 0., 0, 0)
     owner.scheduler.accounts = [hs.Account(i,f'role{i}',100+i*100) for i in range(1,7)]
     owner.scheduler.state = SimpleNamespace(day='2026-10-06',aliases={'role1':'captainA','role4':'captainB'},
-                                           accounts={f'role{i}':{'actions':{}} for i in range(1,7)})
+                                           accounts={f'role{i}':{'actions':{}} for i in range(1,7)},
+                                           save_account=Mock(),save_global=Mock())
     owner.scheduler.by_name = {a.name:a for a in owner.scheduler.accounts}
     owner.scheduler._bound_identity_names = {1:'captainA',4:'captainB'}
     owner.drivers = {}

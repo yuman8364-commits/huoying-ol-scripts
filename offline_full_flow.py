@@ -21,6 +21,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
+# Development replay entry: same conservative native-thread default as the
+# production entries, applied before NumPy loads (explicit user values win).
+from hyol_environment import configure_numeric_runtime
+configure_numeric_runtime()
 import numpy as np
 from PIL import Image
 

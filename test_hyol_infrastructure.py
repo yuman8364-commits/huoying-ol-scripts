@@ -105,13 +105,13 @@ class DiagnosticsTests(unittest.TestCase):
     def test_manual_stop_is_persisted(self):
         with tempfile.TemporaryDirectory() as folder:
             mark_manual_pause(folder, 'run1', 'F12')
-            self.assertTrue(json.loads((Path(folder)/'state/manual_pause.json').read_text())['paused'])
+            self.assertTrue(json.loads((Path(folder)/'state/manual_pause.json').read_text(encoding='utf-8-sig'))['paused'])
 
     def test_explicit_resume_preserves_pause_audit_record(self):
         with tempfile.TemporaryDirectory() as folder:
             mark_manual_pause(folder, 'run1', 'F12')
             cleared = clear_manual_pause(folder, '用户明确继续')
-            value = json.loads((Path(folder)/'state/manual_pause.json').read_text())
+            value = json.loads((Path(folder)/'state/manual_pause.json').read_text(encoding='utf-8-sig'))
             self.assertEqual(cleared, [str(Path(folder)/'state/manual_pause.json')])
             self.assertFalse(value['paused'])
             self.assertEqual(value['reason'], 'F12')
@@ -335,7 +335,7 @@ class DiagnosticsTests(unittest.TestCase):
             logger = hs.JsonlLogger(root/'run.jsonl')
             with patch.object(hs.tempfile, 'gettempdir', return_value=folder), patch.object(hs.time, 'sleep'), self.assertWarns(RuntimeWarning):
                 logger.write('cleanup', result=2)
-            self.assertEqual(json.loads((Path(folder)/'HYOL_diagnostics/run.jsonl').read_text())['event'], 'cleanup')
+            self.assertEqual(json.loads((Path(folder)/'HYOL_diagnostics/run.jsonl').read_text(encoding='utf-8-sig'))['event'], 'cleanup')
 
 
 class RecognitionTests(unittest.TestCase):

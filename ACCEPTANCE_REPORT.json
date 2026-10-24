@@ -1,48 +1,48 @@
 {
-  "version": "2026.10.20.1",
-  "validation_scope": "local_targeted_regression_and_native_gui_launch",
-  "targeted_tests": {
-    "run": 361,
-    "passed": 361,
+  "version": "2026.10.23.8",
+  "at": "2026-10-23T23:38:38.521503+08:00",
+  "local_tests": {
+    "total": 934,
+    "passed": 925,
+    "existing_issues": 9,
+    "new_failures": 0,
     "skipped": 0,
-    "failures": 0,
-    "errors": 0
+    "new_tests_passed": 37,
+    "original_issue_reproductions_verified": true,
+    "tests_deleted_or_disabled": false
   },
-  "prior_pr_only": {
-    "run": 1271,
-    "passed": 1263,
-    "skipped": 8,
+  "clean_source_tests": {
+    "total": 78,
+    "passed": 78,
     "failures": 0,
     "errors": 0,
-    "tree": "10ff667da49d3ca3dab2dc7d9ae916ccff01dc7c",
-    "applies_to_current_full_source": false
+    "skipped": 0
   },
-  "packaged_clients": 5,
-  "source_gui_entries": 2,
-  "native_gui_launch_verified": true,
-  "packaged_source_matches": true,
-  "modules": {
-    "daily": 37,
-    "team": 43,
-    "arena": 37,
-    "bond": 37,
-    "unified": 42
+  "offline_commands": 11,
+  "packaged_modules": 42,
+  "generic_assets": 616,
+  "executable_sha256": "f48c2ef423d4f432544e3593eb4c73a744650787d5cd89f73adba202cd6e184f",
+  "live": {
+    "arena_matches": 16,
+    "arena_wins": 13,
+    "arena_defeats": 3,
+    "arena_tickets": 0,
+    "standalone_arena_zero_ticket_close": true,
+    "treasure_seconds": 300,
+    "treasure_stop_and_home": true,
+    "managed": true,
+    "quiz_result_and_home": true,
+    "survival_observed_score": 220
   },
-  "prior_runtime_files_preserved": 4295,
-  "configuration_state_shortcut_files_preserved": 841,
-  "game_tasks_started_during_release": false,
-  "game_input_operations_during_release": 0,
-  "live_acceptance": "pending_user_testing",
-  "full_project_regression": "not_claimed",
-  "legacy_test_contract_fixture_issues": 14,
-  "local_runtime_and_account_configuration_included": false,
-  "clean_export": {
-    "independent_tests": 113,
-    "mouse_interruption_safety_tests": 4,
-    "failures": 0,
-    "errors": 0,
-    "skipped": 0,
-    "syntax_files": 214,
-    "local_evidence_tests": "require private historical screenshots, identity records and training provenance; not distributed"
+  "limits": [
+    "quiz_full_ten_question_loop_not_live_tested",
+    "survival_new_battles_not_live_tested",
+    "bond_unlinked_legacy_request_preserved_without_battle",
+    "weekend_not_open_on_execution_day"
+  ],
+  "privacy": {
+    "runtime_state_included": false,
+    "personal_account_material_included": false,
+    "local_logs_included": false
   }
 }

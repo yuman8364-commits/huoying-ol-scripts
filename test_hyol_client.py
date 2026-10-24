@@ -25,6 +25,12 @@ def finished_daily():
 
 
 class EventMessageTests(unittest.TestCase):
+    def test_full_backpack_notice_names_the_affected_account_and_required_cleanup(self):
+        message = format_task_event(dict(event='mail_backpack_full', account=ROLE_C, tab_index=3), 'team_then_multi')
+        self.assertIn(ROLE_C, message)
+        self.assertIn('邮件附件未领', message)
+        self.assertIn('背包已满，需清理', message)
+
     def test_solo_pending_uses_identity_and_task_instead_of_configured_tab_number(self):
         event = dict(event='multi_solo_task_pending', account=ROLE_D, tab_index=3,
                      task='mail', detail='原领取结果尚未核实')
@@ -474,6 +480,22 @@ class ControllerTests(unittest.TestCase):
 
 
 class GuiControlTests(unittest.TestCase):
+    def test_mail_cleanup_notice_persists_while_another_task_runs_and_clears_only_when_resolved(self):
+        self.app.active_request = runtime.RunRequest(mode='multi', tasks=('mail', 'welfare'), final_managed=False)
+        mail = dict(status='pending', last_error='普通背包已满，邮件附件保留待领取')
+        tasks = dict(mail=mail, welfare=dict(status='running'))
+        self.app.progress_view.refresh = Mock()
+        self.app.progress_view.snapshot = dict(rows=[dict(index=3, account=ROLE_C, label='标签3',
+            health='已绑定', tasks=tasks)])
+        self.app._refresh_account_list()
+        values = self.app.account_tree.item('3', 'values')
+        self.assertEqual((ROLE_C, '背包满需清理', '邮件', '0/2'), values)
+        self.assertEqual('pending', mail['status'])
+        mail.update(status='done', last_error='')
+        self.app._refresh_account_list()
+        self.assertEqual((ROLE_C, '运行中', '在线福利', '1/2'), self.app.account_tree.item('3', 'values'))
+        self.assertIsNone(self.app.controller.worker)
+
     def test_manual_single_team_choice_is_visible_and_reaches_request(self):
         self.app.tabs.select(1)
         self.app.team_mode.set('已有队伍 → 多人单人')

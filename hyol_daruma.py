@@ -16,7 +16,9 @@ import hyol_scheduler as hs
 
 
 HOTSPOT = (450, 69, 550, 145)
-MENU = (475, 610, 690, 665)
+# Limited-time activities rotate the menu rows. Match the same text template
+# anywhere in the proven left menu rather than assuming its September row.
+MENU = (475, 340, 690, 745)
 WEEKEND_PAGE = (880, 245, 1190, 360)
 GAME_PAGE = (920, 220, 1300, 325)
 REWARD_DIGIT = (1289, 642, 1317, 666)
@@ -176,7 +178,34 @@ def _open_weekend(r) -> None:
         raise hs.PendingError('达摩入口要求当前账号在木叶主界面或已核实的达摩页面')
     r.click('daruma_hotspot.bmp', HOTSPOT, 27, 27, 'daruma_open_hotspot',
             ['anchor_top_menu.bmp'], threshold=.91)
-    r.wait('daruma_weekend_menu.bmp', MENU, 8)
+    try:
+        r.wait('daruma_weekend_menu.bmp', MENU, 8)
+    except hs.PendingError as exc:
+        # Opening the hotspot can leave its initial activity over the role
+        # strip when the requested entry is absent. Close only the independent
+        # title/X pair proven for that initial page; an unknown activity stays
+        # untouched. This cleanup gives neither task nor reward credit.
+        from hyol_identity_overlays import inspect, dismiss_identity_overlays
+        frame = getattr(s, '_last_frame', None)
+        frame = frame if frame is not None else s.capture()
+        overlay = inspect(s, frame)
+        if overlay is None or overlay[0] != 'recharge_activity':
+            raise
+        evidence = s.save_raw_evidence(frame, r.account,
+                                       'daruma_visible_menu_unconfirmed', 'pending')
+        r.event('daruma_entry_unconfirmed', evidence=str(evidence),
+                menu_roi=MENU, task_credit=False, reward_credit=False,
+                detail='当前可见活动菜单未确认周末活动；不推断全天未开放')
+        dismiss_identity_overlays(s, r.account, frame, only_kind='recharge_activity')
+        if not s.wait_until_main(8):
+            raise hs.PendingError('达摩入口未确认，关闭已核实活动页后仍未确认木叶；'
+                                  f'原任务保留pending；截图={evidence}') from exc
+        returned = s.save_raw_evidence(s.capture(), r.account,
+                                      'daruma_menu_unconfirmed_returned', 'verified')
+        r.event('daruma_entry_unconfirmed_returned', evidence=str(returned),
+                entry_evidence=str(evidence), task_credit=False, reward_credit=False)
+        raise hs.PendingError('达摩当前可见活动菜单未确认周末活动；已关闭已核实活动页并回村，'
+                              f'原任务保留pending；截图={evidence}') from exc
     r.click('daruma_weekend_menu.bmp', MENU, 65, 15, 'daruma_open_weekend',
             ['daruma_weekend_menu.bmp'], threshold=.91)
     r.wait('daruma_weekend_page.bmp', WEEKEND_PAGE, 8)

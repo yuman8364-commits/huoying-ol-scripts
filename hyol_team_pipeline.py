@@ -15,7 +15,7 @@ from itertools import permutations
 
 import hyol_scheduler as hs
 from hyol_checkpoints import decode_mask, encode_mask, read_checkpoint
-from hyol_daily_tasks import DailyRunner, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, LABELS, PAGE_ANCHORS, PAGE_ROIS, DAILY_ROI, ROW_ROI, WANTED_SELECTED_ROI, GROUP_RETURN_ROI
+from hyol_daily_tasks import DailyRunner, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, LABELS, PAGE_ANCHORS, PAGE_ROIS, DAILY_ROI, ROW_ROI, WANTED_SELECTED_ROI, GROUP_RETURN_ROI, calendar_task_plan
 from hyol_diagnostics import manual_pause_status
 from hyol_multi_solo import MultiSoloRunner
 from hyol_multi_solo import tab_close_positions, active_tab_centers
@@ -1023,6 +1023,7 @@ class LeaderActivityRunner(DailyRunner):
 
     def tick(self, task):
         s, rec = self.scheduler, self.record(task)
+        s._performance_task = 'team_' + task
         self.next_poll_seconds = .6
         if task == 'strong':
             self.tick_strong(rec)
@@ -1283,8 +1284,39 @@ class TeamPipelineRunner:
         self._not_open_tasks = set()
 
     def save(self):
+        calendar = self._solo_calendar_plan()
+        if calendar is not None:
+            self.record.update(requested_solo_tasks=calendar['requested_tasks'],
+                               effective_solo_tasks=calendar['effective_tasks'],
+                               calendar_skipped_tasks=calendar['calendar_skipped'])
         self.record['updated_at'] = hs.now_iso()
         hs.atomic_json(self.path,self.record)
+
+    def _solo_calendar_plan(self):
+        day = self.record.get('execution_day')
+        if day is None:
+            return None  # Never reinterpret a historical request using today.
+        try:
+            return calendar_task_plan(self.solo_tasks, day)
+        except (TypeError, ValueError):
+            return None
+
+    def _effective_solo_selection(self):
+        calendar = self._solo_calendar_plan()
+        has_calendar = any(task in ('daruma', 'weekend') for task in self.solo_tasks)
+        names = ('requested_solo_tasks', 'effective_solo_tasks', 'calendar_skipped_tasks')
+        request = self.record.get('request', {})
+        requested = request.get('solo_tasks') if isinstance(request, dict) else None
+        if requested is not None and requested != list(self.solo_tasks):
+            return self.solo_tasks, {}, False
+        if calendar is None:
+            return self.solo_tasks, {}, not has_calendar and not any(name in self.record for name in names)
+        if has_calendar or any(name in self.record for name in names):
+            expected = (calendar['requested_tasks'], calendar['effective_tasks'], calendar['calendar_skipped'])
+            if (has_calendar and requested != list(self.solo_tasks)
+                    or any(self.record.get(name) != value for name, value in zip(names, expected))):
+                return self.solo_tasks, {}, False
+        return tuple(calendar['effective_tasks']), calendar['calendar_skipped'], True
 
     def event(self, name, account=None, **fields):
         self.scheduler.event(name,account,**fields)
@@ -1690,6 +1722,9 @@ class TeamPipelineRunner:
         self.save()
 
     def completed(self):
+        effective_tasks, _, calendar_valid = self._effective_solo_selection()
+        if not calendar_valid:
+            return False
         count = self.record.get('required_account_count')
         if type(count) is not int or not 1 <= count <= 6:
             return False
@@ -1711,7 +1746,7 @@ class TeamPipelineRunner:
                 return False
             records = self.record.get('solo_records', {})
             for name in expected:
-                for task in self.solo_tasks:
+                for task in effective_tasks:
                     rec = records.get(name, {}).get(task, {})
                     if (rec.get('status') != 'done' or rec.get('task_completed') is not True
                             or rec.get('home_returned') is not True or rec.get('followup_check_due')):
@@ -1745,6 +1780,22 @@ class TeamPipelineRunner:
                         for slot in self.record['teams'].values())
                 and self.record.get('solo_result') == 0)
 
+    def _timed_call(self, phase, function, *args, **kwargs):
+        s = self.scheduler
+        previous = getattr(s, '_performance_task', None)
+        s._performance_task = phase
+        started = time.perf_counter()
+        outcome = 'error'
+        self.event('pipeline_stage_started', phase=phase)
+        try:
+            result = function(*args, **kwargs)
+            outcome = 'finished'
+            return result
+        finally:
+            s._performance_task = previous
+            self.event('pipeline_stage_elapsed', phase=phase, outcome=outcome,
+                       seconds=round(time.perf_counter()-started, 6))
+
     def run(self):
         s = self.scheduler
         lease = hs.ForegroundRuntimeLease()
@@ -1752,31 +1803,39 @@ class TeamPipelineRunner:
             lease.release()
             raise hs.PendingError('已有脚本占用游戏窗口')
         stop = s.stop
+        meter = None
         try:
+            from hyol_performance import PerformanceMeter
+            meter = PerformanceMeter(s)
             self.run_context.begin()
             s.start_f12_monitor()
-            s.bind_session(self.leaders,allow_unavailable=True,leaders_only=True)
+            self._timed_call('identity_binding', s.bind_session, self.leaders,
+                             allow_unavailable=True, leaders_only=True)
             if not self.leaders:
                 self.leaders = s._automatic_captain_slots
             if not self.leaders:
                 raise hs.PendingError('未识别到可核实队长，请先在游戏组成队伍')
             self.initialize_run()
-            self.prepare_teams()
-            self.run_teams()
+            self._timed_call('team_preparation', self.prepare_teams)
+            self._timed_call('team_tasks', self.run_teams)
             s.check_stop()
             self.record['phase'] = 'solo'
             self.save()
             self.solo = MultiSoloRunner(self.solo_tasks,config_path=self.root/'HYOL_Daily.ini',
                 account_count=6,arena_wins=self.arena_wins,arena_target_mode=self.arena_target_mode,
                 formation=self.formation,managed_enabled=self.managed_enabled,
-                event_sink=self.sink,run_context=self.run_context)
+                event_sink=self.sink,run_context=self.run_context,
+                execution_day=self.record['execution_day'])
             if self.solo.scheduler.state.day != self.record['execution_day']:
                 raise hs.PendingError('运行期间日期改变，本轮结束；请重新开始')
             self.scheduler = self.solo.scheduler
-            result = self.solo.run(manage_lease=False,before_prepare=self.handoff)
+            result = self._timed_call('solo_tasks', self.solo.run, manage_lease=False,
+                before_prepare=lambda solo: self._timed_call('handoff', self.handoff, solo))
             selected = (*self.solo_tasks, 'managed')
-            self.record['solo_records'] = {name:deepcopy({task:runner.records.get(task,{}) for task in selected})
-                                           for name,runner in self.solo.runners.items()}
+            records = self.record.setdefault('solo_records', {})
+            for name, runner in self.solo.runners.items():
+                records.setdefault(name, {}).update(deepcopy({task:runner.records[task]
+                    for task in selected if task in runner.records}))
             self.record.update(solo_result=result,solo_exclusions=self.solo_exclusions,
                 solo_initial_unavailable=sorted(self.solo.initial_unavailable),
                 solo_disconnected=sorted(self.solo.disconnected),
@@ -1787,12 +1846,20 @@ class TeamPipelineRunner:
             self.save()
             return 0 if self.completed() else 2
         finally:
-            stop.set()
-            lease.release()
+            try:
+                stop.set()
+                if meter is not None:
+                    timings, scopes = meter.snapshot(), meter.scope_snapshot()
+                    meter.close()
+                    self.event('pipeline_performance', timings=timings, scopes=scopes,
+                               detail='仅exclusive_seconds可相加；阶段及账号墙钟可重叠')
+            finally:
+                lease.release()
 
 
     def summary(self):
         from hyol_puzzle import weekend_verified
+        effective_tasks, calendar_skipped, calendar_valid = self._effective_solo_selection()
         teams = self.record.get('teams',{})
         done = sum(t.get('status') == 'done' for t in teams.values())
         pending = len(teams)-done
@@ -1808,7 +1875,7 @@ class TeamPipelineRunner:
         accounts = dict.fromkeys([*self.record.get('expected_accounts', []), *records])
         for account in accounts:
             account_records = records.get(account, {})
-            for task in self.solo_tasks:
+            for task in effective_tasks:
                 rec = account_records.get(task,{})
                 if (rec.get('status') == 'done' and rec.get('task_completed')
                         and rec.get('home_returned') and not rec.get('followup_check_due')
@@ -1832,6 +1899,8 @@ class TeamPipelineRunner:
         complete = self.completed()
         return dict(teams=teams,solo_eligible=self.record.get('solo_eligible',[]),
                     solo_exclusions=self.record.get('solo_exclusions',{}),
+                    effective_solo_tasks=list(effective_tasks), calendar_skipped_tasks=calendar_skipped,
+                    calendar_valid=calendar_valid,
                     solo_pending=solo_pending,not_open=not_open,
                     batch_status='complete' if complete else 'pending',
                     offline_skipped=offline,phase=self.record.get('phase'),
@@ -1839,6 +1908,8 @@ class TeamPipelineRunner:
                            + f'组队已完成并解散{done}队；本轮暂缓{pending}队；单人已核实可运行{eligible}号、暂缓{excluded}号、掉线或未绑定跳过{offline}号。'
                            + (reasons+'。' if reasons else '')
                            + ('组队副本当前不在开放时间，本轮已跳过并继续后续任务；未计完成。' if not_open else '')
+                           + (f"{self.record['execution_day']}非周末，达摩和周末活动按日历跳过；原请求及旧记录保留。"
+                              if calendar_skipped else '')
                            + (f'单人待处理{len(solo_pending)}项：'+solo_reasons
                               +('；其余原因见运行日志。' if len(solo_pending)>6 else '。') if solo_pending else ''))
 

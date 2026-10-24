@@ -57,6 +57,12 @@ def inspect(s, frame):
         if not close[0] or fingerprint is None:
             return ('blocked_arena_trial_notice',)
         return ('arena_trial_notice','arena_trial_notice_close_current.bmp',(1190,290,1290,390),11,11,close[2],close[3],fingerprint)
+    if s.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+        close=s.template('interference_recharge_close_20261022.bmp',(1290,285,1350,350),frame,threshold=.98)
+        if not close[0]:
+            return ('blocked_recharge_activity',)
+        return ('recharge_activity','interference_recharge_close_20261022.bmp',
+                (1290,285,1350,350),13,14,close[2],close[3])
     if (s.template('team_public_room_title_current.bmp',(900,230,1100,315),frame,threshold=.98)[0]
             and s.template('team_create_button.bmp',(951,650,1301,850),frame,threshold=.98)[0]):
         close = s.template('team_room_close.bmp',(1360,250,1450,340),frame,threshold=.98)

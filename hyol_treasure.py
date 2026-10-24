@@ -38,9 +38,12 @@ def transformation_visible(runner, frame):
 
 
 def loading_visible(runner, frame):
-    return (runner.visible('map_loading_word_current.bmp', MAP_LOADING_ROI, frame, .98)
-            and any(runner.visible(name, MAP_LOADING_ROI, frame, .98) for name in (
-                'map_loading_path_current.bmp', 'map_loading_finished_current.bmp')))
+    if not runner.visible('map_loading_word_current.bmp', MAP_LOADING_ROI, frame, .98):
+        return False
+    return (any(runner.visible(name, MAP_LOADING_ROI, frame, .98) for name in (
+                'map_loading_path_current.bmp', 'map_loading_finished_current.bmp'))
+            or (runner.visible('map_loading_bar_left_current.bmp', (730,520,790,560), frame, .98)
+                and runner.visible('map_loading_bar_right_current.bmp', (1140,520,1190,560), frame, .98)))
 
 
 def settle_result(runner, action):
@@ -67,13 +70,15 @@ def open_page(runner):
     if runner.visible("treasure_page_anchor.bmp", PAGE_ROI, threshold=.96):
         return
     toolbar_roi = (651,69,1670,170)
-    runner.scheduler.ensure_activity_toolbar(runner.account, 'treasure_toolbar_core_current.bmp', toolbar_roi)
+    runner.scheduler.ensure_activity_toolbar(runner.account, 'treasure_toolbar_icon_core_current.bmp', toolbar_roi)
     frame = runner.scheduler.capture()
-    target, dx, dy = ('treasure_toolbar_core_current.bmp', 22, 25)
+    # The label crosses animated map pixels. Prefer the strict icon interior,
+    # which stays stable between detection and the final input guard.
+    target, dx, dy = ('treasure_toolbar_icon_core_current.bmp', 12, 12)
     if not runner.visible(target, toolbar_roi, frame, .98):
-        target, dx, dy = ('treasure_toolbar_icon_core_current.bmp', 12, 12)
+        target, dx, dy = ('treasure_toolbar_core_current.bmp', 22, 25)
     runner.click(target, toolbar_roi,dx,dy,
-                 "daily_treasure_open", ["anchor_top_menu.bmp", "treasure_toolbar_core_current.bmp"],
+                 "daily_treasure_open", ["anchor_top_menu.bmp", target],
                  threshold=.98, anchor_threshold=.98)
     runner.wait("treasure_page_anchor.bmp", PAGE_ROI,10)
 

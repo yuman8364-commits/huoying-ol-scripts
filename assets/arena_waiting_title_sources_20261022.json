@@ -1,0 +1,11 @@
+{
+  "source": "logs/arena_unknown_after_stop_20260926.png",
+  "source_sha256": "dfc46360c1cabd2aea3952662e42b62482c8442869d3c3605ac7791f4af83444",
+  "roi": [
+    820,
+    472,
+    1065,
+    529
+  ],
+  "asset": "arena_waiting_title_current.bmp"
+}

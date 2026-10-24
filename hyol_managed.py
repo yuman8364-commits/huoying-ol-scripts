@@ -13,6 +13,84 @@ OPTIONS = (
     ('market', (779,708,807,735), (807,710,866,735)),
 )
 
+CARD_PROMPT = 'managed_first_card_prompt_current.bmp'
+CARD_CONFIRM = 'managed_first_card_confirm_current.bmp'
+CARD_PROMPT_ROI = (800,490,1120,570)
+CARD_CONFIRM_ROI = (800,565,950,625)
+CARD_ACTION = 'start_managed_card_confirm'
+
+
+def first_card_prompt_visible(s, frame):
+    """The complete first-day card text and its own button must agree."""
+    return all(s.template(name, roi, frame, threshold=.98)[0] for name,roi in (
+        (TITLE, TITLE_ROI), (CARD_PROMPT, CARD_PROMPT_ROI),
+        (CARD_CONFIRM, CARD_CONFIRM_ROI)))
+
+
+def validate_card_intent(s, account):
+    """Tie the card confirmation to this day's original start receipt."""
+    from pathlib import Path
+    import re
+    import hyol_scheduler as hs
+    actions = s.state.accounts[account.name].get('actions', {})
+    budget = s.state.accounts[account.name].get('network_retries', {}).get('start_managed', {})
+    attempts = budget.get('attempts')
+    day = s.state.day
+    if (isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 3
+            or budget.get('source_day') != day):
+        raise hs.PendingError('托管卡确认缺少本日原启动预算，未点击')
+    receipts = [(key,row) for key,row in actions.items()
+                if re.fullmatch(r'start_managed_network_\d+', key)
+                and isinstance(row, dict) and row.get('status') == 'pending']
+    if not receipts:
+        raise hs.PendingError('托管卡确认没有对应未决启动，未点击')
+    for key,row in receipts:
+        number = int(key.rsplit('_', 1)[1])
+        if (not 1 <= number <= attempts or row.get('origin') or row.get('checkpoint_conflict')
+                or not str(row.get('updated_at', '')).startswith(day+'T')
+                or not Path(row.get('before_evidence', '')).is_file()):
+            raise hs.PendingError('托管原启动凭据有冲突或缺失，未确认托管卡')
+    previous = actions.get(CARD_ACTION, {})
+    if previous and (previous.get('origin') or previous.get('checkpoint_conflict')
+                     or not str(previous.get('updated_at', '')).startswith(day+'T')):
+        raise hs.PendingError('托管卡原确认凭据存在冲突，保留待核实')
+
+
+def confirm_first_card(s, account, frame):
+    """Send one audited confirmation; disappearance alone never proves success."""
+    import hyol_scheduler as hs
+    if not first_card_prompt_visible(s, frame):
+        return False
+    validate_card_intent(s, account)
+    status = s.state.action_status(account.name, CARD_ACTION)
+    if status != 'new':
+        return False  # An unconfirmed or already confirmed card is never spent again.
+    def still_current(fresh):
+        validate_card_intent(s, account)
+        return (s.state.action_status(account.name, CARD_ACTION) == 'new'
+                and first_card_prompt_visible(s, fresh))
+    if not s.click_template(account, CARD_CONFIRM, CARD_CONFIRM_ROI, 50,16,
+            CARD_ACTION, [TITLE, CARD_PROMPT, CARD_CONFIRM], irreversible=True,
+            threshold=.98, anchor_threshold=.98,
+            frame_predicate=still_current):
+        raise hs.PendingError('托管卡确认提示在点击前变化，未重复启动')
+    s.event('managed_first_card_confirmation_sent', account,
+            detail='本日原启动对应的1张已有托管卡确认已发送，等待托管中十帧核实')
+    return True
+
+
+def reconcile_card_confirmation(s, account):
+    """Called only after the primary ten-frame active gate has passed."""
+    if s.state.action_status(account.name, CARD_ACTION) == 'pending':
+        # The start network receipts may already be committed, so validate the
+        # card receipt itself here rather than inventing another start intent.
+        import hyol_scheduler as hs
+        row = s.state.accounts[account.name]['actions'][CARD_ACTION]
+        if (row.get('origin') or row.get('checkpoint_conflict')
+                or not str(row.get('updated_at', '')).startswith(s.state.day+'T')):
+            raise hs.PendingError('托管卡确认来源未核实，保留原记录')
+        s.commit_action(account, CARD_ACTION, '原托管卡确认后托管中连续十帧核实')
+
 
 def option_rois(s, checkbox_roi, label_roi, frame):
     """Keep each label and checkbox attached to the positively identified panel."""

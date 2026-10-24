@@ -203,6 +203,8 @@ class BondRunner:
         hs.atomic_json(getattr(self, 'request_path', BOND_STATE_PATH), self.request)
 
     def event(self, name: str, **fields: object) -> None:
+        if name == 'bond_command_summary':
+            self.last_summary = dict(fields)
         self.scheduler.event(name, self.account, **fields)
 
     def ready_visible(self, frame=None) -> bool:

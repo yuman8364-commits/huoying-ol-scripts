@@ -19,6 +19,8 @@ from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
 
+from hyol_environment import configure_numeric_runtime
+configure_numeric_runtime()
 import numpy as np
 from PIL import Image, ImageGrab
 from hyol_diagnostics import Diagnostics, export_from_scheduler, mark_manual_pause, run_id
@@ -26,6 +28,15 @@ from hyol_recognition import Detection, OnnxDetector, fuse
 from hyol_geometry import GameGeometry
 from hyol_survival_counts import GRADES as SURVIVAL_GRADES, grade_candidates, choose_grade
 from hyol_combat_watchdog import BattleWatchdog
+from hyol_errors import SafetyError, PendingError, LeaseBlocked
+from hyol_platform import Win32, GAME_TITLE, GAME_EXE, VK_F12
+from hyol_storage import JsonlLogger, StateStore
+from hyol_vision import (
+    dedupe_digit_matches, read_template_digits, edge_binary, edge_f1,
+    identity_text_mask, mask_f1, wanted_task_list_is_empty, image_hash,
+    _fast_fft_length, TemplateSpectra, ncc_map, ncc, TemplateStore,
+    IDENTITY_SERVER_WIDTH, IDENTITY_TEXT_THRESHOLD, IDENTITY_TEXT_SATURATION,
+)
 
 
 # A frozen GUI keeps editable configuration, visual assets, logs and state
@@ -38,8 +49,6 @@ STATE_DIR = ROOT / "state"
 EVIDENCE_DIR = LOGS / "scheduler_evidence"
 CONFIG_PATH = ROOT / "HYOL_Daily.ini"
 
-GAME_TITLE = "火影忍者online"
-GAME_EXE = "qqmicrogamebox.exe"
 EXPECTED_WINDOW = (0, 0, 1920, 1032)
 VIEW = (1, 69, 1919, 1031)
 TARGET_CARD_CLOSE_ROI = (695, 80, 760, 145)
@@ -83,11 +92,7 @@ ARENA_SLOT_PENDING_LIMIT = 3
 SURVIVAL_SLOT_PENDING_LIMIT = 6
 ARENA_STALE_PENDING_SECONDS = 900
 IDENTITY_ROI = (105, 72, 250, 104)
-IDENTITY_SERVER_WIDTH = 18
-IDENTITY_TEXT_THRESHOLD = 120
-IDENTITY_TEXT_SATURATION = 35
 POWER_ROI = (92, 112, 315, 153)
-VK_F12 = 0x7B
 
 # The online-gift page renders three independent claim cards.  The old
 # implementation searched one large ROI for every card; after the first click
@@ -119,16 +124,8 @@ def rescue_activity_open_now(current: datetime | None = None) -> bool:
     return current.weekday() in RESCUE_OPEN_WEEKDAYS and RESCUE_OPEN_FROM <= current.time() <= RESCUE_OPEN_UNTIL
 
 
-class SafetyError(RuntimeError):
-    pass
-
-
 class TargetPreconditionChanged(SafetyError):
     """A freshly captured target no longer satisfies its observed precondition."""
-
-
-class PendingError(RuntimeError):
-    pass
 
 
 class BattleStalled(PendingError):
@@ -176,10 +173,6 @@ class AccountOffline(PendingError):
 
 class WelfareNotReady(PendingError):
     """Online reward time has not elapsed; this is an expected pending state."""
-    pass
-
-
-class LeaseBlocked(RuntimeError):
     pass
 
 
@@ -279,106 +272,6 @@ class SchedulerCommand:
         return None
 
 
-def dedupe_digit_matches(matches: Iterable[tuple[float, int, int]], min_x_gap: int = 3) -> list[tuple[float, int, int]]:
-    """Keep one strongest template hit per horizontal digit position."""
-    ordered = sorted(matches, key=lambda row: (-row[0], row[1], row[2]))
-    accepted: list[tuple[float, int, int]] = []
-    for match in ordered:
-        if any(abs(match[1] - prior[1]) <= min_x_gap for prior in accepted):
-            continue
-        accepted.append(match)
-    return sorted(accepted, key=lambda row: (row[1], row[2]))
-
-
-def read_template_digits(
-    frame: Image.Image,
-    templates: "TemplateStore",
-    asset_dir: Path,
-    prefix: str,
-    roi: tuple[int, int, int, int],
-    threshold: float = 0.94,
-    min_digits: int = 1,
-    max_digits: int = 8,
-) -> int:
-    """Read a bounded integer using per-digit image templates.
-
-    This intentionally rejects missing/ambiguous digits instead of guessing. A
-    caller can then keep a purchase or balance check in ``pending`` safely.
-    """
-    found: list[tuple[float, int, int]] = []
-    for digit in range(10):
-        path = asset_dir / f"{prefix}{digit}.bmp"
-        if not path.exists():
-            raise PendingError(f"missing digit template: {path.name}")
-        if prefix.startswith("market_"):
-            # Market glyphs are adjacent and sit on a textured, dimmed map.
-            # Use the edge matcher with a stronger edge cutoff; its bounded
-            # local non-max suppression keeps repeated digits such as ``00``.
-            edge_threshold = 30 if prefix == "market_balance_digit_" else 70
-            variant_paths = [path, *sorted(asset_dir.glob(f"{prefix}{digit}_*.bmp"))]
-            matches: list[tuple[float, int, int]] = []
-            for variant in variant_paths:
-                matches.extend(templates.find_all_edges(frame, variant, roi, threshold, edge_threshold=edge_threshold))
-        else:
-            matches = templates.find_all(frame, path, roi, threshold)
-        found.extend((score, x, digit) for score, x, _y in matches)
-    selected = dedupe_digit_matches(found)
-    if not (min_digits <= len(selected) <= max_digits):
-        raise PendingError(f"digit count outside bounds for {prefix}: {len(selected)}")
-    return int("".join(str(digit) for _score, _x, digit in selected))
-
-
-def edge_binary(image: Image.Image, threshold: int = 70) -> np.ndarray:
-    """Return a small, translation-stable edge mask for UI text/icons."""
-    gray = np.asarray(image.convert("L"), dtype=np.int16)
-    dx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-    dy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
-    return (dx + dy) > threshold
-
-
-def edge_f1(reference: Image.Image, candidate: Image.Image, threshold: int = 70) -> float:
-    """Compare UI glyph edges while ignoring map/background colour changes."""
-    ref = edge_binary(reference, threshold)
-    got = edge_binary(candidate, threshold)
-    if ref.shape != got.shape:
-        return 0.0
-    intersection = int((ref & got).sum())
-    denominator = int(ref.sum()) + int(got.sum())
-    return (2.0 * intersection / denominator) if denominator else 0.0
-
-
-def identity_text_mask(image: Image.Image, threshold: int = IDENTITY_TEXT_THRESHOLD) -> np.ndarray:
-    """Extract the bright, low-saturation identity glyphs from a name strip.
-
-    Grayscale NCC over the complete strip is dominated by the changing map
-    texture.  The name itself is white/gray and low-saturation, so this mask
-    keeps the server prefix and character name while discarding most of the
-    background.
-    """
-    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
-    mask = (
-        (rgb.min(axis=2) >= threshold)
-        & ((rgb.max(axis=2) - rgb.min(axis=2)) <= IDENTITY_TEXT_SATURATION)
-    ).astype(np.uint8)
-    # The enrolled strip is 32 px high and the glyphs start below the
-    # animated map edge.  The first eight rows contain only background on the
-    # current client; retaining them makes a repaint alter the identity score
-    # even when the server/name text is unchanged.  Suppress that fixed
-    # background band while keeping the complete glyph region for all tabs.
-    if mask.shape[0] > 8:
-        mask[:8, :] = 0
-    return mask
-
-
-def mask_f1(reference: np.ndarray, candidate: np.ndarray) -> float:
-    """Return F1 overlap for two equal-sized binary masks."""
-    if reference.shape != candidate.shape:
-        return 0.0
-    intersection = int((reference & candidate).sum())
-    denominator = int(reference.sum()) + int(candidate.sum())
-    return (2.0 * intersection / denominator) if denominator else 0.0
-
-
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
@@ -416,28 +309,6 @@ def choose_leader(members: Iterable[str], powers: dict[str, int]) -> str:
     return max(ordered, key=lambda name: (powers[name], -ordered.index(name)))
 
 
-def wanted_task_list_is_empty(image: Image.Image) -> bool:
-    """Recognize the tested post-wanted state without OCR or a click.
-
-    The ROI is the area below the fixed ``任务列表`` heading. While a wanted
-    task is active it contains bright green task text and many character edges;
-    after the automatic chain finishes the translucent panel is nearly blank.
-    """
-    # The translucent left border at x=1715..1724 exposes map vegetation.
-    # Actual task text starts to its right; including that border can keep an
-    # already empty list pending solely because the map behind it is green.
-    roi = np.asarray(image.convert("RGB"), dtype=np.int16)[480:590, 1725:1910]
-    green = (roi[:, :, 1] > 110) & (roi[:, :, 1] * 100 > roi[:, :, 0] * 135) & (roi[:, :, 1] * 100 > roi[:, :, 2] * 115)
-    # The panel is translucent.  Once its task row disappears, grass, rocks,
-    # NPCs, or animation can still produce arbitrarily many image edges.  Edge
-    # density therefore cannot be a completion requirement: it caused the
-    # wanted loop to wait forever on textured maps.  The active wanted row in
-    # every recorded replay contains the distinctive bright-green task text;
-    # completion is accepted only after that text is absent for consecutive
-    # frames while the caller independently verifies the main page.
-    return int(green.sum()) <= 10
-
-
 def atomic_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=path.name+'.', suffix='.tmp', dir=path.parent)
@@ -457,495 +328,6 @@ def atomic_json(path: Path, value: object) -> None:
             if attempt == 10:
                 raise
             time.sleep(.1)
-
-
-def image_hash(image: Image.Image) -> str:
-    return hashlib.sha256(image.convert("RGB").tobytes()).hexdigest()
-
-
-@functools.lru_cache(maxsize=256)
-def _fast_fft_length(minimum: int) -> int:
-    """Smallest 2/3/5-smooth length; padding keeps valid correlation intact."""
-    best = 1 << (minimum - 1).bit_length()
-    power5 = 1
-    while power5 < best:
-        power3 = power5
-        while power3 < best:
-            needed = (minimum + power3 - 1) // power3
-            candidate = power3 * (1 << (needed - 1).bit_length())
-            best = min(best, candidate)
-            power3 *= 3
-        power5 *= 5
-    return best
-
-
-class TemplateSpectra:
-    """Bounded transforms of immutable templates, reusable across captures."""
-    def __init__(self, max_bytes=64 * 1024 * 1024, max_entries=64):
-        self.max_bytes = max_bytes
-        self.max_entries = max_entries
-        self.bytes = 0
-        self.entries = OrderedDict()
-
-    def get(self, template, shape):
-        # Mutable arrays are deliberately uncached; replay callers can edit them.
-        if template.flags.writeable:
-            centered = template - template.mean()
-            return float(np.sum(centered * centered)), np.fft.rfft2(centered[::-1, ::-1], shape)
-        key = (id(template), shape)
-        cached = self.entries.get(key)
-        if cached is not None and cached[0] is template:
-            self.entries.move_to_end(key)
-            return cached[1], cached[2]
-        centered = template - template.mean()
-        variance = float(np.sum(centered * centered))
-        transform = np.fft.rfft2(centered[::-1, ::-1], shape)
-        size = template.nbytes + transform.nbytes
-        if size <= self.max_bytes and self.max_entries > 0:
-            while self.entries and (self.bytes + size > self.max_bytes
-                                    or len(self.entries) >= self.max_entries):
-                _, old = self.entries.popitem(last=False)
-                self.bytes -= old[3]
-            # Retain the original array so its identity cannot be recycled.
-            self.entries[key] = template, variance, transform, size
-            self.bytes += size
-        return variance, transform
-
-
-def ncc_map(image: np.ndarray, template: np.ndarray, *, prepared: dict | None = None,
-            template_cache: TemplateSpectra | None = None) -> np.ndarray:
-    """Return the normalized-correlation score at every valid position."""
-    image = image.astype(np.float64, copy=False)
-    template = template.astype(np.float64, copy=False)
-    height, width = image.shape
-    th, tw = template.shape
-    if th > height or tw > width:
-        return np.empty((0, 0), dtype=np.float64)
-    shape = (_fast_fft_length(height + th - 1), _fast_fft_length(width + tw - 1))
-    if template_cache is None:
-        centered = template - template.mean()
-        template_var = float(np.sum(centered * centered))
-        template_transform = None
-    else:
-        template_var, template_transform = template_cache.get(template, shape)
-    if template_var <= 1e-12:
-        return np.full((height - th + 1, width - tw + 1), -1.0, dtype=np.float64)
-    if prepared is not None:
-        if prepared.get('image') is not image:
-            prepared.clear()
-            prepared['image'] = image
-        transforms = prepared.setdefault('transforms', {})
-        if shape not in transforms:
-            # Bound memory even when many template sizes share a large ROI.
-            if len(transforms) >= 2:
-                transforms.pop(next(iter(transforms)))
-            transforms[shape] = np.fft.rfft2(image, shape)
-        image_transform = transforms[shape]
-    else:
-        image_transform = np.fft.rfft2(image, shape)
-    if template_transform is None:
-        template_transform = np.fft.rfft2(centered[::-1, ::-1], shape)
-    correlation = np.fft.irfft2(
-        image_transform * template_transform,
-        shape,
-    )
-    numerator = correlation[th - 1 : height, tw - 1 : width]
-    if prepared is not None and 'integrals' in prepared:
-        integral, integral2 = prepared['integrals']
-    else:
-        integral = np.pad(image, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-        integral2 = np.pad(image * image, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-        if prepared is not None:
-            prepared['integrals'] = integral, integral2
-    sums = integral[th:, tw:] - integral[:-th, tw:] - integral[th:, :-tw] + integral[:-th, :-tw]
-    sums2 = integral2[th:, tw:] - integral2[:-th, tw:] - integral2[th:, :-tw] + integral2[:-th, :-tw]
-    variance = np.maximum(sums2 - sums * sums / (th * tw), 0)
-    denominator = np.sqrt(variance * template_var)
-    scores = np.full_like(numerator, -1.0)
-    np.divide(numerator, denominator, out=scores, where=denominator > 1e-12)
-    return scores
-
-
-def ncc(image: np.ndarray, template: np.ndarray, *, prepared: dict | None = None,
-        template_cache: TemplateSpectra | None = None) -> tuple[float, int, int]:
-    scores = ncc_map(image, template, prepared=prepared, template_cache=template_cache)
-    if not scores.size:
-        return -1.0, -1, -1
-    y, x = np.unravel_index(np.argmax(scores), scores.shape)
-    return float(scores[y, x]), int(x), int(y)
-
-
-class Win32:
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    SW_RESTORE = 9
-    SW_MAXIMIZE = 3
-    MOUSEEVENTF_LEFTDOWN = 0x0002
-    MOUSEEVENTF_LEFTUP = 0x0004
-    MOUSEEVENTF_WHEEL = 0x0800
-    VK_MENU = 0x12
-    KEYEVENTF_KEYUP = 0x0002
-
-    class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-
-    @classmethod
-    def title(cls, hwnd: int) -> str:
-        length = cls.user32.GetWindowTextLengthW(hwnd)
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        cls.user32.GetWindowTextW(hwnd, buffer, len(buffer))
-        return buffer.value
-
-    @classmethod
-    def rect(cls, hwnd: int) -> tuple[int, int, int, int]:
-        if hasattr(cls.user32, "SetThreadDpiAwarenessContext"):
-            cls.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
-        value = cls.RECT()
-        if not cls.user32.GetWindowRect(hwnd, ctypes.byref(value)):
-            raise SafetyError("GetWindowRect failed")
-        return value.left, value.top, value.right, value.bottom
-
-    @classmethod
-    def pid(cls, hwnd: int) -> int:
-        value = ctypes.c_ulong()
-        cls.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(value))
-        return int(value.value)
-
-    @classmethod
-    def process_path(cls, pid: int) -> str:
-        handle = cls.kernel32.OpenProcess(cls.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return ""
-        try:
-            size = ctypes.c_ulong(32768)
-            buffer = ctypes.create_unicode_buffer(size.value)
-            if not cls.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                return ""
-            return buffer.value
-        finally:
-            cls.kernel32.CloseHandle(handle)
-
-    @classmethod
-    def game_windows(cls) -> list[int]:
-        found: list[int] = []
-        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-
-        def callback(hwnd: int, _lparam: int) -> bool:
-            if cls.user32.IsWindowVisible(hwnd) and cls.title(hwnd) == GAME_TITLE:
-                path = cls.process_path(cls.pid(hwnd))
-                if Path(path).name.lower() == GAME_EXE:
-                    found.append(int(hwnd))
-            return True
-
-        callback_ref = callback_type(callback)
-        cls.user32.EnumWindows(callback_ref, 0)
-        return found
-
-    @classmethod
-    def foreground(cls) -> int:
-        return int(cls.user32.GetForegroundWindow())
-
-    @classmethod
-    def game_content_rect(cls, hwnd: int) -> tuple[int, int, int, int]:
-        candidates = set()
-        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
-        def callback(child, _):
-            if cls.user32.IsWindowVisible(child):
-                name = ctypes.create_unicode_buffer(256)
-                cls.user32.GetClassNameW(child, name, len(name))
-                if name.value == "CefBrowserWindow":
-                    candidates.add(cls.rect(child))
-            return True
-        callback_ref = callback_type(callback)
-        cls.user32.EnumChildWindows(hwnd, callback_ref, 0)
-        if len(candidates) != 1:
-            raise SafetyError(f"game content surface is ambiguous: {len(candidates)} visible regions")
-        return candidates.pop()
-
-    @classmethod
-    def hit_test(cls, hwnd: int, x: int, y: int) -> int:
-        """Bounded, read-only non-client hit test in screen coordinates."""
-        result = ctypes.c_size_t()
-        send = cls.user32.SendMessageTimeoutW
-        send.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
-                         ctypes.c_ssize_t, ctypes.c_uint, ctypes.c_uint,
-                         ctypes.POINTER(ctypes.c_size_t)]
-        send.restype = ctypes.c_ssize_t
-        point = (x & 0xFFFF) | ((y & 0xFFFF) << 16)
-        if not send(hwnd, 0x0084, 0, point, 0x0002, 500, ctypes.byref(result)):
-            raise SafetyError("window hit test timed out or failed")
-        return ctypes.c_ssize_t(result.value).value
-
-    @classmethod
-    def activate(cls, hwnd: int) -> None:
-        # Never restore, maximize, resize, or move the shared microclient here.
-        # Repositioning the top-level window while clicking browser tabs can be
-        # interpreted as a title/tab drag and has caused account disconnects.
-        if cls.foreground() == hwnd:
-            return
-        cls.user32.SetForegroundWindow(hwnd)
-        if cls.foreground() == hwnd:
-            return
-        # Windows can reject a foreground request when the panel (or another
-        # desktop app) owns the foreground input queue.  Temporarily attach
-        # only the input queues, then retry the focus request.  This changes
-        # focus ordering but never restores, moves, resizes, or clicks either
-        # window; the attachment is always released in the finally block.
-        foreground = cls.foreground()
-        foreground_pid = ctypes.c_ulong()
-        foreground_thread = cls.user32.GetWindowThreadProcessId(foreground, ctypes.byref(foreground_pid))
-        current_thread = cls.kernel32.GetCurrentThreadId()
-        attached = bool(foreground_thread and foreground_thread != current_thread and cls.user32.AttachThreadInput(current_thread, foreground_thread, True))
-        try:
-            cls.user32.BringWindowToTop(hwnd)
-            cls.user32.SetForegroundWindow(hwnd)
-        finally:
-            if attached:
-                cls.user32.AttachThreadInput(current_thread, foreground_thread, False)
-        if cls.foreground() == hwnd:
-            return
-        # Windows' foreground-lock policy can still reject both calls above
-        # even on an unlocked desktop.  A press/release of Alt grants the
-        # calling input queue the standard foreground transition privilege;
-        # it does not move, resize, restore, or click the game window.
-        cls.user32.keybd_event(cls.VK_MENU, 0, 0, 0)
-        cls.user32.keybd_event(cls.VK_MENU, 0, cls.KEYEVENTF_KEYUP, 0)
-        cls.user32.SetForegroundWindow(hwnd)
-
-    @classmethod
-    def click(cls, x: int, y: int, *, expected_hwnd: int | None = None,
-              before_down: Callable[[], None] | None = None) -> None:
-        if not cls.user32.SetCursorPos(x, y):
-            raise SafetyError("SetCursorPos failed")
-        # Let Flash observe the stationary cursor, then validate immediately
-        # before DOWN: focus and F12 can change during the hover interval.
-        time.sleep(0.15)
-        if before_down is not None:
-            before_down()
-        if expected_hwnd is not None:
-            if cls.foreground() != expected_hwnd:
-                raise SafetyError("game window lost foreground during pre-click hover")
-            if cls.f12_down():
-                raise KeyboardInterrupt("F12 before mouse down")
-        cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        try:
-            time.sleep(0.06)
-        finally:
-            cls.user32.mouse_event(cls.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-
-    @classmethod
-    def move(cls, x: int, y: int) -> None:
-        if not cls.user32.SetCursorPos(x, y):
-            raise SafetyError("SetCursorPos failed before hover")
-
-    @classmethod
-    def wheel(cls, x: int, y: int, delta: int) -> None:
-        if not cls.user32.SetCursorPos(x, y):
-            raise SafetyError("SetCursorPos failed before wheel")
-        time.sleep(0.15)
-        cls.user32.mouse_event(cls.MOUSEEVENTF_WHEEL, 0, 0, ctypes.c_uint32(delta).value, 0)
-
-    @classmethod
-    def f12_down(cls) -> bool:
-        return bool(cls.user32.GetAsyncKeyState(VK_F12) & 0x8000)
-
-
-class JsonlLogger:
-    def __init__(self, path: Path):
-        self.path = path
-        self.lock = threading.Lock()
-        self.last_error = ""
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self.last_error = str(exc)
-
-    def write(self, event: str, **fields: object) -> None:
-        row = {"ts": now_iso(), "event": event, **fields}
-        payload = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-        # Windows readers such as PowerShell ``Get-Content`` can briefly hold
-        # an exclusive sharing lock while a file is being tailed.  Logging is
-        # observational and must never abort a scheduler ``finally`` block
-        # (which would otherwise skip lease release and its final summary).
-        with self.lock:
-            for attempt in range(3):
-                try:
-                    with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                        handle.write(payload)
-                        handle.flush()
-                    return
-                except OSError as exc:
-                    self.last_error = str(exc)
-                    if attempt == 2:
-                        fallback = Path(tempfile.gettempdir()) / "HYOL_diagnostics" / self.path.name
-                        try:
-                            fallback.parent.mkdir(parents=True, exist_ok=True)
-                            with fallback.open("a", encoding="utf-8") as handle:
-                                handle.write(payload)
-                            self.last_error += f"; fallback={fallback}"
-                        except OSError as fallback_exc:
-                            self.last_error += f"; fallback failed={fallback_exc}"
-                        try:
-                            warnings.warn(self.last_error, RuntimeWarning)
-                        except Exception:
-                            pass
-                        return
-                    time.sleep(0.05)
-
-
-class StateStore:
-    def __init__(self, accounts: list[str], directory: Path | None = None, aliases: dict[str, str] | None = None,
-                 *, restore_history: bool = True):
-        self.directory = directory if directory is not None else STATE_DIR
-        self.restore_history = restore_history
-        self.aliases = aliases or {}
-        self.day = date.today().isoformat()
-        self.path = self.directory / f"{self.day}.json"
-        self.account_paths = {name: self.directory / self.day / f"{slug(self.aliases.get(name, name))}.json" for name in accounts}
-        self.global_state = self._load(self.path, {"date": self.day, "stage": "recognize", "pending": [], "teams": {}, "tab_map": {}})
-        self.accounts = {
-            name: self._load(path, {"date": self.day, "account": self.aliases.get(name, name), "modules": {}, "pending": []})
-            for name, path in self.account_paths.items()
-        }
-        from hyol_checkpoints import CheckpointError, restore_actions
-        try:
-            if restore_history:
-                restore_actions(self)
-        except CheckpointError as exc:
-            raise PendingError(str(exc)) from exc
-
-    @staticmethod
-    def _load(path: Path, default: dict) -> dict:
-        from hyol_checkpoints import CheckpointError, read_checkpoint
-        try:
-            value = read_checkpoint(path)
-        except CheckpointError as exc:
-            raise PendingError(str(exc)) from exc
-        if value and value.get('date') != default['date']:
-            raise PendingError(f'断点日期与文件不一致：{path}')
-        return value or default
-
-    def save_global(self) -> None:
-        self.global_state["updated_at"] = now_iso()
-        atomic_json(self.path, self.global_state)
-
-    def save_account(self, name: str) -> None:
-        self.accounts[name]["updated_at"] = now_iso()
-        atomic_json(self.account_paths[name], self.accounts[name])
-
-    def module_status(self, name: str, module: str) -> str:
-        return str(self.accounts[name].get("modules", {}).get(module, {}).get("status", "new"))
-
-    def set_module(self, name: str, module: str, status: str, detail: str = "") -> None:
-        modules = self.accounts[name].setdefault("modules", {})
-        modules[module] = {"status": status, "detail": detail, "updated_at": now_iso()}
-        self.save_account(name)
-        # Keep the append-only pending audit trail, but do not leave a
-        # previously blocked module looking unresolved after a verified
-        # completion.  Market read-only probes are intentionally excluded:
-        # only a coupon-only settlement is strong enough to resolve market
-        # purchase pending records.
-        if status == "done" and (not module.startswith("market_") or detail == "coupon-only offers settled"):
-            self.resolve_pending(name, module)
-
-    def add_pending(self, scope: str, module: str, detail: str, retry_at: datetime | None = None) -> None:
-        item = {
-            "scope": scope,
-            "module": module,
-            "detail": detail,
-            "status": "pending",
-            "created_at": now_iso(),
-            "retry_at": (retry_at or datetime.now().astimezone() + timedelta(minutes=10)).isoformat(timespec="seconds"),
-        }
-        target = self.global_state.setdefault("pending", [])
-        if not any(
-            row.get("scope") == scope
-            and row.get("module") == module
-            and row.get("detail") == detail
-            and str(row.get("status", "pending")) not in ("resolved", "cleared")
-            for row in target
-        ):
-            target.append(item)
-            self.save_global()
-
-    def resolve_pending(self, scope: str, module: str, detail: str | None = None) -> int:
-        """Mark matching pending rows resolved without deleting audit evidence."""
-        target = self.global_state.setdefault("pending", [])
-        changed = 0
-        resolved_at = now_iso()
-        for row in target:
-            if not isinstance(row, dict):
-                continue
-            if row.get("scope") != scope or row.get("module") != module:
-                continue
-            if str(row.get("status", "pending")) in ("resolved", "cleared"):
-                continue
-            if detail is not None and row.get("detail") != detail:
-                continue
-            row["status"] = "resolved"
-            row["resolved_at"] = resolved_at
-            changed += 1
-        if changed:
-            self.save_global()
-        return changed
-
-    def unresolved_pending_count(self, since: str | None = None) -> int:
-        return sum(
-            1
-            for row in self.global_state.get("pending", [])
-            if isinstance(row, dict)
-            and str(row.get("status", "pending")) not in ("resolved", "cleared")
-            and (since is None or str(row.get("created_at", "")) >= since)
-        )
-
-    def action_status(self, name: str, action: str) -> str:
-        return str(self.accounts[name].get("actions", {}).get(action, {}).get("status", "new"))
-
-    def action_record(self, name: str, action: str) -> dict[str, object]:
-        value = self.accounts[name].get("actions", {}).get(action, {})
-        return dict(value) if isinstance(value, dict) else {}
-
-    def set_action(self, name: str, action: str, status: str, detail: str = "") -> None:
-        actions = self.accounts[name].setdefault("actions", {})
-        previous = actions.get(action, {})
-        if status == 'done' and previous.get('checkpoint_conflict'):
-            from hyol_checkpoints import action_versions, read_checkpoint
-            resolutions = read_checkpoint(self.directory / 'checkpoint_resolutions.json')
-            remaining = [row for row in action_versions(previous)[1:]
-                         if row.get('status') == 'pending'
-                         and row.get('origin', {}).get('token') not in resolutions]
-            if remaining:
-                raise PendingError('动作存在多个未决来源，单次结果不能结清全部原动作：' + action)
-        if previous.get('origin'):
-            if status == 'new':
-                raise PendingError('跨日未决动作不能重置：' + action)
-            if status == 'done':
-                from hyol_checkpoints import resolve_action
-                resolve_action(self, name, action, detail)
-        actions[action] = {"status": status, "detail": detail, "updated_at": now_iso()}
-        if status != 'new' and previous.get('before_evidence'):
-            actions[action]['before_evidence'] = previous['before_evidence']
-        scope = self.accounts[name].get('continuation_scope')
-        survival_scope = self.accounts[name].get('survival_operation_scope') if action.startswith('survival_') else None
-        if survival_scope:
-            if status != 'new':
-                run = 2 if actions.get('survival_second_run_started', {}).get('status') == 'done' else 1
-                actions[action]['operation_id'] = previous.get('operation_id', f'{survival_scope}:run_{run}:{action}')
-        elif scope:
-            actions[action]['operation_id'] = previous.get('operation_id',scope+':'+action)
-        if previous.get('origin'):
-            actions[action]['origin'] = previous['origin']
-        self.save_account(name)
-
-    def set_market_offer(self, name: str, key: str, record: dict[str, object]) -> None:
-        """Persist one date/batch/slot market quote without erasing old actions."""
-        offers = self.accounts[name].setdefault("market_offers", {})
-        value = dict(record)
-        value.setdefault("key", key)
-        value["updated_at"] = now_iso()
-        offers[key] = value
-        self.save_account(name)
 
 
 @dataclass(frozen=True)
@@ -1164,194 +546,19 @@ def check_combat_slot_watchdog(scheduler, slot, frame, *, now=None):
                          f'{slot.mode}_battle_{slot.next_index}', mode=slot.mode, now=now)
 
 
-class TemplateStore:
-    def __init__(self, threshold: float):
-        self.threshold = threshold
-        self.cache: dict[Path, np.ndarray] = {}
-        self.variants = {"leaf_return_current.bmp":
-                         ("leaf_return_hover.bmp", "leaf_return_village_current.bmp", "leaf_return_rooftop_current.bmp", "leaf_return_rooftop_second.bmp", "leaf_return_rooftop_live.bmp", "leaf_return_rotation_1.bmp", "leaf_return_rotation_2.bmp", "leaf_return_rotation_3.bmp", "leaf_return_rotation_4.bmp", "leaf_return_rotation_5.bmp")}
-        self.resize_scale = (1.0, 1.0)
-        self.last_match_size = None
-        self.last_match_source = "template"
-        self._asset_versions = {}
-        self._frame = None
-        self._frame_matches = {}
-        self._frame_crops = {}
-        self._frame_correlation = {}
-        self._frame_edges = {}
-        self._edge_templates = OrderedDict()
-        self._template_spectra = TemplateSpectra()
-
-    def begin_frame(self, frame: Image.Image) -> None:
-        # Only capture() opts immutable live snapshots into caching. Replay
-        # callers can still edit an image between matches without stale results.
-        self._frame = frame
-        self._frame_matches.clear()
-        self._frame_crops.clear()
-        self._frame_correlation.clear()
-        self._frame_edges.clear()
-
-    def _crop(self, frame, roi):
-        if frame is not self._frame:
-            return np.asarray(frame.crop(roi).convert("L"), dtype=np.float64)
-        if roi not in self._frame_crops:
-            self._frame_crops[roi] = np.asarray(frame.crop(roi).convert("L"), dtype=np.float64)
-        return self._frame_crops[roi]
-
-    @staticmethod
-    def _asset_version(path):
-        try:
-            stat = path.stat()
-            return stat.st_mtime_ns, stat.st_size
-        except FileNotFoundError:
-            return None
-
-    def load(self, path: Path) -> np.ndarray:
-        version = self._asset_version(path)
-        if path not in self.cache or self._asset_versions.get(path) != version:
-            self.cache[path] = np.asarray(Image.open(path).convert("L"), dtype=np.float64)
-            self.cache[path].setflags(write=False)
-            self._asset_versions[path] = version
-        return self.cache[path]
-
-    def match(self, frame: Image.Image, path: Path, roi: tuple[int, int, int, int], threshold: float | None = None) -> tuple[bool, float, int, int]:
-        self.last_match_size = None
-        self.last_match_source = "template"
-        version = self._asset_version(path)
-        if version is None:
-            return False, -1.0, -1, -1
-        variants = tuple((name, self._asset_version(path.with_name(name)))
-                         for name in self.variants.get(path.name, ()))
-        cutoff = self.threshold if threshold is None else threshold
-        key = (path, version, variants, roi, cutoff, self.resize_scale)
-        cacheable = frame is self._frame
-        if cacheable and key in self._frame_matches:
-            result, self.last_match_size, self.last_match_source = self._frame_matches[key]
-            return result
-        result = self._match(frame, path, roi, cutoff)
-        if cacheable:
-            self._frame_matches[key] = result, self.last_match_size, self.last_match_source
-        return result
-
-    def _match(self, frame, path, roi, cutoff):
-        x1, y1, x2, y2 = roi
-        crop = self._crop(frame, roi)
-        prepared = self._frame_correlation.setdefault(roi, {}) if frame is self._frame else None
-        score, x, y = ncc(crop, self.load(path), prepared=prepared,
-                          template_cache=self._template_spectra)
-        if score < cutoff:
-            for name in self.variants.get(path.name, ()):
-                variant = path.with_name(name)
-                if variant.exists():
-                    candidate = ncc(crop, self.load(variant), prepared=prepared,
-                                    template_cache=self._template_spectra)
-                    if candidate[0] > score:
-                        score, x, y = candidate
-        sx, sy = self.resize_scale
-        # Canonical game captures can enlarge/shrink native UI independently
-        # of browser chrome. Keep the original cutoff, and reject duplicates.
-        if score < cutoff and (abs(sx-1) > .01 or abs(sy-1) > .01):
-            original = self.load(path)
-            width, height = max(2,round(original.shape[1]*sx)), max(2,round(original.shape[0]*sy))
-            pad_x, pad_y = round(abs(sx-1)*frame.width), round(abs(sy-1)*frame.height)
-            expanded = (max(1,x1-pad_x), max(69,y1-pad_y), min(frame.width-1,x2+pad_x), min(frame.height-1,y2+pad_y))
-            if width < expanded[2]-expanded[0] and height < expanded[3]-expanded[1]:
-                resized = np.asarray(Image.fromarray(original.astype(np.uint8)).resize((width,height),Image.Resampling.BILINEAR),dtype=np.float64)
-                canvas = self._crop(frame, expanded)
-                scores = ncc_map(canvas,resized)
-                by,bx = np.unravel_index(np.argmax(scores),scores.shape)
-                best = float(scores[by,bx])
-                scores[max(0,by-height):by+height+1,max(0,bx-width):bx+width+1] = -1
-                if best >= cutoff and float(scores.max()) < cutoff:
-                    self.last_match_size = (height,width)
-                    self.last_match_source = "template_scaled"
-                    return True,best,expanded[0]+int(bx),expanded[1]+int(by)
-        return score >= cutoff, score, x1 + x, y1 + y
-
-    def find_all(self, frame: Image.Image, path: Path, roi: tuple[int, int, int, int], threshold: float | None = None) -> list[tuple[float, int, int]]:
-        if not path.exists():
-            return []
-        x1, y1, x2, y2 = roi
-        image = np.asarray(frame.crop(roi).convert("L"), dtype=np.float64)
-        template = self.load(path)
-        th, tw = template.shape
-        cutoff = self.threshold if threshold is None else threshold
-        results: list[tuple[float, int, int]] = []
-        working = image.copy()
-        while True:
-            score, x, y = ncc(working, template, template_cache=self._template_spectra)
-            if score < cutoff or x < 0 or y < 0:
-                break
-            results.append((score, x1 + x, y1 + y))
-            # UI glyphs can be adjacent (for example the ``00`` in a market
-            # price).  Suppress only a small neighbourhood around the peak;
-            # masking the whole template width would erase the next digit.
-            radius_x = max(2, min(4, tw // 3))
-            radius_y = max(2, min(4, th // 3))
-            left = max(0, x - radius_x)
-            top = max(0, y - radius_y)
-            right = min(working.shape[1], x + radius_x + 1)
-            bottom = min(working.shape[0], y + radius_y + 1)
-            working[top:bottom, left:right] = working.mean()
-            if len(results) >= 16:
-                break
-        return results
-
-    def find_all_edges(
-        self,
-        frame: Image.Image,
-        path: Path,
-        roi: tuple[int, int, int, int],
-        threshold: float | None = None,
-        edge_threshold: int = 18,
-    ) -> list[tuple[float, int, int]]:
-        """Find repeated UI glyphs using edges rather than map-dependent color."""
-        if not path.exists():
-            return []
-        x1, y1, x2, y2 = roi
-        # Market digit templates share the same ROI; avoid recomputing the
-        # edge mask, image FFT and immutable template FFT for each digit.
-        edge_key = (roi, edge_threshold)
-        if frame is self._frame:
-            image = self._frame_edges.get(edge_key)
-            if image is None:
-                image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
-                self._frame_edges[edge_key] = image
-        else:
-            image = edge_binary(frame.crop(roi), threshold=edge_threshold).astype(np.float64)
-        template_key = (path, self._asset_version(path), edge_threshold)
-        template = self._edge_templates.get(template_key)
-        if template is None:
-            with Image.open(path) as asset:
-                template = edge_binary(asset.convert("L"), threshold=edge_threshold).astype(np.float64)
-            template.setflags(write=False)
-            self._edge_templates[template_key] = template
-            if len(self._edge_templates) > 64:
-                self._edge_templates.popitem(last=False)
-        else:
-            self._edge_templates.move_to_end(template_key)
-        th, tw = template.shape
-        cutoff = self.threshold if threshold is None else threshold
-        prepared = (self._frame_correlation.setdefault(('edge', *edge_key), {})
-                    if frame is self._frame else None)
-        scores = ncc_map(image, template, prepared=prepared,
-                         template_cache=self._template_spectra)
-        candidates: list[tuple[float, int, int]] = []
-        for y, x in zip(*np.where(scores >= cutoff)):
-            candidates.append((float(scores[y, x]), x1 + int(x), y1 + int(y)))
-        results: list[tuple[float, int, int]] = []
-        radius_x = max(2, min(4, tw // 3))
-        radius_y = max(2, min(4, th // 3))
-        for score, x, y in sorted(candidates, key=lambda row: (-row[0], row[1], row[2])):
-            if any(abs(x - prior_x) <= radius_x and abs(y - prior_y) <= radius_y for _prior_score, prior_x, prior_y in results):
-                continue
-            results.append((score, x, y))
-            if len(results) >= 16:
-                break
-        return sorted(results, key=lambda row: (row[1], row[2]))
-
-
 class Scheduler:
+    def release_resources(self):
+        """Release disposable recognition buffers, without touching ledgers."""
+        self._last_frame = None
+        templates = getattr(self, 'templates', None)
+        if templates is not None:
+            templates.clear()
+        detector = getattr(self, 'detector', None)
+        if detector is not None:
+            detector.cached_frame = None
+            detector.cached_predictions = []
+            detector.session = None
+
     def __init__(
         self,
         config: dict[str, str],
@@ -1363,6 +570,7 @@ class Scheduler:
         self.config = config
         self.account_mode = config.get("AccountMode", "tab6").strip().lower()
         self.automatic_accounts = self.account_mode == 'dynamic' or config.get('AccountDiscovery') == 'automatic'
+        self.portable_accounts = self.automatic_accounts and config.get('PortableAccounts', '1') == '1'
         names = parse_csv(config.get("TabAccountNames", ""))
         tab_xs = parse_int_csv(config.get("TabXs", "180,310,445,590,730,860"))
         if self.account_mode == 'dynamic':
@@ -1585,40 +793,86 @@ class Scheduler:
                         self.run_context.bind_window(self)
                     self.event("window_bound", rect=Win32.rect(self.hwnd), pid=Win32.pid(self.hwnd))
                     return
+                if Scheduler._readonly_identity_discovery(self):
+                    try:
+                        chrome = self._blank_discovery_chrome_frame()
+                    except SafetyError:
+                        chrome = None
+                    if chrome is not None:
+                        if getattr(self, 'run_context', None):
+                            self.run_context.bind_window(self)
+                        self.event('window_bound_chrome_only', rect=Win32.rect(self.hwnd),
+                                   content_available=False, content_clicks=0)
+                        return
             if deadline is not None and time.monotonic() >= deadline:
-                self.event("window_wait_timeout", count=len(windows), reason="expected_one_healthy_game_window")
-                if len(windows) == 1:
-                    hwnd = windows[0]
-                    if Win32.user32.IsIconic(hwnd):
-                        raise SafetyError("游戏窗口已最小化，请恢复游戏主界面后重试")
-                    rect = Win32.rect(hwnd)
-                    if rect != EXPECTED_WINDOW:
-                        raise SafetyError(f"游戏窗口位置或尺寸不符：当前{rect}，要求{EXPECTED_WINDOW}；请恢复窗口后重试")
-                    raise SafetyError("游戏窗口未取得前台焦点，请恢复游戏窗口后重试")
-                raise SafetyError(f"expected one healthy game window; found {len(windows)}")
+                detail, fields = Scheduler._window_binding_failure(self, windows)
+                self.event("window_wait_timeout", **fields)
+                raise SafetyError(detail)
             self.event("window_wait", count=len(windows), reason="expected_one_healthy_game_window")
             if not wait:
-                if len(windows) == 1:
-                    if Win32.user32.IsIconic(windows[0]):
-                        raise SafetyError("游戏窗口已最小化，请恢复游戏主界面后重试")
-                    raise SafetyError(f"游戏窗口位置或尺寸不符：当前{Win32.rect(windows[0])}，要求{EXPECTED_WINDOW}；请恢复窗口后重试")
-                raise SafetyError(f"expected one healthy game window; found {len(windows)}")
+                detail, fields = Scheduler._window_binding_failure(self, windows)
+                self.event("window_binding_failed", **fields)
+                raise SafetyError(detail)
             time.sleep(3)
+
+    def _window_binding_failure(self, windows) -> tuple[str, dict]:
+        """Diagnose a refused binding with read-only probes, without recovery."""
+        fields = dict(count=len(windows), reason="expected_one_healthy_game_window")
+        if len(windows) != 1:
+            return f"expected one healthy game window; found {len(windows)}", fields
+        hwnd = windows[0]
+        fields['expected_hwnd'] = hwnd
+        if Win32.user32.IsIconic(hwnd):
+            fields['reason'] = 'window_minimized'
+            return "游戏窗口已最小化，请恢复游戏主界面后重试", fields
+        rect = Win32.rect(hwnd)
+        fields['rect'] = rect
+        if rect != EXPECTED_WINDOW:
+            fields['reason'] = 'window_geometry_mismatch'
+            return f"游戏窗口位置或尺寸不符：当前{rect}，要求{EXPECTED_WINDOW}；请恢复窗口后重试", fields
+        foreground = Win32.foreground()
+        fields['foreground_hwnd'] = foreground
+        if foreground != hwnd:
+            fields['reason'] = 'window_not_foreground'
+            return f"游戏窗口未取得前台焦点：当前前台{foreground}，游戏窗口{hwnd}；请恢复游戏窗口后重试", fields
+        try:
+            if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
+                content = Win32.game_content_rect(hwnd)
+                fields['content_rect'] = content
+                GameGeometry(rect, content)
+        except (SafetyError, ValueError) as exc:
+            fields.update(reason='game_geometry_unavailable', error_type=type(exc).__name__,
+                          error=str(exc))
+            return f"游戏窗口已在前台，但游戏内容区域或几何不可用：{type(exc).__name__}: {exc}", fields
+        fields['reason'] = 'window_validation_failed'
+        return "游戏窗口已在前台，但未通过窗口健康检查；请检查游戏内容后重试", fields
 
     def validate_geometry(self, activate: bool = False) -> bool:
         try:
-            if self.hwnd not in Win32.game_windows():
-                return False
-            if activate and self.auto_foreground:
-                Win32.activate(self.hwnd)
-                time.sleep(0.4)
-            if Win32.user32.IsIconic(self.hwnd):
-                return False
-            if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
-                GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd))
-            elif Win32.rect(self.hwnd) != EXPECTED_WINDOW:
-                return False
-            return not activate or Win32.foreground() == self.hwnd
+            attempts = 3 if activate and self.auto_foreground else 1
+            for attempt in range(attempts):
+                if self.hwnd not in Win32.game_windows():
+                    return False
+                if activate and self.auto_foreground:
+                    self.check_stop()
+                    Win32.activate(self.hwnd)
+                    self.wait_interruptible(0.4)
+                if Win32.user32.IsIconic(self.hwnd):
+                    return False
+                if getattr(self, "config", {}).get("AdaptiveGeometry", "1") == "1":
+                    GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd))
+                elif Win32.rect(self.hwnd) != EXPECTED_WINDOW:
+                    return False
+                foreground = Win32.foreground() if activate else None
+                if not activate or foreground == self.hwnd:
+                    return True
+                # A desktop panel can briefly win focus while it repaints.
+                # Retry only this read-only check, with fresh geometry each
+                # time; never replay the click or extend the account's task.
+                if attempt + 1 < attempts:
+                    self.event("window_focus_retry", attempt=attempt + 1,
+                               foreground_hwnd=foreground)
+            return False
         except (SafetyError, ValueError):
             return False
 
@@ -1640,6 +894,54 @@ class Scheduler:
             if len(windows) == 1:
                 self.hwnd = windows[0]
             self.check_stop()
+
+    def _readonly_identity_discovery(self) -> bool:
+        return (getattr(self, 'no_content_clicks', False)
+                and getattr(self, '_capture_binding_probe', False))
+
+    def _blank_discovery_chrome_frame(self) -> Image.Image:
+        if not self._readonly_identity_discovery():
+            raise SafetyError('raw browser capture requires read-only identity discovery')
+        return self._blank_browser_chrome_frame()
+
+    def _blank_browser_chrome_frame(self) -> Image.Image:
+        """An unnormalized browser frame may prove native tabs, never content."""
+        self.check_stop()
+        if getattr(self, 'run_context', None):
+            self.run_context.check_window(self)
+
+        def guarded_window():
+            if (not self.hwnd or Win32.game_windows() != [self.hwnd]
+                    or Win32.foreground() != self.hwnd
+                    or Win32.rect(self.hwnd) != EXPECTED_WINDOW
+                    or Win32.user32.IsIconic(self.hwnd)):
+                raise SafetyError('read-only blank-tab browser window is not uniquely stable')
+            try:
+                Win32.game_content_rect(self.hwnd)
+            except SafetyError as exc:
+                if str(exc) != 'game content surface is ambiguous: 0 visible regions':
+                    raise
+            else:
+                raise SafetyError('blank-tab content changed during browser-only observation')
+
+        guarded_window()
+        frame = ImageGrab.grab(bbox=EXPECTED_WINDOW, all_screens=True).convert('RGB')
+        self.check_stop()
+        guarded_window()
+        frame._hyol_chrome_only = True
+        frame._hyol_chrome_only_geometry = dict(window=EXPECTED_WINDOW, content=None, normalized=False)
+        frame._hyol_observations = {}
+        # Do not replace _last_frame, _capture_geometry or the template cache.
+        return frame
+
+    def capture_account_observation(self) -> Image.Image:
+        try:
+            return self.capture()
+        except SafetyError as exc:
+            if (not self._readonly_identity_discovery()
+                    or str(exc) != 'game content surface is ambiguous: 0 visible regions'):
+                raise
+        return self._blank_discovery_chrome_frame()
 
     def capture(self) -> Image.Image:
         self.check_stop()
@@ -1664,6 +966,11 @@ class Scheduler:
             raise SafetyError("game geometry changed before capture")
         geometry = GameGeometry(Win32.rect(self.hwnd), Win32.game_content_rect(self.hwnd)) if adaptive else GameGeometry(EXPECTED_WINDOW, VIEW)
         raw = ImageGrab.grab(bbox=geometry.window, all_screens=True).convert("RGB")
+        captured_foreground = Win32.foreground()
+        if captured_foreground != self.hwnd:
+            self.event("capture_rejected", reason="game_not_foreground_during_capture",
+                       foreground_hwnd=captured_foreground)
+            raise SafetyError("game lost foreground during capture; discard stale frame")
         if Win32.rect(self.hwnd) != geometry.window or (adaptive and Win32.game_content_rect(self.hwnd) != geometry.content):
             raise SafetyError("game geometry changed during capture; discard stale frame")
         frame = geometry.normalize(raw)
@@ -1753,11 +1060,15 @@ class Scheduler:
 
     @staticmethod
     def healthy(frame: Image.Image) -> bool:
+        if getattr(frame, '_hyol_chrome_only', False):
+            return False
         crop = np.asarray(frame.crop(VIEW).resize((96, 48)).convert("L"), dtype=np.float64)
         return float(crop.std()) >= 8.0 and float(crop.mean()) not in (0.0, 255.0)
 
     def template(self, name: str, roi: tuple[int, int, int, int], frame: Image.Image | None = None, threshold: float | None = None) -> tuple[bool, float, int, int]:
         frame = frame or self.capture()
+        if getattr(frame, '_hyol_chrome_only', False):
+            raise SafetyError('browser-only discovery frame cannot authorize a content template')
         result = self.templates.match(frame, ASSETS / name, roi, threshold)
         # The reconnect dialog has multiple live skins with identical safety
         # meaning.  Either positive template classifies the tab as offline;
@@ -1842,6 +1153,8 @@ class Scheduler:
         if isinstance(getattr(self, '_dynamic_identity_materials', None), dict):
             from hyol_checkpoints import identity_mask_scores, current_identity_mask
             return identity_mask_scores(current_identity_mask(frame, self.templates), self._dynamic_identity_materials)
+        if getattr(self, 'portable_accounts', False):
+            return {}  # A new run must observe the live tabs, never personal bitmap files.
         scores: dict[str, float] = {}
         from hyol_checkpoints import current_identity_mask
         current = current_identity_mask(frame, self.templates)
@@ -1923,7 +1236,28 @@ class Scheduler:
     def chrome_click(self, x: int, y: int, label: str, account: Account | None = None) -> None:
         self.check_input_pause()
         blank_tab_chrome = False
-        if (label.startswith(('rebind_probe:', 'switch_tab:'))
+        discovery_switch = (Scheduler._readonly_identity_discovery(self) and account is not None
+                            and label == f'observe_account:{account.index}'
+                            and (x,y) == (account.tab_x,10))
+        legacy_switch = (account is not None and (x,y) == (account.tab_x,10)
+                         and label in (f'switch_tab:{account.name}',f'switch_tab:{account.index}'))
+        probe = re.fullmatch(r'rebind_probe:([1-6])', label) if y == 10 else None
+        blank_markers = None
+
+        def verify_discovery_target():
+            nonlocal blank_markers
+            from hyol_multi_solo import tab_close_positions, active_tab_centers
+            frame = self._blank_browser_chrome_frame()
+            markers = tab_close_positions(frame)
+            centers = active_tab_centers(markers)
+            if blank_markers is not None and markers != blank_markers:
+                raise SafetyError('browser tab layout changed during blank-tab chrome validation')
+            blank_markers = markers
+            if (x not in centers or probe is not None
+                    and (int(probe[1]) > len(centers) or centers[int(probe[1])-1] != x)):
+                raise SafetyError('read-only blank-tab switch target is not an existing tab title')
+
+        if ((legacy_switch or probe is not None or discovery_switch)
                 and self.hwnd in Win32.game_windows()
                 and Win32.rect(self.hwnd) == EXPECTED_WINDOW
                 and Win32.foreground() == self.hwnd):
@@ -1934,6 +1268,7 @@ class Scheduler:
                     # A white tab has no CEF child, but its verified browser
                     # chrome remains usable for switching to another tab.
                     blank_tab_chrome = True
+                    verify_discovery_target()
                     self.event('blank_tab_chrome_switch', account, target=label)
                 else:
                     raise
@@ -1972,7 +1307,10 @@ class Scheduler:
                 # observing again; an unsafe hit result is never retried.
                 self.event("chrome_hit_test_retry", account, target=label, attempt=attempt)
                 self.wait_interruptible(.2)
-                self.ensure_window()
+                if blank_tab_chrome:
+                    verify_discovery_target()
+                else:
+                    self.ensure_window()
                 self.check_input_pause()
                 if Win32.foreground() != self.hwnd:
                     raise SafetyError("window changed during chrome target validation") from exc
@@ -1990,6 +1328,8 @@ class Scheduler:
             raise SafetyError("window changed during chrome target validation")
         if blank_tab_chrome and Win32.rect(self.hwnd) != EXPECTED_WINDOW:
             raise SafetyError("window changed during blank-tab chrome validation")
+        if blank_tab_chrome:
+            verify_discovery_target()
         if not blank_tab_chrome and hasattr(self,"screen_point") and self.screen_point(x,y) != (physical_x,physical_y):
             raise SafetyError("window changed during chrome target validation")
         self.check_input_pause()
@@ -2221,6 +1561,15 @@ class Scheduler:
         # are not sufficient and can drag the client when the page is absent.
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
             raise PendingError("offline login prompt requires manual login")
+        from hyol_managed import first_card_prompt_visible
+        if first_card_prompt_visible(self, frame):
+            # Spending a card belongs to the audited managed start, even when
+            # this dialog shares a generic orange confirmation button.
+            return False
+        if self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+            from hyol_identity_overlays import dismiss_identity_overlays
+            following=dismiss_identity_overlays(self,account,frame,only_kind='recharge_activity')
+            return not self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),following,threshold=.98)[0]
         from hyol_managed import stopped_panel_visible
         if stopped_panel_visible(self, frame):
             if not self.click_template(account, 'managed_settings_close_current.bmp',
@@ -3005,7 +2354,11 @@ class Scheduler:
             ok, scores = True, {account.name: 1.0}
             reference = getattr(self, '_verified_current_mask', None)
             if reference is not None and self.main_ready(frame):
-                current = identity_text_mask(frame.crop(IDENTITY_ROI))
+                from hyol_checkpoints import current_identity_mask
+                # Binding excludes animated map pixels and compensates only
+                # positively anchored dimmed modals. Reuse that exact layout
+                # here so a quiz overlay cannot masquerade as a role change.
+                current = current_identity_mask(frame, self.templates)
                 score = mask_f1(reference, current)
                 if score < .92:
                     raise SafetyError('当前入口已关联账号的身份发生变化，禁止点击')
@@ -3208,6 +2561,7 @@ class Scheduler:
             ("welfare_close.bmp", (1301, 219, 1451, 369)),
             ("welfare_title_current.bmp", (1120,230,1320,380)),
             ("daruma_weekend_page.bmp", (850,230,1180,360)),
+            ('interference_recharge_title_20261022.bmp',(900,235,1250,325)),
             ("daily_practice_anchor.bmp", (951, 119, 1501, 369)),
             ("survival_anchor.bmp", (201, 69, 601, 419)),
             ("wanted_team_anchor.bmp", (500, 200, 1450, 850)),
@@ -3238,6 +2592,16 @@ class Scheduler:
         """Return a verified close-X match, including bounded scale drift."""
         frame = frame or self.capture()
         roi = (1865, 700, 1919, 780)
+        # This round X is shared by enrolled merchant and group notices.
+        # Duel notifications use the same design at a larger native size.
+        # Require a known notice body before matching either exact button.
+        if self._activity_notice_anchor(frame) is not None:
+            for name in ('activity_notice_merchant_close_current.bmp',
+                         'activity_notice_round_large_close_current.bmp'):
+                matched, score, x, y = self.template(name, roi, frame, threshold=.98)
+                if matched:
+                    asset = self.templates.load(ASSETS / name)
+                    return name, score, x, y, 1.0, int(asset.shape[1]), int(asset.shape[0])
         # Current clients render a dark one-pixel border around the X.  Keep
         # both exact assets as the first choice.  Some activity cards are
         # painted at 1.2x in the fixed client, so retry the same two assets at
@@ -3270,6 +2634,14 @@ class Scheduler:
         match = self._activity_notice_close_match(frame)
         return match[0] if match else None
 
+    def _activity_notice_anchor(self, frame: Image.Image) -> str | None:
+        name = 'activity_notice_merchant_title_current.bmp'
+        if self.template(name, (1680,700,1880,760), frame, threshold=.98)[0]:
+            return name
+        if self.template('activity_notice_anchor.bmp', (1680,730,1919,930), frame, threshold=.50)[0]:
+            return 'activity_notice_anchor.bmp'
+        return None
+
     def clear_transient_notifications(self, account: Account, frame: Image.Image | None = None) -> Image.Image:
         """Close only positively identified lower-right activity notices via their own X."""
         frame = frame or self.capture()
@@ -3284,7 +2656,8 @@ class Scheduler:
         # (seven cards were observed live). Keep a finite ceiling, but allow
         # the verified card, X, and changed-frame loop to drain that queue.
         for _ in range(12):
-            notice = self.template("activity_notice_anchor.bmp", notice_roi, frame, threshold=notice_threshold)[0]
+            notice_anchor = self._activity_notice_anchor(frame)
+            notice = notice_anchor is not None
             close_match = self._activity_notice_close_match(frame)
             close_name = close_match[0] if close_match else None
             if notice and not close_name:
@@ -3297,10 +2670,11 @@ class Scheduler:
                     account,
                     close_name,
                     close_roi,
-                    19,
-                    19,
+                    close_match[5] // 2,
+                    close_match[6] // 2,
                     "close_lower_right_activity_notice",
-                    ["activity_notice_anchor.bmp", close_name],
+                    [notice_anchor, close_name],
+                    frame_predicate=lambda fresh: self._activity_notice_anchor(fresh) is not None,
                 ):
                     raise PendingError("lower-right activity notice X disappeared before click")
             else:
@@ -3319,20 +2693,18 @@ class Scheduler:
                     x + width // 2,
                     y + height // 2,
                     "close_lower_right_activity_notice",
-                    ["activity_notice_anchor.bmp"],
+                    [notice_anchor],
                     anchor_threshold=notice_threshold,
+                    frame_predicate=lambda fresh: (self._activity_notice_anchor(fresh) is not None
+                        and (current := self._activity_notice_close_match(fresh)) is not None
+                        and current[2:4] == close_match[2:4]),
                 )
             self.event("activity_notice_closed", account, location="lower_right")
             replacement = False
             for settle_index in range(12):
                 self.wait_interruptible(0.5)
                 next_frame = self.capture()
-                notice_after = self.template(
-                    "activity_notice_anchor.bmp",
-                    notice_roi,
-                    next_frame,
-                    threshold=notice_threshold,
-                )[0]
+                notice_after = self._activity_notice_anchor(next_frame) is not None
                 close_after = self._activity_notice_close_match(next_frame)
                 if not notice_after and not close_after:
                     return next_frame
@@ -3381,6 +2753,10 @@ class Scheduler:
         leave_hot_spring(self, account)
         for _ in range(5):
             frame = self.content_guard(account)
+            if self.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+                from hyol_identity_overlays import dismiss_identity_overlays
+                dismiss_identity_overlays(self,account,frame,only_kind='recharge_activity')
+                continue
             if (self.template('daruma_weekend_page.bmp', (850,230,1180,360), frame, threshold=.98)[0]
                     and self.template('daruma_weekend_close.bmp', (1290,260,1420,370), frame, threshold=.98)[0]):
                 if not self.click_template(account, 'daruma_weekend_close.bmp', (1290,260,1420,370),
@@ -3717,8 +3093,8 @@ class Scheduler:
                 and self.template('mail_backpack_full_current.bmp', (740,450,1180,580), frame, threshold=.985)[0]):
             evidence = evidence or self.save_raw_evidence(frame,account,'mail_backpack_full','pending')
             self.event('mail_backpack_full',account,evidence=str(evidence),capacity='ordinary_backpack',
-                       detail='普通背包已满，邮件附件保留待领取；未清理或购买')
-            raise PendingError('普通背包已满，邮件附件保留待领取；证据='+str(evidence))
+                       detail='邮件附件未领：普通背包已满，需清理；附件保留待领取')
+            raise PendingError('邮件附件未领：普通背包已满，需清理；证据='+str(evidence))
 
     def module_mail(self, account: Account) -> None:
         self.ensure_assets(["mail_toolbar_icon.bmp", "mail_ready_anchor.bmp", "mail_close.bmp", "mail_attachment_warehouse.bmp", "mail_empty_list.bmp", "mail_warehouse_anchor.bmp", "mail_warehouse_close.bmp", "mail_claim_all.bmp", "mail_claim_all_disabled.bmp", "mail_claimed_stamp.bmp", "mail_backpack_full_current.bmp"])
@@ -3996,7 +3372,29 @@ class Scheduler:
         return self.state.action_status(account.name, current) == "pending" or self.state.action_status(account.name, legacy) == "pending"
 
     def _arena_daily_rewards_complete(self, account: Account) -> bool:
-        return all(self._arena_reward_claim_done(account, index) for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
+        account_state = getattr(self.state, 'accounts', {}).get(account.name, {})
+        actions = account_state.get('actions', {}) if isinstance(account_state, dict) else {}
+        if any(key.startswith(('arena_daily_reward_claim_', 'arena_reward_claim_'))
+               and isinstance(value, dict) and value.get('status') == 'pending'
+               for key, value in actions.items()):
+            return False
+        if all(self._arena_reward_claim_done(account, index) for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1)):
+            return True
+        record = account_state.get('arena_daily_reward_exhaustion', {}) if isinstance(account_state, dict) else {}
+        return (isinstance(record, dict) and record.get('status') == 'verified'
+                and record.get('account') == account.name
+                and record.get('day') == self.state.day
+                and record.get('run_id') == getattr(getattr(self, 'diagnostics', None), 'identifier', None)
+                and type(record.get('observations')) is int
+                and record['observations'] >= 2 and bool(record.get('evidence')))
+
+    def _arena_daily_rows_exhausted(self, frame: Image.Image) -> bool:
+        """Both explicit 'no challenge tasks' messages, never blank-row absence."""
+        return (self.template('arena_ready_anchor.bmp', (851,199,1451,449), frame)[0]
+                and all(self.template('arena_daily_no_tasks_current.bmp', roi, frame, threshold=.98)[0]
+                        for roi in ((330,480,485,585), (330,600,485,710)))
+                and not self._combat_active_visible('arena', frame)
+                and not self._arena_victory_visible(frame) and not self._arena_defeat_visible(frame))
 
     def _arena_difficulties_lowered_complete(self, account: Account) -> bool:
         return all(
@@ -4336,7 +3734,13 @@ class Scheduler:
         green = ((title[:, :, 1] > title[:, :, 0] * 1.15)
                  & (title[:, :, 1] > title[:, :, 2] * 1.10)
                  & (title[:, :, 1] > 85)).sum()
-        return bool(green >= 900 and rgb[150:900, 300:1600].mean() < 80)
+        if not (green >= 900 and rgb[150:900, 300:1600].mean() < 80):
+            return False
+        # Dark forest maps also satisfy the color heuristic. Require the
+        # independent fixed queue title before blocking navigation.
+        store = getattr(self, 'templates', None) or TemplateStore(.94)
+        return store.match(frame, ASSETS/'arena_waiting_title_current.bmp',
+                           (790,455,1100,545), .94)[0]
 
     def _combat_ready_visible(self, mode: str, frame: Image.Image | None = None) -> bool:
         frame = frame or self.capture()
@@ -4421,7 +3825,7 @@ class Scheduler:
             # The bound tab-title mask authorizes observation/switching only;
             # subsequent content clicks still require fresh page and identity gates.
             return context.select(self, account,
-                                  allow_hidden=running, allow_transition=running)
+                                  allow_hidden=running, allow_transition=running, combat_mode=mode)
         if not running:
             if (getattr(self, 'active', None) == account
                     and self._saved_tab_mapping().get(account.name) == account.tab_x):
@@ -4549,6 +3953,16 @@ class Scheduler:
                 confirmed = self.capture()
                 if (ready_before and self.template('arena_ready_anchor.bmp', (851,199,1451,449), confirmed)[0]
                         and not self.template('arena_reward_claim.bmp', (301,469,521,879), confirmed)[0]):
+                    if (self._arena_daily_rows_exhausted(frame)
+                            and self._arena_daily_rows_exhausted(confirmed)):
+                        evidence = self.save_raw_evidence(confirmed, account, 'arena_daily_rows_exhausted', 'verified')
+                        self.state.accounts[account.name]['arena_daily_reward_exhaustion'] = dict(
+                            status='verified', account=account.name, day=self.state.day,
+                            run_id=self.diagnostics.identifier, observations=2, evidence=str(evidence),
+                            claim_clicks_inferred=0)
+                        self.state.save_account(account.name)
+                        self.event('arena_daily_rewards_exhausted_verified', account, observations=2,
+                                   evidence=str(evidence), claim_clicks_inferred=0)
                     break
                 continue
             action = f"arena_daily_reward_claim_{claim_index}"
@@ -4586,9 +4000,13 @@ class Scheduler:
         else:
             raise PendingError("arena reward claim sequence exceeded safe bound")
         if self._arena_daily_rewards_complete(account):
+            claims = sum(self._arena_reward_claim_done(account, index)
+                         for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
             if self.state.action_status(account.name, "arena_daily_rewards") != "done":
-                self.state.set_action(account.name, "arena_daily_rewards", "done", "two left-side daily reward claims verified")
-            self.event("arena_daily_rewards_verified", account, claims=ARENA_DAILY_REWARD_CLAIMS, target="arena_daily_rewards")
+                self.state.set_action(account.name, "arena_daily_rewards", "done",
+                    "two left-side daily reward claims verified" if claims == ARENA_DAILY_REWARD_CLAIMS
+                    else "both daily task rows explicitly exhausted on two ready frames; no claim inferred")
+            self.event("arena_daily_rewards_verified", account, claims=claims, target="arena_daily_rewards")
 
     def recheck_arena_rewards(self, account: Account) -> None:
         """Sweep refreshed rows after an older completed run, without another battle."""
@@ -5198,13 +4616,17 @@ class Scheduler:
             if target_mode == 'tickets':
                 request['ticket_count_at_completion'] = 0
             self.state.save_global()
-        detail = ('ranked tickets exhausted and two daily reward claims verified'
-                  if target_mode == 'tickets'
-                  else f'{self._arena_target_for(account)} arena victories and two daily reward claims verified')
+        claims = sum(self._arena_reward_claim_done(account, index)
+                     for index in range(1, ARENA_DAILY_REWARD_CLAIMS + 1))
+        rewards_detail = ('two daily reward claims verified' if claims == ARENA_DAILY_REWARD_CLAIMS
+                          else 'both daily task rows explicitly exhausted; no additional claim inferred')
+        detail = ('ranked tickets exhausted' if target_mode == 'tickets'
+                  else f'{self._arena_target_for(account)} arena victories') + '; ' + rewards_detail
         self.state.set_module(account.name, "arena", "done", detail)
         self.event("combat_module_done", account, mode="arena", target_mode=target_mode,
                    wins=self._arena_victory_count(account), target=self._arena_target_for(account),
-                   tickets_exhausted=target_mode == 'tickets', claims=ARENA_DAILY_REWARD_CLAIMS)
+                   tickets_exhausted=target_mode == 'tickets', claims=claims,
+                   daily_rows_exhausted=claims < ARENA_DAILY_REWARD_CLAIMS)
 
     def _observe_survival_pending_page(self, slot: CombatSlot, frame: Image.Image) -> bool:
         """A ready page is progress evidence, never an invented battle outcome."""
@@ -5542,12 +4964,13 @@ class Scheduler:
         if not paths:
             # Older versions logged before-image paths without putting them in
             # the ledger. Only the original operation's timestamp may select one.
-            from hyol_task_progress import ProgressReader
+            # Pure directory discovery: no progress index or reader is created.
+            from hyol_task_progress import discover_log_roots
             try:
                 stamp = datetime.fromisoformat(record['updated_at'])
             except (ValueError, KeyError):
                 return False
-            for logs in dict.fromkeys((LOGS, *ProgressReader(ROOT).log_roots)):
+            for logs in dict.fromkeys((LOGS, *discover_log_roots(ROOT))):
                 folder = logs/'scheduler_evidence'/self.state.day/slug(account.name)
                 for path in folder.glob('*_before_survival_reset.jpg'):
                     try:
@@ -5973,6 +5396,7 @@ class Scheduler:
                                    f"本场保持待续，不重复开战；{evidence}")
             self.commit_action(account, label, "result closed; point increase independently confirmed")
             self.commit_action(account, action, f"survival score confirmed: {baseline}->{score_after}")
+            self.reconcile_survival_finished_speed_controls(account)
             slot.running = False
             slot.next_index += 1
             slot.start_confirmed = False
@@ -6004,6 +5428,73 @@ class Scheduler:
                     and self.state.action_status(account.name, action) == "done"
                     and self.state.action_status(account.name, action + "_start") == "done"):
                 self.commit_action(account, label, "旧版结算确认补记：同关开战及结算返回均已有完成记录")
+        self.reconcile_survival_finished_speed_controls(account)
+
+    def reconcile_survival_finished_speed_controls(self, account: Account) -> int:
+        """Expire an unverified UI toggle only after its exact battle settled.
+
+        Expired is not a successful x2 observation. Preserve the pending input
+        and its evidence, and never use this path for starts, rewards or resets.
+        """
+        from copy import deepcopy
+        from hyol_run_context import RunContext
+        context = getattr(self, 'run_context', None)
+        if (not isinstance(context, RunContext)
+                or Path(self.state.directory).resolve() != context.directory.resolve()):
+            return 0
+        data = self.state.accounts.get(account.name, {})
+        scope = f'survival:{context.identifier}:{account.account_id}'
+        if data.get('survival_operation_scope') != scope:
+            return 0
+        actions = data.get('actions', {})
+        observations = data.get('survival_attempt_observations', {})
+        if not isinstance(actions, dict) or not isinstance(observations, dict):
+            return 0
+        changed = 0
+        for key, row in tuple(actions.items()):
+            match = re.fullmatch(r'survival_run_([12])_battle_speed_x2_([1-9][0-9]*)', key)
+            if not match or not isinstance(row, dict) or row.get('status') != 'pending':
+                continue
+            run, step = match.groups()
+            names = (f'survival_battle_step_{step}', f'survival_battle_step_{step}_start',
+                     f'survival_result_confirm_{step}')
+            parents = [actions.get(name, {}) for name in names]
+            records = [row, *parents]
+            if any(not isinstance(record, dict) or record.get('origin') or record.get('checkpoint_conflict')
+                   for record in records):
+                continue
+            prefix = f'{scope}:run_{run}:'
+            if row.get('operation_id') != prefix + key or any(
+                    record.get('status') != 'done' or record.get('operation_id') != prefix + name
+                    for name, record in zip(names, parents)):
+                continue
+            points = re.fullmatch(r'survival score confirmed: ([0-9]+)->([0-9]+)', str(parents[0].get('detail', '')))
+            observed = observations.get(f'run_{run}:{names[0]}', {})
+            if (not points or not isinstance(observed, dict) or type(observed.get('score_before')) is not int
+                    or observed['score_before'] != int(points[1])
+                    or not 0 <= int(points[1]) < int(points[2]) <= 220):
+                continue
+            try:
+                sent = datetime.fromisoformat(row['updated_at'])
+                settled = datetime.fromisoformat(parents[0]['updated_at'])
+                if sent > settled or sent.date().isoformat() != self.state.day or settled.date() != sent.date():
+                    continue
+                evidence = {name: str(record['before_evidence']) for name, record in
+                            ((key, row), (names[0], parents[0]), (names[2], parents[2]))}
+                if not all(Path(path).is_file() for path in evidence.values()):
+                    continue
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
+            original = deepcopy(row)
+            self.state.set_action(account.name, key, 'expired', '原二倍速效果未知；同账号同轮同场开战、积分增加及结算已核实，按钮已失效，禁止重试')
+            actions[key].update(speed_verified=False, original_pending=original,
+                resolution=dict(reason='parent_battle_completed', parents={name: deepcopy(record)
+                                for name, record in zip(names, parents)}, evidence=evidence))
+            self.state.save_account(account.name)
+            self.event('survival_speed_observation_expired', account, action=key,
+                       operation_id=original['operation_id'], speed_verified=False, evidence=evidence)
+            changed += 1
+        return changed
 
     def _finish_survival_slot(self, slot: CombatSlot) -> None:
         if slot.complete:
@@ -6114,6 +5605,7 @@ class Scheduler:
             try:
                 if slot.complete:
                     continue
+                self.event('combat_slot_prepare_started', slot.account, mode=mode)
                 if mode == "arena":
                     self._prepare_arena_slot(slot)
                 else:
@@ -9586,6 +9078,10 @@ class Scheduler:
         return best
 
     def run_managed_gate(self, account: Account) -> None:
+        from hyol_managed import (CARD_ACTION, first_card_prompt_visible,
+                                  confirm_first_card, reconcile_card_confirmation,
+                                  stopped_panel_visible)
+        from hyol_network_retry import run as retry_network
         self.switch_account(account)
         if not (ASSETS / "managed_active.bmp").exists() or not (ASSETS / "managed_exit.bmp").exists():
             raise PendingError("managed_active.bmp and managed_exit.bmp are required")
@@ -9603,35 +9099,57 @@ class Scheduler:
                 self.wait_interruptible(0.3)
                 frame = self.capture()
         if stable_samples == 10:
-            if self.state.action_status(account.name, "start_managed") != "done":
+            actions = self.state.accounts[account.name].get('actions', {})
+            pending_network = any(key.startswith('start_managed_network_')
+                and isinstance(row, dict) and row.get('status') == 'pending'
+                for key,row in actions.items())
+            if pending_network:
+                retry_network(self, account, 'start_managed', '开始托管',
+                              lambda: True, lambda: False, lambda _label: False)
+            elif self.state.action_status(account.name, "start_managed") != "done":
                 self.commit_action(account, "start_managed", "managed active was positively reconciled across ten consecutive samples")
+            reconcile_card_confirmation(self, account)
             self.state.set_module(account.name, "managed", "done")
             return
         if seen_active:
             raise PendingError("managed active recognition was not stable for ten consecutive samples; no start click made")
         if self.config.get("ManagedSafetyVerified", "0") != "1":
             raise PendingError("managed state not active and ManagedSafetyVerified is not enabled; no managed click made")
+        self.reconcile_survival_finished_speed_controls(account)
         unresolved = [key for key, value in self.state.accounts[account.name].get('actions', {}).items()
                       if isinstance(value, dict) and value.get('status') == 'pending'
-                      and key != 'start_managed' and not key.startswith('start_managed_network_')]
+                      and key not in ('start_managed', CARD_ACTION)
+                      and not key.startswith('start_managed_network_')]
         if unresolved:
             raise PendingError('原操作结果尚未核实，不能开始托管：'+', '.join(unresolved))
         self.ensure_assets(["managed_mode_button.bmp", "managed_start_button.bmp"])
-        self.prepare_main(account)
-        self.open_managed_panel_with_retry(account)
-        from hyol_managed import preserve_existing_options
-        preserve_existing_options(self, account)
-        from hyol_network_retry import run as retry_network
+        if not first_card_prompt_visible(self, frame):
+            self.prepare_main(account)
+            self.open_managed_panel_with_retry(account)
+            from hyol_managed import preserve_existing_options
+            preserve_existing_options(self, account)
         hits = 0
         def active_verified():
             nonlocal hits
-            hits = hits + 1 if self.managed_active_score(self.capture()) >= .70 else 0
+            current = self.capture()
+            if first_card_prompt_visible(self, current):
+                confirm_first_card(self, account, current)
+                hits = 0
+                return False
+            hits = hits + 1 if self.managed_active_score(current) >= .70 else 0
             return hits >= 10
+        def start_ready():
+            current = self.capture()
+            return (not first_card_prompt_visible(self, current)
+                    and self.managed_active_score(current) < .70
+                    and stopped_panel_visible(self, current))
         retry_network(self, account, 'start_managed', '开始托管', active_verified,
-                      lambda: self.managed_active_score(self.capture()) < .70
-                      and self.template('managed_start_button.bmp', (651,619,1051,919))[0],
+                      start_ready,
                       lambda label: self.click_template(account, 'managed_start_button.bmp', (651,619,1051,919),
-                                                        50,12,label,['managed_start_button.bmp'],irreversible=True))
+                          50,12,label,['managed_start_button.bmp'],irreversible=True,
+                          frame_predicate=lambda fresh: (not first_card_prompt_visible(self, fresh)
+                                                         and stopped_panel_visible(self, fresh))))
+        reconcile_card_confirmation(self, account)
         self.state.set_module(account.name, 'managed', 'done')
 
     def open_managed_panel_with_retry(self, account: Account) -> None:

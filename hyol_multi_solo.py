@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image, ImageGrab
 
 import hyol_scheduler as hs
-from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json
+from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json, calendar_task_plan
 from hyol_daruma_task import verified as daruma_verified
 
 TAB_MARKER_CORE = "microclient_tab_close_core.bmp"
@@ -62,16 +62,17 @@ def active_tab_centers(close_positions: tuple[int, ...]) -> tuple[int, ...]:
 
 class MultiSoloRunner:
     def __init__(self, tasks=DEFAULT_SOLO_OPTIONS, *, config_path=None, account_count=None,
-                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None):
+                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None,
+                 execution_day=None):
         chosen = tuple(tasks)
         if not chosen or len(set(chosen)) != len(chosen) or any(task not in SOLO_OPTIONS for task in chosen):
             raise ValueError("请选择不重复的单人日常任务")
-        self.tasks = tuple(task for task in SOLO_OPTIONS if task in chosen)
-        from hyol_weekend import is_weekend
-        if not is_weekend():
-            self.tasks = tuple(task for task in self.tasks if task != 'weekend')
+        self.requested_tasks = tuple(task for task in SOLO_OPTIONS if task in chosen)
+        self.calendar_plan = calendar_task_plan(self.requested_tasks, execution_day)
+        self.tasks = tuple(self.calendar_plan['effective_tasks'])
         if not self.tasks:
-            raise ValueError('非周末不能执行仅包含周末任务的请求；未启动游戏，请选择其他任务')
+            raise ValueError(f"{self.calendar_plan['execution_day']}非周末，达摩和周末活动已按日历跳过；"
+                             '没有其他可执行任务，未启动游戏')
         self.arena_wins = arena_wins
         self.arena_target_mode = arena_target_mode
         if not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
@@ -96,7 +97,7 @@ class MultiSoloRunner:
         if account_count is None:
             account_count = len(names)
         if account_count < 1 or account_count > len(names):
-            raise ValueError(f"账号数量须在1到{len(names)}之间；新增账号先配置TabAccountNames并采集身份模板")
+            raise ValueError(f"账号数量须在1到{len(names)}之间；通用模式从当前游戏标签自动建立本轮记录")
         selected_names = names
         missing = [] if self.automatic_accounts else [name for name in selected_names if not (hs.ASSETS / 'accounts' / f'{hs.slug(name)}_identity.bmp').exists()]
         if missing:
@@ -152,6 +153,10 @@ class MultiSoloRunner:
             "arena_target_mode": self.arena_target_mode,
             "managed_enabled": getattr(self, 'managed_enabled', True),
             "tasks": list(self.tasks),
+            "requested_tasks": list(getattr(self, 'requested_tasks', self.tasks)),
+            "effective_tasks": list(self.tasks),
+            "calendar_skipped": getattr(self, 'calendar_plan', {}).get('calendar_skipped', {}),
+            "execution_day": getattr(self, 'calendar_plan', {}).get('execution_day'),
             "run_id": self.scheduler.diagnostics.identifier,
             "tab_bindings": {str(a.index): a.name for a in self.scheduler.accounts},
             "blocked_tasks": getattr(self, 'blocked_tasks', {}),
@@ -237,6 +242,8 @@ class MultiSoloRunner:
         runner.group_selection_cancelled = False
         runner.wanted_selection_cancelled = False
         runner.selected_tasks = self.tasks
+        runner.requested_tasks = getattr(self, 'requested_tasks', self.tasks)
+        runner.calendar_plan = getattr(self, 'calendar_plan', {})
         runner.managed_enabled = getattr(self, 'managed_enabled', True)
         from hyol_checkpoints import load_tasks
         runner.path, runner.records = load_tasks(self.scheduler.state, account.name)
@@ -809,6 +816,7 @@ class MultiSoloRunner:
                 runner.save()
                 runners[account.name] = runner
                 candidates.append(account)
+                self.event('multi_solo_task_started', account, task='survival')
             if not candidates:
                 self.event('multi_solo_survival_no_eligible_accounts',
                            detail='没有需要继续执行的生存演习账号')
@@ -904,6 +912,7 @@ class MultiSoloRunner:
                     continue
                 candidates.append(account)
                 pending[account.name] = account
+                self.event('multi_solo_task_started', account, task='ranking')
             if not candidates:
                 self.event('multi_solo_ranking_no_eligible_accounts',
                            detail='没有需要继续执行的排位赛账号')
@@ -1338,6 +1347,9 @@ class MultiSoloRunner:
         self.event('multi_solo_survival_second_run_queued', account, reason=reason)
 
     def unresolved_combat_task(self, account):
+        reconcile = getattr(self.scheduler, 'reconcile_survival_finished_speed_controls', None)
+        if callable(reconcile):
+            reconcile(account)
         actions = self.scheduler.state.accounts.get(account.name, {}).get('actions', {})
         if not isinstance(actions, dict):
             actions = {}
@@ -1418,6 +1430,7 @@ class MultiSoloRunner:
         return True
 
     def finish_managed_accounts(self):
+        self.scheduler._performance_task = 'managed'
         """Start managed mode last, only for accounts with a complete solo run."""
         if not getattr(self, 'managed_enabled', True):
             self.event('multi_solo_managed_disabled', detail='本轮最后进入托管未勾选')
@@ -1485,6 +1498,9 @@ class MultiSoloRunner:
             meter = PerformanceMeter(s)
             self.event('multi_solo_run_started', tasks=list(self.tasks), managed_enabled=getattr(self, 'managed_enabled', True),
                        requested_account_count=getattr(self, 'requested_account_count', None))
+            if getattr(self, 'calendar_plan', {}).get('calendar_skipped'):
+                self.event('solo_calendar_filtered', **self.calendar_plan,
+                           detail='执行日非周末，跳过达摩和周末活动；原请求及旧断点保留')
             context = getattr(self, 'run_context', None)
             if context and manage_lease:
                 context.begin()
@@ -1520,6 +1536,7 @@ class MultiSoloRunner:
                     self.save_progress("paused")
                     return 2
                 stage_started = time.monotonic()
+                s._performance_task = task
                 self.event("multi_solo_stage_started", task=task)
                 if task == 'treasure':
                     from hyol_treasure import run_multi
@@ -1653,9 +1670,9 @@ class MultiSoloRunner:
             finally:
                 try:
                     if meter is not None:
-                        timings = meter.snapshot()
+                        timings, scopes = meter.snapshot(), meter.scope_snapshot()
                         meter.close()
-                        self.event('multi_solo_performance', timings=timings,
+                        self.event('multi_solo_performance', timings=timings, scopes=scopes,
                                    detail='seconds为嵌套总时长；仅exclusive_seconds可相加')
                 finally:
                     s.stop.set()

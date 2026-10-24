@@ -5,13 +5,27 @@ import json
 import hashlib
 import os
 import re
+import sqlite3
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from hyol_progress_index import ProgressLogIndex
 from pathlib import Path
 
 TASK_LABELS = dict(mail='邮件', welfare='福利', ranking='排位', survival='生存',
                    quiz='测验', arena='竞技场', daruma='达摩', weekend='周末', treasure='挖宝', managed='托管')
 STATUSES = dict(new='未执行', running='执行中', done='已完成', pending='待核实',
                 skipped='跳过', unselected='未选择', offline='掉线')
+
+
+def mail_cleanup_required(record):
+    return (record.get('status') == 'pending'
+            and '普通背包已满' in str(record.get('last_error') or ''))
+
+
+def task_status_text(task, record):
+    if task == 'mail' and mail_cleanup_required(record):
+        return '背包满需清理'
+    return STATUSES.get(record.get('status'), '待核实')
 
 
 def local_day():
@@ -103,56 +117,104 @@ def survival_battle_counts(events, account, day, actions=None):
                 verified_current_round_battles=current)
 
 
+def discover_log_roots(root, state=None):
+    """Every logs directory this installation may read; creates no index.
+
+    Pure directory discovery so scheduler back-tracking can locate evidence
+    folders without building a temporary SQLite index or a progress reader.
+    """
+    root = Path(root)
+    state = shared_state(root) if state is None else Path(state)
+    roots = [root / 'logs', state.parent / 'logs']
+    desktop = Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Desktop' / '可用脚本'
+    if desktop.is_dir():
+        for package in desktop.iterdir():
+            if package.is_dir() and any((package / name).is_file() for name in
+                                       ('HYOL_Daily.ini', 'DAILY_Client.ini', 'ARENA_Client.ini')):
+                if shared_state(package).resolve() == state.resolve():
+                    roots.append(package / 'logs')
+    return list(dict.fromkeys(roots))
+
+
 class ProgressReader:
     def __init__(self, root, *, log_roots=None):
         self.root = Path(root)
         self.state = shared_state(self.root)
-        self.log_roots = [Path(p) for p in log_roots] if log_roots is not None else self._log_roots()
-        self.cache = {}
+        self.log_roots = ([Path(p) for p in log_roots] if log_roots is not None
+                          else discover_log_roots(self.root, self.state))
+        self.cache = OrderedDict()
+        self.cache_bytes = 0
+        self.max_cache_entries = 32
+        self.max_cache_bytes = 8 * 1024 * 1024
+        self._cache_sizes = {}
+        # The disk index is disposable: constructing it lazily keeps a locked or
+        # unwritable TEMP from ever breaking the client itself.
+        self.index = None
+        self._index_error = ''
+        self._last_good = None
+        self._scope = None
         self.warnings = []
 
-    def _log_roots(self):
-        roots = [self.root / 'logs', self.state.parent / 'logs']
-        desktop = Path(os.environ.get('USERPROFILE', str(Path.home()))) / 'Desktop' / '可用脚本'
-        if desktop.is_dir():
-            for package in desktop.iterdir():
-                if package.is_dir() and any((package / name).is_file() for name in
-                                           ('HYOL_Daily.ini','DAILY_Client.ini','ARENA_Client.ini')):
-                    if shared_state(package).resolve() == self.state.resolve():
-                        roots.append(package / 'logs')
-        return list(dict.fromkeys(roots))
+    def _ensure_index(self):
+        if self.index is None:
+            try:
+                self.index = ProgressLogIndex(TASK_LABELS, action_task)
+                self._index_error = ''
+            except (OSError, sqlite3.Error) as exc:
+                self._index_error = str(exc)
+        return self.index
 
-    def _read(self, path, *, lines=False):
+    def _discard_index(self):
+        index, self.index = self.index, None
+        if index is not None:
+            try:
+                index.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self._discard_index()
+        self.cache.clear()
+        self._cache_sizes.clear()
+        self.cache_bytes = 0
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _read(self, path):
+        """Small ledger cache only; JSONL history is indexed separately."""
         path = Path(path)
         try:
             stat = path.stat()
-            signature = (stat.st_mtime_ns, stat.st_size)
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
             previous = self.cache.get(path)
             if previous and previous[0] == signature:
+                self.cache.move_to_end(path)
                 return previous[1]
-            raw = path.read_text(encoding='utf-8-sig')
-            if lines:
-                value = []
-                for line in raw.splitlines():
-                    try:
-                        event = json.loads(line)
-                    except ValueError:
-                        self.warnings.append('日志末行写入中：' + path.name)
-                        continue
-                    if isinstance(event, dict):
-                        value.append(event)
-            else:
-                value = json.loads(raw)
-                if not isinstance(value, dict):
-                    raise ValueError('expected object')
-            self.cache[path] = (signature, value)
+            value = json.loads(path.read_text(encoding='utf-8-sig'))
+            if not isinstance(value, dict):
+                raise ValueError('expected object')
+            self.cache_bytes -= self._cache_sizes.pop(path, 0)
+            self.cache.pop(path, None)
+            if stat.st_size <= self.max_cache_bytes:
+                self.cache[path] = (signature, value)
+                self._cache_sizes[path] = stat.st_size
+                self.cache_bytes += stat.st_size
+            while self.cache and (len(self.cache) > self.max_cache_entries or self.cache_bytes > self.max_cache_bytes):
+                old, _ = self.cache.popitem(last=False)
+                self.cache_bytes -= self._cache_sizes.pop(old)
             return value
         except FileNotFoundError:
-            return [] if lines else {}
+            self.cache.pop(path, None)
+            self.cache_bytes -= self._cache_sizes.pop(path, 0)
+            return {}
         except (OSError, ValueError) as exc:
             self.warnings.append('待刷新：' + path.name + ' ' + str(exc))
             previous = self.cache.get(path)
-            return previous[1] if previous else ([] if lines else {})
+            return previous[1] if previous else {}
 
     def days(self):
         found = {local_day()}
@@ -166,28 +228,45 @@ class ProgressReader:
         if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day):
             raise ValueError('日期须为YYYY-MM-DD')
         self.warnings = []
-        events = []
-        for root in self.log_roots:
-            pattern = ('HYOL_Scheduler_' + run_id + '.jsonl' if run_id else
-                       'HYOL_Scheduler_' + day.replace('-', '') + '_*.jsonl')
-            for path in root.glob(pattern):
-                events.extend(self._read(path, lines=True))
-        # Copies of one log do not count as extra victories/operations.
-        unique = {}
-        for event in events:
-            key = (event.get('run_id'), event.get('ts'), event.get('event'),
-                   event.get('account'), event.get('target'), event.get('task'))
-            unique[key] = event
-        events = sorted(unique.values(), key=lambda e: str(e.get('ts', '')))
-        runs = {}
-        for event in events:
-            if event.get('event') in ('multi_solo_run_started', 'daily_task_started',
-                                     'generic_current_window_bound', 'combat_interleaved_start'):
-                identifier = event.get('run_id')
-                if identifier:
-                    runs.setdefault(identifier, str(event.get('ts', '')))
-        if run_id:
-            events = [e for e in events if e.get('run_id') == run_id]
+        scope = (day, run_id)
+        if scope != self._scope:
+            self.cache.clear()
+            self._cache_sizes.clear()
+            self.cache_bytes = 0
+            self._scope = scope
+            self._last_good = None  # The previous snapshot belongs to another view.
+        progress_index = self._ensure_index()
+        if progress_index is None:
+            self.warnings.append('进度索引不可用，待刷新：' + self._index_error)
+            return self._degraded(day, run_id)
+        try:
+            snapshot = self._load_with_index(progress_index, scope, day, run_id)
+        except sqlite3.Error as exc:
+            # A failed index transaction must never surface partial counts.
+            # Drop the broken index (a fresh one is rebuilt on the next refresh)
+            # and keep the last verified snapshot for this scope.
+            self.warnings.append('进度索引读取失败，保留上次快照：' + str(exc))
+            self._discard_index()
+            return self._degraded(day, run_id)
+        self._last_good = snapshot
+        return snapshot
+
+    def _degraded(self, day, run_id):
+        # Missing data is unknown state, never completion: without a verified
+        # snapshot for this scope the panel simply shows an empty unknown view.
+        warnings = list(dict.fromkeys(self.warnings))
+        if self._last_good is not None:
+            snapshot = dict(self._last_good)
+            snapshot['warnings'] = warnings
+            return snapshot
+        return dict(day=day, run_id=run_id, updated_at='', rows=[], runs=[], warnings=warnings)
+
+    def _load_with_index(self, progress_index, scope, day, run_id):
+        pattern = ('HYOL_Scheduler_' + run_id + '.jsonl' if run_id else
+                   'HYOL_Scheduler_' + day.replace('-', '') + '_*.jsonl')
+        paths = [path for root in self.log_roots for path in root.glob(pattern)]
+        observed_summary = progress_index.sync(paths, scope, self.warnings)
+        runs = observed_summary.runs
         global_state = self._read(self.state / (day + '.json')) if not run_id else {}
         latest = self._read(self.state / 'multi_solo_latest.json') if not run_id else {}
         if not str(latest.get('updated_at', '')).startswith(day):
@@ -201,83 +280,26 @@ class ProgressReader:
                 name = ledger.get('account')
                 if name:
                     accounts[name] = (ledger, self._read(path.with_name(path.stem + '_tasks.json')))
-        bindings, health, cells, selected = {}, {}, {}, None
-        ended_runs = set()
-        last_events = {}
-        active_tasks = {}
-        centers = []
+        bindings = {}
         count = int(latest.get('tab_count') or (6 if day == local_day() and not run_id else 0))
         if not run_id:
             mapping = global_state.get('verified_solo_tab_map', global_state.get('tab_map', {}))
-            # Derive physical slots from logged chrome, not compacted identity order.
-            for event in reversed(events):
-                if event.get('event') == 'multi_solo_tabs_counted':
-                    centers = event.get('title_centers', [])
-                    break
             for name, x in mapping.items():
-                matches = [i+1 for i, center in enumerate(centers) if abs(center-x) <= 20]
+                matches = [i+1 for i, center in enumerate(observed_summary.centers) if abs(center-x) <= 20]
                 if len(matches) == 1:
                     bindings[matches[0]] = name
-            count = max(count, len(bindings))
-        for event in events:
-            kind, name = event.get('event', ''), event.get('account')
-            identifier = event.get('run_id')
-            last_events[identifier] = event
-            if kind in ('multi_solo_run_end','daily_summary','emergency_stop','scheduler_stopped'):
-                ended_runs.add(identifier)
-            index = event.get('tab_index')
-            if kind == 'multi_solo_tabs_counted':
-                count = int(event.get('count') or count)
-            if kind == 'multi_solo_run_started':
-                selected = set(event.get('tasks', []))
-                if event.get('managed_enabled', latest.get('managed_enabled', True)):
-                    selected.add('managed')
-            if isinstance(index, int) and 1 <= index <= 6 and isinstance(name, str) and not name.startswith('当前窗口标签'):
-                for old in [key for key, value in bindings.items() if value == name and key != index]:
-                    del bindings[old]
-                bindings[index] = name
-            if not name:
-                continue
-            if kind in ('account_offline', 'combat_account_offline_skipped',
-                        'multi_solo_account_disconnected', 'multi_solo_account_disconnected_skipped',
-                        'combat_watchdog_timeout', 'multi_solo_account_stalled'):
-                health[name] = event.get('detail') or ('已掉线：提示确认' if kind != 'combat_watchdog_timeout' else '掉线：30秒无变化')
-            elif kind in ('account_verified', 'identity_bound', 'account_bound', 'combat_account_bound', 'multi_solo_start_return_verified'):
-                health.pop(name, None)
-            task = event.get('task') or event.get('mode')
-            if task in TASK_LABELS and kind in ('multi_solo_task_started','daily_task_started'):
-                active_tasks[name] = task
-            if kind in ('multi_solo_managed_complete', 'multi_solo_managed_pending'):
-                task = 'managed'
-            if kind.startswith('multi_solo_survival_'):
-                task = 'survival'
-            if task not in TASK_LABELS:
-                task = action_task(str(event.get('target') or event.get('action') or '')) or action_task(kind)
-            if task not in TASK_LABELS and kind in ('return_leaf_verified','navigation_pending'):
-                task = active_tasks.get(name)
-            if task not in TASK_LABELS:
-                continue
-            rec = cells.setdefault((name, task), {})
-            rec.setdefault('events', []).append(event)
-            for field in ('completed','remaining','score','result','claims','home_returned',
-                          'followup_check_due','task_completed','finished_at'):
-                if field in event:
-                    rec[field] = event[field]
-            if kind in ('multi_solo_task_complete', 'daily_task_complete', 'multi_solo_managed_complete',
-                        'multi_solo_task_skip_done', 'multi_solo_survival_second_run_complete',
-                        'multi_solo_survival_no_reset_needed'):
-                rec['status'] = 'done'
-            elif kind in ('multi_solo_task_started', 'daily_task_started'):
-                rec['status'] = 'running'
-            elif 'pending' in kind or 'blocked' in kind or kind == 'combat_slot_pending':
-                rec['status'] = 'pending'
-                rec['last_error'] = event.get('detail', '')
-            elif kind == 'multi_solo_task_skipped_for_later' and rec.get('status') != 'done':
-                rec['status'] = 'skipped'
-            if event.get('evidence'):
-                rec.setdefault('evidence_paths', []).append(str(event['evidence']))
-            if kind in ('return_leaf_verified','multi_solo_task_complete','daily_task_complete'):
-                rec['home_returned'] = True
+        for index, name in observed_summary.bindings.items():
+            for old in [key for key, value in bindings.items() if value == name and key != index]:
+                del bindings[old]
+            bindings[index] = name
+        count = observed_summary.count or max(count, len(bindings))
+        health, cells = observed_summary.health, observed_summary.cell_records()
+        ended_runs, last_events = observed_summary.ended_runs, observed_summary.last_events
+        selected = None
+        if observed_summary.started is not None:
+            selected = set(observed_summary.started.get('tasks', []))
+            if observed_summary.started.get('managed_enabled', latest.get('managed_enabled', True)):
+                selected.add('managed')
         if not run_id:
             # A resumed task can be saved before its companion action ledger
             # is written today. Its verified binding still identifies the exact
@@ -346,7 +368,7 @@ class ProgressReader:
                                           if isinstance(value, dict) and value.get('status') == 'done'
                                           and action_task(key) == task and ('victory' in key or 'defeat' in key or 'result_confirm' in key)]
                 if task == 'survival':
-                    rec.update(survival_battle_counts(events, name, day, None if run_id else actions))
+                    rec.update(survival_battle_counts(progress_index.survival_events(name), name, day, None if run_id else actions))
                 if task == 'arena' and not run_id:
                     request = global_state.get('arena_requests', {}).get(name, {})
                     wins = sum(isinstance(v, dict) and v.get('status') == 'done'
@@ -354,9 +376,7 @@ class ProgressReader:
                     rec['verified_wins'] = max(0, wins - request.get('base_wins', 0))
                     rec['requested_wins'] = request.get('requested_wins')
                 if run_id and task == 'arena':
-                    victories = {e.get('target') or e.get('index') for e in events
-                                 if e.get('account') == name and e.get('event') == 'arena_victory_confirmed'}
-                    rec['verified_wins'] = len(victories)
+                    rec['verified_wins'] = progress_index.arena_wins(name)
                 task_rows[task] = rec
             rows.append(dict(label=f'标签{index}', index=index, account=name,
                              health=health.get(name, '已绑定' if name else '身份待核实'), tasks=task_rows))
