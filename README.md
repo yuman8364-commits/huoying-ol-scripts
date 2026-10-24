@@ -1,4 +1,10 @@
-# 火影OL 2026.10.24.2-local
+# 火影OL 桌面客户端 2026.10.24.3-local
+
+当前入口为 `hyol_desktop.py`，采用Kimi确认的界面并接入原有 `RuntimeController`。普通用户完整解压桌面标准包后双击“火影OL完整客户端.exe”；打开时保持空闲，点击开始才执行实际任务。使用、源码启动、构建与验证边界见 [桌面客户端说明](README_DESKTOP.md)，设计见 [DESIGN.md](DESIGN.md)，字段与事件映射见 [INTERFACE_MAP.md](INTERFACE_MAP.md)。`--demo` 单独提供演示数据，不连接游戏。
+
+本版继承2026.10.24.2-local的内存和资源优化，没有改变识别阈值、数值精度或原任务判定；新桌面宿主使用系统WebView2，旧Tk客户端的内存测量不代表本版。真实游戏验收由用户执行，当前仅完成离线交互与空闲启动验证。
+
+## 上一版本背景：2026.10.24.2-local
 
 本地优化版（第2轮，含进度索引降级/入口线程/测试编码修复），基于发布提交 fe51a660，相对 2026.10.24.1-local 的差异见 OPTIMIZATION.md 修复一节。使用、依赖、构建和回放分包说明见 [OPTIMIZATION.md](OPTIMIZATION.md)。
 

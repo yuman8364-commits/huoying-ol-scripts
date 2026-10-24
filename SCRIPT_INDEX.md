@@ -6,6 +6,7 @@
 
 | 入口 | 依赖/核心 | 用途 |
 |------|-----------|------|
+| `hyol_desktop.py` | `web/`、`hyol_desktop_bridge.py`、`hyol_runtime.py` | 当前Kimi界面桌面入口；默认接真实任务，`--demo`仅看界面 |
 | `hyol_arena.py` | `hyol_scheduler.py` | 当前标签竞技场独立客户端 |
 | `daruma_standalone_gui.py` | `daruma_standalone/` | 达摩独立客户端；桌面“火影OL达摩”打开EXE |
 | `hyol_daruma_task.py` | `hyol_daily_tasks.py` / `daruma_standalone/` | 多人解散后及单人达摩选项；同线程递归互斥锁、本轮独立记录、奖励0及回村门 |
@@ -18,6 +19,8 @@
 | `hyol_panel.py` | `hyol_scheduler.py` | 六标签综合任务面板，可勾选复合队列并传递次数 |
 
 ## 启动、构建与辅助
+
+当前桌面构建入口为 `build_desktop_client.ps1` / `tools/build_desktop_package.py`，安装 `requirements-build.txt` 与 `requirements-desktop.txt` 后使用新的输出目录构建。说明见 `README_DESKTOP.md`；专项桥接测试为 `test_hyol_desktop_bridge.py`，原生隔离交互检查为 `tools/check_desktop_ui.py`，均不运行游戏。
 
 综合面板“执行勾选任务”按显示顺序运行：识别、邮箱、福利、第一队、第二队、竞技场、生存、黑市、托管。只运行勾选项，失败或暂停后不运行后续项；托管安排在最后，全天值守保留独立入口。竞技场胜场、两队副本/强者场数均传递到实际调度命令。单人日常默认竞技场追加5胜；藏宝图因游戏“自动挖宝”会连续执行而默认不选。
 
