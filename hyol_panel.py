@@ -5,7 +5,6 @@ import queue
 import re
 import threading
 from datetime import date, datetime
-from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -185,7 +184,6 @@ EVENT_LABELS = {
     "market_offer_sold_out": "黑市商品已售罄",
     "market_offer_skip_no_item": "黑市没有目标商品",
     "market_offer_skip_non_coupon": "黑市货币类型不符合策略",
-    "market_offer_skip_insufficient_coupon": "黑市点券不足",
     "all_day_wait": "全天值守等待批次",
     "all_day_catch_up": "全天值守补做历史批次",
     "all_day_cycle": "全天值守批次结果",

@@ -1,48 +1,44 @@
 {
-  "version": "2026.10.20.1",
-  "validation_scope": "local_targeted_regression_and_native_gui_launch",
-  "targeted_tests": {
-    "run": 361,
-    "passed": 361,
-    "skipped": 0,
+  "version": "2026.11.05.1-opencv",
+  "date": "2026-11-05",
+  "local_final_offline": {
+    "stages": 19,
+    "tests": 2158,
     "failures": 0,
-    "errors": 0
+    "existing_skips": 2,
+    "provenance": "Final local release validation on 2026-11-05; private replay evidence remains local"
   },
-  "prior_pr_only": {
-    "run": 1271,
-    "passed": 1263,
-    "skipped": 8,
+  "publication_validation": {
+    "portable_tests": 31,
     "failures": 0,
-    "errors": 0,
-    "tree": "10ff667da49d3ca3dab2dc7d9ae916ccff01dc7c",
-    "applies_to_current_full_source": false
+    "original_baseline_inputs_checked": 761,
+    "archive_files_checked": 1746,
+    "package_sha256": "324f118395e45aeaa8c9a8aea14e85f096935d1a55a0084a00a3161f96b0de40",
+    "history_text_objects_checked": 607,
+    "historical_game_label_or_profile_path_findings": 28,
+    "detected_credential_patterns": 0,
+    "existing_repository_history_preserved": true
   },
-  "packaged_clients": 5,
-  "source_gui_entries": 2,
-  "native_gui_launch_verified": true,
-  "packaged_source_matches": true,
-  "modules": {
-    "daily": 37,
-    "team": 43,
-    "arena": 37,
-    "bond": 37,
-    "unified": 42
+  "packaged_client": {
+    "project_modules": 68,
+    "resources": 669,
+    "files": 1746,
+    "packaging": "onedir",
+    "personal_runtime_data_included": false,
+    "zip_crc": "PASS",
+    "native_idle_verified": true
   },
-  "prior_runtime_files_preserved": 4295,
-  "configuration_state_shortcut_files_preserved": 841,
-  "game_tasks_started_during_release": false,
-  "game_input_operations_during_release": 0,
-  "live_acceptance": "pending_user_testing",
-  "full_project_regression": "not_claimed",
-  "legacy_test_contract_fixture_issues": 14,
-  "local_runtime_and_account_configuration_included": false,
-  "clean_export": {
-    "independent_tests": 113,
-    "mouse_interruption_safety_tests": 4,
-    "failures": 0,
-    "errors": 0,
-    "skipped": 0,
-    "syntax_files": 214,
-    "local_evidence_tests": "require private historical screenshots, identity records and training provenance; not distributed"
-  }
+  "live_acceptance": {
+    "accounts": 1,
+    "day1_rewards": 1,
+    "repeated_start_rewards": 0,
+    "day2": "locked",
+    "later_days": "not yet naturally unlocked",
+    "original_battles": "not replayed"
+  },
+  "limitations": [
+    "Private desktop replay fixtures are not included.",
+    "Historical offline tests may depend on local fixtures; use the documented portable subset.",
+    "The encrypted original puzzle component is hash-checked, not a complete source audit."
+  ]
 }

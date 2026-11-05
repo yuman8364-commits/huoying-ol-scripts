@@ -2,7 +2,7 @@
 import os
 import queue
 import threading
-from tkinter import ttk, messagebox
+from tkinter import TclError, ttk, messagebox
 
 from hyol_diagnostics import Diagnostics, export_from_scheduler
 
@@ -35,6 +35,8 @@ def add_diagnostic_controls(parent, root, get_scheduler):
             (messagebox.showinfo if ok else messagebox.showerror)('诊断包', message, parent=parent.winfo_toplevel())
         except queue.Empty:
             pass
+        except TclError:
+            return  # the bar was destroyed while a result was pending
         bar.after(150, poll)
 
     def open_logs():
@@ -59,6 +61,8 @@ def add_diagnostic_controls(parent, root, get_scheduler):
                 events.put((True, manual_return(root)))
             except Exception as exc:
                 events.put((False, str(exc)))
+        # daemon=False on purpose: a click flow already sent to the game must
+        # run to its own bounded end even if the window closes mid-way.
         threading.Thread(target=worker, name='HYOL-safe-return', daemon=False).start()
     ttk.Button(bar, text='安全返回木叶村', command=safe_return).pack(side='left')
     bar.after(150, poll)

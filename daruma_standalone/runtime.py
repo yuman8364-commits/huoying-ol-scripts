@@ -5,7 +5,6 @@ import ctypes
 from dataclasses import asdict
 from datetime import datetime
 import hashlib
-import json
 from pathlib import Path
 import threading
 import time

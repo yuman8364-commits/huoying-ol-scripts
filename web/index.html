@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>火影 OL · 本轮任务控制台（界面原型）</title>
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <script src="demo-data.js" defer></script>
+  <script src="native-adapter.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 44 44" aria-hidden="true">
+          <path d="M12 28C4 17 16 7 30 9c10 2 10 15 2 20-7 5-17 1-15-6 1-5 9-7 12-3 2 3-1 7-5 6" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>
+          <path d="M12 28 8 35M17 31l-2 7" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>
+        </svg>
+        <div class="brand-copy"><strong>火影 OL</strong><span>本轮任务控制台</span></div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item is-active" data-page="plan" aria-current="page"><span data-icon="plan"></span><span class="nav-label">任务计划</span></button>
+        <button class="nav-item" data-page="progress"><span data-icon="progress"></span><span class="nav-label">本轮进度</span><span id="nav-attention" class="nav-count" hidden></span></button>
+        <button class="nav-item" data-page="logs"><span data-icon="logs"></span><span class="nav-label">运行日志</span></button>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <button class="nav-item nav-help" data-action="help"><span data-icon="help"></span><span class="nav-label">使用说明</span></button>
+      <div class="connection-card">
+        <span class="connection-dot"></span>
+        <div><strong>本地界面原型</strong><span>未连接游戏</span></div>
+      </div>
+      <div class="sidebar-version">2026.10.26.5-opencv</div>
+    </aside>
+
+    <div class="app-frame">
+      <header class="demo-strip">
+        <div class="demo-notice"><span class="demo-badge">界面演示数据</span><span class="demo-notice-text">账号、进度、日志与证据均为模拟，不操作真实游戏</span></div>
+        <div class="demo-actions">
+          <label for="scenario-select">状态预览</label>
+          <select id="scenario-select" aria-label="载入演示状态">
+            <option value="idle">未开始</option>
+            <option value="running">执行中</option>
+            <option value="stopping">停止中</option>
+            <option value="stopped">已停止</option>
+            <option value="pending">待核实</option>
+            <option value="offline">掉线</option>
+            <option value="not_open">活动未开放</option>
+            <option value="complete">已完成</option>
+            <option value="refresh_failed">进度刷新失败</option>
+          </select>
+          <button class="text-button" data-action="reset-demo">重置演示</button>
+        </div>
+      </header>
+
+      <header class="topbar">
+        <div><div id="page-eyebrow" class="eyebrow">工作台</div><h1 id="page-title">任务计划</h1><p id="page-description">组织本轮账号与任务，确认执行清单后开始。</p></div>
+        <div class="topbar-actions">
+          <button class="button button-secondary" data-action="check-window"><span data-icon="shield"></span>检查并回木叶村</button>
+          <span class="version-chip">V 2026.10.26.5</span>
+        </div>
+      </header>
+
+      <main id="main-content" class="main-content" tabindex="-1"></main>
+
+      <footer id="run-dock" class="run-dock" aria-label="本轮运行控制"></footer>
+    </div>
+  </div>
+
+  <dialog id="app-dialog" class="app-dialog" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

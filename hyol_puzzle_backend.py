@@ -20,7 +20,7 @@ import hyol_scheduler as hs
 
 BACKEND_NAME = '拼图 忍术训练V2.1.exe'
 BACKEND_SHA256 = 'ffa2ca6cd1eb8c3cc4185bd8cd52b5d85e3d9ad6864d779e1295a548db3425be'
-SOURCE_PATH = Path(r'C:\Users\Administrator\Desktop\可用脚本') / BACKEND_NAME
+SOURCE_PATH = Path.home() / 'Desktop' / '可用脚本' / BACKEND_NAME
 REQUIRED = ('启动', '中止', '保存设置', '拼图', '忍术修炼', '自动识别')
 
 
@@ -35,21 +35,24 @@ def verify_executable(path):
     return path.resolve()
 
 
-def require_account_tab(scheduler, account, frame):
+def require_account_tab(scheduler, account, frame, *, activity='拼图'):
     """A puzzle page can hide identity; it cannot replace the selected-tab lease."""
     expected = account.tab_x
     if not expected:
         expected = (getattr(scheduler, 'generic_current_tab_x', None)
                     or getattr(scheduler, '_connection_tab_x', None))
     if not expected or scheduler._generic_active_tab_x(frame) != expected:
-        raise hs.SafetyError('拼图期间选中的账号标签发生变化，停止操作并保留原局')
+        raise hs.SafetyError(f'{activity}期间选中的账号标签发生变化，停止操作并保留原局')
 
 
 class NativeApi:
     """Small, bounded Win32 surface; injectable for lifecycle/safety tests."""
 
     def __init__(self):
-        self.u, self.k = ctypes.windll.user32, ctypes.windll.kernel32
+        # Keep our callback signatures local. Mutating ctypes.windll's cached
+        # EnumWindows functions breaks the scheduler's different callback ABI.
+        self.u = ctypes.WinDLL('user32',use_last_error=True)
+        self.k = ctypes.WinDLL('kernel32',use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
         self.u.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
         self.u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
@@ -61,7 +64,9 @@ class NativeApi:
         self.u.GetDlgCtrlID.argtypes = [wt.HWND]
         self.u.IsWindow.argtypes = [wt.HWND]
         self.u.IsWindowEnabled.argtypes = [wt.HWND]
+        self.u.GetWindowLongW.argtypes = [wt.HWND,ctypes.c_int]
         self.u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+        self.u.PostMessageW.argtypes = [wt.HWND,wt.UINT,wt.WPARAM,wt.LPARAM]
         self.u.SendMessageTimeoutW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM,
                                                wt.UINT, wt.UINT, ctypes.POINTER(ctypes.c_size_t)]
         self.k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
@@ -83,9 +88,9 @@ class NativeApi:
         self.k.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
         self.k.CreateToolhelp32Snapshot.restype = wt.HANDLE
 
-    def send(self, hwnd, message, wparam=0, lparam=0):
+    def send(self, hwnd, message, wparam=0, lparam=0, *, timeout_ms=750):
         result = ctypes.c_size_t()
-        if not self.u.SendMessageTimeoutW(hwnd, message, wparam, lparam, 2, 750,
+        if not self.u.SendMessageTimeoutW(hwnd, message, wparam, lparam, 2, timeout_ms,
                                           ctypes.byref(result)):
             raise hs.PendingError('拼图程序控件无响应；保留当前游戏')
         return ctypes.c_ssize_t(result.value).value
@@ -107,16 +112,17 @@ class NativeApi:
         finally:
             self.k.CloseHandle(handle)
 
-    def describe(self, hwnd):
+    def describe(self, hwnd, *, query_state=True):
         name, pid = ctypes.create_unicode_buffer(128), wt.DWORD()
         self.u.GetClassNameW(hwnd, name, len(name))
         self.u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         result = dict(hwnd=int(hwnd), pid=pid.value, text=self.window_text(hwnd),
                       kind=name.value, identifier=self.u.GetDlgCtrlID(hwnd),
-                      enabled=bool(self.u.IsWindowEnabled(hwnd)))
-        if name.value == 'Button':
+                      enabled=bool(self.u.IsWindowEnabled(hwnd)),visible=bool(self.u.IsWindowVisible(hwnd)),
+                      own_visible=bool(self.u.GetWindowLongW(hwnd,-16)&0x10000000))
+        if query_state and name.value == 'Button' and result['text'] in ('拼图','忍术修炼','自动识别'):
             result['checked'] = self.send(hwnd, 0xF0)
-        if name.value == 'ComboBox':
+        if query_state and name.value == 'ComboBox':
             result['selection'] = self.send(hwnd, 0x147)
             result['items'] = []
             count = self.send(hwnd, 0x146)
@@ -126,24 +132,62 @@ class NativeApi:
                 result['items'].append(text.value)
         return result
 
-    def children(self, hwnd):
-        items = []
+    def children(self, hwnd, *, query_state=True):
+        items, errors = [], []
         @self.callback
         def each(child, _):
-            row = self.describe(child)
-            if row['kind'] in ('Button', 'ComboBox'):
-                items.append(row)
-            return True
+            try:
+                row = self.describe(child,query_state=query_state)
+                row['relative_visible']=self.visible_in_window(child,hwnd)
+                if row['kind'] in ('Button', 'ComboBox'):
+                    items.append(row)
+                return True
+            except Exception as exc:
+                errors.append(exc)
+                return False
         self.u.EnumChildWindows(hwnd, each, 0)
+        if errors:
+            raise errors[0]
         return items
+
+    def visible_in_window(self,child,root):
+        """Ignore only the hidden host; respect hidden intermediate pages."""
+        current=child
+        for _ in range(32):
+            if current==root:return True
+            if not current or not self.u.IsWindow(current) or not self.u.GetWindowLongW(current,-16)&0x10000000:
+                return False
+            current=self.u.GetParent(current)
+        return False
+
+    def prepare_window(self, window):
+        """Leave the host's introduction without issuing the script's Start."""
+        introductory=[row for row in self.children(window['hwnd'],query_state=False)
+                      if row['text']=='开始使用>>' and row.get('relative_visible',row['own_visible'])]
+        if len(introductory)>1:
+            raise hs.PendingError('原拼图脚本开始使用入口不唯一，未启动游戏')
+        if introductory:
+            self.click(introductory[0])
+            deadline=time.monotonic()+30
+            while time.monotonic()<deadline:
+                remaining=[row for row in self.children(window['hwnd'],query_state=False)
+                           if row['text']=='开始使用>>' and row.get('relative_visible',row['own_visible'])]
+                if not remaining:
+                    try:
+                        self.send(window['hwnd'],0,timeout_ms=250)
+                        return
+                    except hs.PendingError:
+                        pass
+                time.sleep(.1)
+            raise hs.PendingError('原拼图脚本介绍页仍在加载，未启动游戏')
 
     def windows(self):
         items = []
         @self.callback
         def each(hwnd, _):
-            if '拼图 忍术训练V2.1' in self.window_text(hwnd):
-                row = self.describe(hwnd)
-                controls = self.children(hwnd)
+            if self.window_text(hwnd) == '拼图 忍术训练V2.1':
+                row = self.describe(hwnd,query_state=False)
+                controls = self.children(hwnd,query_state=False)
                 if all(any(c['text'] == label for c in controls) for label in REQUIRED):
                     row['controls'] = controls
                     row['path'] = self.process_path(row['pid'])
@@ -255,11 +299,15 @@ class NativeApi:
     def click(self, control):
         if not self.u.IsWindow(control['hwnd']) or self.window_text(control['hwnd']) != control['text']:
             raise hs.PendingError('拼图程序控件发生变化，停止发送命令')
-        if control['text'] in ('拼图', '忍术修炼', '自动识别'):
+        if control['text']=='开始使用>>':
+            parent=self.u.GetParent(control['hwnd'])
+            if not self.u.PostMessageW(parent,0x111,control['identifier'],control['hwnd']):
+                raise hs.PendingError('原拼图脚本介绍页命令未送达，未启动游戏')
+        elif control['text'] in ('拼图', '忍术修炼', '自动识别'):
             self.send(control['hwnd'], 0xF5)  # BM_CLICK updates both check state and script variables.
         else:
             parent = self.u.GetParent(control['hwnd'])
-            self.send(parent, 0x111, control['identifier'], control['hwnd'])  # WM_COMMAND / BN_CLICKED
+            self.send(parent, 0x111, control['identifier'], control['hwnd'],timeout_ms=5000)
 
     def hide(self, hwnd):
         self.u.ShowWindow(hwnd, 0)
@@ -371,7 +419,7 @@ class PuzzleScriptSession:
                     self.api.assign(self.job, pid)
             else:
                 pid = self.api.spawn(self.executable, self.job)
-                deadline = time.monotonic() + 12
+                deadline = time.monotonic() + 45
                 while time.monotonic() < deadline:
                     self._permit()
                     matched = [row for row in self.api.windows() if row['pid'] == pid]
@@ -381,6 +429,10 @@ class PuzzleScriptSession:
                     self.s.wait_interruptible(.1)
                 if not self.window:
                     raise hs.PendingError('拼图自动识别控件加载超时，未启动解题')
+            prepare=getattr(self.api,'prepare_window',None)
+            if callable(prepare):
+                self._permit()
+                prepare(self.window)
             controls, _ = self._controls()
             self._permit()
             self.api.click(controls['中止'])

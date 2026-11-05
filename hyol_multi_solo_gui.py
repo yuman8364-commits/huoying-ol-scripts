@@ -21,7 +21,11 @@ TASK_LABELS = {
     "survival": "生存演习", "quiz": "忍者测验", "arena": "竞技场",
     "weekend": "周末（拼图＋达摩）",
     "daruma": "达摩",
+    "puzzle": "忍者拼图（三难度）",
+    "training_record": "修行录目标",
+    "escort": "押镖（两次点券＋一次铜币）",
     "treasure": "挖宝（每号5分钟）",
+    "anniversary": "周年庆签到",
 }
 
 

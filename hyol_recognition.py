@@ -95,6 +95,8 @@ class OnnxDetector:
         self.cached_frame = None
         self.cached_predictions = []
         if not self.path.exists():
+            if allow_shadow:
+                self.error = 'optional vision component is not installed'
             return
         try:
             self.manifest = json.loads(self.path.read_text(encoding='utf-8'))

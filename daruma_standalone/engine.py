@@ -12,7 +12,7 @@ from PIL import Image
 from .journal import Journal, atomic_json
 from .runtime import Desktop, RUNTIME
 from .trace import REWARDS, crop_roi, save_trace, measured_latency
-from .vision import (BAR, BOTTOM, CLOSE, GAME_PAGE, OVER, START, TRACE, IDENTITY,
+from .vision import (BAR, BOTTOM, CLOSE, START, TRACE,
                      Pending, Stopped, bottom_bounds, dispatch_at, estimate_motion,
                      f1, flame_columns, judgment_from_frames, layer_count, perfect_zone, binding_matches,
                      moving_column)
@@ -20,13 +20,16 @@ from .vision import (BAR, BOTTOM, CLOSE, GAME_PAGE, OVER, START, TRACE, IDENTITY
 
 class DarumaRunner:
     def __init__(self, hwnd, *, stop=None, root=RUNTIME, sink=None, desktop_factory=Desktop,
-                 strike_limit=None, expected_binding=None):
+                 strike_limit=None, expected_binding=None, round_limit=None, quantity_request_id=None):
         self.hwnd, self.root = hwnd, Path(root)
         self.stop = stop if stop is not None else threading.Event()
         self.sink = sink
         self.desktop_factory = desktop_factory
         self.strike_limit = strike_limit
         self.expected_binding = expected_binding
+        self.round_limit = round_limit
+        self.quantity_request_id = quantity_request_id
+        self.quantity_satisfied = False
         self.strikes_sent = 0
         self.journal = None
         self.desktop = None
@@ -69,12 +72,24 @@ class DarumaRunner:
                 if self.journal.data['status'] == 'new' and page not in ('ready', 'playing', 'over', 'weekend'):
                     raise Pending('请先打开指定账号的达摩挑战页或周末福利达摩页')
                 self.journal.save(status='running', day=day, reason='')
+                if self.round_limit is not None:
+                    if type(self.round_limit) is not int or self.round_limit < 1 or not self.quantity_request_id:
+                        raise Pending('达摩数量请求无效，未消耗新机会')
+                    requests = dict(self.journal.data.get('quantity_requests', {}))
+                    requests.setdefault(self.quantity_request_id, dict(
+                        base_round=max(0,int(self.journal.data.get('round',0))
+                                       -int(bool(self.journal.data.get('round_active')))), limit=self.round_limit))
+                    self.journal.save(quantity_requests=requests)
                 if page == 'ready' and not self.journal.data.get('intent'):
                     self.journal.save(reward_checked_for_start=False)
                 self.journal.evidence(frame, 'bound')
                 self.emit('bound', hwnd=self.hwnd, tab_x=desktop.binding['tab_x'],
                           binding_key=desktop.binding['key'], checkpoint=str(self.journal.path))
                 self.drive()
+                if self.quantity_satisfied:
+                    return dict(status='request_satisfied', reason='本次修行录完整局数已满足，日常剩余奖励保持实读',
+                                checkpoint=str(self.journal.path), content_clicks=desktop.content_clicks,
+                                quantity_request_id=self.quantity_request_id)
                 return dict(status='done', reason='剩余奖励已正向核实为0，停留活动界面',
                             checkpoint=str(self.journal.path), content_clicks=desktop.content_clicks)
         except (Pending, KeyboardInterrupt) as exc:
@@ -260,6 +275,13 @@ class DarumaRunner:
         self.reconcile()
         if self.journal.data['status'] == 'done' and self.journal.data.get('zero_verified'):
             return
+        if (self.round_limit is not None and self._quantity_met()
+                and not self.journal.data.get('intent') and not self.journal.data.get('round_active')):
+            self.open_activity()
+            self.stable_reward()
+            self.quantity_satisfied = True
+            self.progress('request_satisfied',status='pending',round_active=False)
+            return
         self.refresh_calibration()
         while True:
             self.desktop.check_stop()
@@ -292,6 +314,12 @@ class DarumaRunner:
                               result_evidence=self.journal.evidence(frame, 'game_over'),
                               round_results=results, remaining_estimate=allowance, reward_needs_check=True,
                               six_icons_verified=count == 6, game_over_verified=True)
+                if self.round_limit is not None and self._quantity_met():
+                    self.open_activity()
+                    self.stable_reward()
+                    self.quantity_satisfied = True
+                    self.progress('request_satisfied', status='pending', round_active=False)
+                    return
                 if chance > 0 and allowance is not None and allowance > 0:
                     self.progress('restart_round')
                     self.start_round()
@@ -317,6 +345,13 @@ class DarumaRunner:
             self.click_template('daruma_go.bmp', (1190, 635, 1330, 710), (47, 18),
                                 ('weekend',), ('ready',), 'go_game')
             self.progress('ready', reward_checked_for_start=True, round_active=False)
+
+    def _quantity_met(self):
+        request = self.journal.data.get('quantity_requests', {}).get(self.quantity_request_id, {})
+        base = request.get('base_round')
+        limit = request.get('limit')
+        if type(base) is not int or type(limit) is not int:return False
+        return sum(result.get('round', 0) > base for result in self.journal.data.get('round_results', [])) >= limit
 
     def round_allowance(self, results=None):
         rec = self.journal.data

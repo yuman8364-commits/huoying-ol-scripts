@@ -29,7 +29,7 @@ def clean_config(text):
         if key == 'AllowMarketPurchase': line = 'AllowMarketPurchase=0'
         if key == 'MarketDirectBuyVerified': line = 'MarketDirectBuyVerified=0'
         lines.append(line)
-    updates = dict(AccountDiscovery='automatic',HistoricalPendingPolicy='isolate_inactive',
+    updates = dict(AccountDiscovery='automatic',PortableAccounts='1',HistoricalPendingPolicy='isolate_inactive',
                    SharedStateDirectory=r'%LOCALAPPDATA%\HYOLClient\state',
                    AllowMarketPurchase='0',MarketDirectBuyVerified='0')
     lines = [line for line in lines if line.split('=',1)[0].strip() not in updates]

@@ -47,6 +47,13 @@ class BattleWatchdog:
         if not isinstance(frame, Image.Image):
             return None
         w, h = frame.size
+        if mode=='training_record':
+            # The document occupies the center. World/chat animation cannot
+            # mask a frozen document, and real scrolling/reward changes count.
+            roi=(450,275,1358,705)
+            box=tuple(round(v*(w/1920 if index%2==0 else h/1032)) for index,v in enumerate(roi))
+            return np.asarray(frame.crop(box).convert('L').resize(
+                (96,48),Image.Resampling.BILINEAR),dtype=np.int16).ravel().copy()
         box = (round(w * .14), round(h * .21), round(w * .86), round(h * .77))
         sampled = np.asarray(frame.crop(box).convert('L').resize(
             (96, 48), Image.Resampling.BILINEAR), dtype=np.int16).copy()

@@ -11,6 +11,7 @@ from tkinter import ttk
 import hyol_scheduler as hs
 from hyol_runtime import RuntimeController, RunRequest, VERSION
 from hyol_progress_view import ProgressView
+from hyol_task_progress import mail_cleanup_required
 from hyol_daily_tasks import SOLO_OPTIONS, DEFAULT_SOLO_OPTIONS
 from hyol_team_six import TASKS as TEAM_TASKS, DEFAULT_TASKS, TASK_LABELS as TEAM_LABELS
 from hyol_team_pipeline import TEAM_TASKS as PIPELINE_DEFAULTS, SUPPORTED_TEAM_TASKS
@@ -19,7 +20,12 @@ SOLO_LABELS = {'mail': '邮件', 'welfare': '在线福利', 'ranking': '排位�
                'survival': '生存演习', 'quiz': '忍者测验', 'arena': '竞技场',
                'weekend': '周末（拼图＋达摩）', 'treasure': '挖宝（每号5分钟）'}
 SOLO_LABELS['daruma'] = '达摩'
+SOLO_LABELS['puzzle'] = '忍者拼图（三难度）'
+SOLO_LABELS['training_record'] = '修行录目标'
+SOLO_LABELS['escort'] = '押镖（两次点券＋一次铜币）'
+SOLO_LABELS['anniversary'] = '周年庆签到'
 INDEPENDENT = {'竞技场': 'arena', '羁绊': 'bond', '周末任务': 'weekend', '挖宝（5分钟）': 'treasure'}
+INDEPENDENT.update({'忍者拼图（全部账号）':'puzzle','修行录目标（全部账号）':'training_record'})
 EVENT_LABELS = {'daily_task_started': '任务开始', 'daily_task_complete': '任务与回村已确认',
                 'daily_task_pending': '任务待处理', 'generic_team_task_started': '组队任务开始',
                 'generic_team_task_done': '全队任务已确认', 'generic_team_task_pending': '组队任务待处理',
@@ -57,9 +63,23 @@ EVENT_LABELS.update(pipeline_team_tick='轮换队长', pipeline_team_pending='�
 EVENT_LABELS['pipeline_task_not_open'] = '当前不在开放时间，继续下一项'
 EVENT_LABELS['pipeline_reformed_teams'] = '先执行当前已组好的队伍'
 EVENT_LABELS['pipeline_group_remaining'] = '继续多人副本'
+EVENT_LABELS.update(pipeline_member_auto_verified='该账号自动战斗已确认',
+                    pipeline_all_members_checked='全员已检查，已结束场次单独记录',
+                    pipeline_wanted_observation_deferred='通缉降频，优先其他队伍',
+                    pipeline_wanted_observation_resumed='恢复通缉检查',
+                    pipeline_all_members_auto_verified='全队自动战斗已确认',
+                    pipeline_leader_x2_verified='队长二倍速已确认',
+                    pipeline_duo_warning_confirmed='已勾选不再提示，二人队继续',
+                    pipeline_bond_complete='所选羁绊场次与退出已确认',
+                    pipeline_team_released='羁绊已退出，恢复单人状态')
 EVENT_LABELS['pipeline_round_started'] = '两队开始本轮'
 EVENT_LABELS['pipeline_round_focus'] = '固定检查当前队伍'
 EVENT_LABELS['pipeline_round_completed'] = '两队本轮已完成'
+EVENT_LABELS['mail_backpack_full'] = '邮件附件未领：普通背包已满，需清理'
+EVENT_LABELS.update(training_supported_task_started='优先完成修行录中的已有任务',
+                    training_goals_rechecked='修行录目标已复查',training_task_preserved='保留本轮已完成任务',
+                    training_rewards_cleared='修行录奖励已领完并复扫',training_plan_detected='已更新本号日常计划')
+EVENT_LABELS['training_account_pending'] = '本号保留待核实，其他可用账号继续'
 
 
 def format_task_event(event, mode):
@@ -88,11 +108,19 @@ class UnifiedClient(tk.Tk):
         self.arena_use_win_target = tk.BooleanVar(value=False)
         self.formation = tk.StringVar(value='保持不变')
         self.bond_count = tk.StringVar(value='5')
+        self.bond_target_mode = tk.StringVar(value='固定场数')
+        self.bond_kill_target = tk.StringVar(value='160')
+        self.bond_score_target = tk.StringVar(value='100')
+        self.bond_team_modes = {i:tk.StringVar(value='沿用默认') for i in range(3)}
+        self.bond_team_targets = {i:tk.StringVar(value='100') for i in range(3)}
         self.new_bond_round = tk.BooleanVar(value=False)
+        self.bond_stop_mode = tk.StringVar(value='打5次')
         self.leader = tk.StringVar(value='1')
         self.team_mode = tk.StringVar(value='自动建队')
-        self.pipeline_leaders = (tk.StringVar(value='1'),tk.StringVar(value='6'))
+        self.pipeline_leaders = (tk.StringVar(value='1'),tk.StringVar(value='3'),tk.StringVar(value='不选'))
+        self.preformed_members = (tk.StringVar(value='2'),tk.StringVar(value='4'),tk.StringVar(value='6'))
         self.pipeline_auto = tk.BooleanVar(value=True)
+        self.preformed_duos = tk.BooleanVar(value=False)
         self.pipeline_task_vars = {t:tk.BooleanVar(value=t in PIPELINE_DEFAULTS) for t in SUPPORTED_TEAM_TASKS}
         self.friend_shortcut = tk.BooleanVar(value=False)
         self.member_vars = {index: tk.BooleanVar(value=index in (2, 3)) for index in range(1, 7)}
@@ -261,9 +289,9 @@ class UnifiedClient(tk.Tk):
         line.pack(fill='x')
         self.pipeline_leader_controls = []
         for i, variable in enumerate(self.pipeline_leaders, 1):
-            ttk.Label(line, text=f'第{i}队队长'+('（可不选）' if i == 2 else '')).pack(side='left')
+            ttk.Label(line, text=f'第{i}队队长'+('（可不选）' if i > 1 else '')).pack(side='left')
             values = tuple(str(n) for n in range(1, 7))
-            control = ttk.Combobox(line, values=(('不选',) + values if i == 2 else values),
+            control = ttk.Combobox(line, values=(('不选',) + values if i > 1 else values),
                                    state='readonly', width=4, textvariable=variable)
             control.pack(side='left', padx=(6, 12))
             self.pipeline_leader_controls.append(control)
@@ -274,10 +302,19 @@ class UnifiedClient(tk.Tk):
         self.detect_leaders_button.pack(side='left')
         line = ttk.Frame(self.pipeline_box)
         line.pack(fill='x', pady=8)
+        ttk.Checkbutton(line, text='已组好二人队，按队长和下方队员标签直接执行',
+                        variable=self.preformed_duos).pack(anchor='w')
+        pair_line=ttk.Frame(self.pipeline_box)
+        pair_line.pack(fill='x',pady=4)
+        for index,variable in enumerate(self.preformed_members):
+            ttk.Label(pair_line,text=f'第{index+1}队队员').pack(side='left')
+            ttk.Combobox(pair_line,values=tuple(map(str,range(1,7))),state='readonly',
+                         textvariable=variable,width=4).pack(side='left',padx=(5,12))
         for task, variable in self.pipeline_task_vars.items():
-            ttk.Checkbutton(line, text=TEAM_LABELS[task], variable=variable).pack(side='left', padx=(0, 12))
+            ttk.Checkbutton(line, text=TEAM_LABELS.get(task, '多人完成后羁绊（仅二人）'), variable=variable,
+                            command=self._refresh_task_settings).pack(side='left', padx=(0, 12))
         ttk.Label(self.pipeline_box,
-                  text='只操作已核实队长。两队先开战，再依次等待结算；两队完成后才进入下一轮。',
+                  text='支持三支二人队轮换。多人完成后可打羁绊；现成二人队直接执行，全部场次结束才退出，退出即单人。',
                   style='Muted.TLabel', wraplength=560).pack(anchor='w')
         next_tasks = ttk.LabelFrame(self.pipeline_box, text='解散后执行的单人任务', padding=7)
         next_tasks.pack(fill='x', pady=(8, 0))
@@ -297,7 +334,7 @@ class UnifiedClient(tk.Tk):
         self.independent_combo.bind('<<ComboboxSelected>>',
                                     lambda _event: self._refresh_task_settings())
         ttk.Label(independent_box,
-                  text='下方设置会随所选任务变化；只显示当前任务实际支持的参数。',
+                  text='独立任务仅支持当前一个游戏窗口。羁绊请先手动进入准备页，目标可选一直打、打5次、5场胜利；不领取宝箱。',
                   style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(8, 0))
 
         self.task_settings_frame = ttk.LabelFrame(left, text='独立任务设置', padding=10)
@@ -398,16 +435,29 @@ class UnifiedClient(tk.Tk):
         leaders = (tuple(int(v.get()) for v in self.pipeline_leaders if v.get() != '不选')
                    if mode == 'team_then_multi' and not self.pipeline_auto.get() else ())
         return RunRequest(mode=mode, tasks=tuple(task for task, variable in self.task_vars.items() if variable.get()),
-                          account_count=6 if mode == 'team_then_multi' else int(self.account_count.get()),
+                          account_count=1 if selected == 2 else 6 if mode == 'team_then_multi' else int(self.account_count.get()),
                           arena_wins=int(self.arena_wins.get()),
                           arena_target_mode='wins' if self.arena_use_win_target.get() else 'tickets',
                           formation={'保持不变':'keep', '主力阵容':'main', '速刷阵容':'fast'}[self.formation.get()],
                           leader=int(self.leader.get()), members=tuple(index for index, variable in self.member_vars.items() if variable.get()),
                           leaders=leaders,
+                          preformed_duos=mode == 'team_then_multi' and self.preformed_duos.get(),
+                          preformed_pairs=(tuple((int(leader.get()),int(self.preformed_members[index].get()))
+                                                   for index,leader in enumerate(self.pipeline_leaders) if leader.get()!='不选')
+                                           if mode=='team_then_multi' and self.preformed_duos.get() and not self.pipeline_auto.get() else ()),
                           friend_shortcut=self.friend_shortcut.get(),
                           team_tasks=tuple(task for task, variable in (self.pipeline_task_vars if mode == 'team_then_multi' else self.team_vars).items() if variable.get()),
-                          bond_count=int(self.bond_count.get()), new_bond_round=mode == 'bond' and self.new_bond_round.get(),
-                          final_managed=self.final_managed.get())
+                          bond_count=5 if mode == 'bond' else int(self.bond_count.get()),
+                          bond_stop_mode=({'一直打':'endless','打5次':'battles','5场胜利':'wins'}[self.bond_stop_mode.get()] if mode == 'bond' else 'battles'),
+                          new_bond_round=mode == 'bond' and self.new_bond_round.get(),
+                          bond_target_mode=({'固定场数':'battles','击杀数达标':'kills','积分降到指定值':'score'}[self.bond_target_mode.get()]
+                                            if mode == 'team_then_multi' else 'battles'),
+                          bond_kill_target=int(self.bond_kill_target.get()), bond_score_target=int(self.bond_score_target.get()),
+                          bond_team_goals=(tuple((int(self.pipeline_leaders[i].get()),{'固定场数':'battles','击杀数达标':'kills','积分降到指定值':'score'}[v.get()],
+                                                 int(self.bond_team_targets[i].get()))
+                                                for i,v in self.bond_team_modes.items() if v.get() != '沿用默认' and self.pipeline_leaders[i].get()!='不选')
+                                           if mode == 'team_then_multi' else ()),
+                          final_managed=mode != 'bond' and self.final_managed.get())
 
     def _show_page(self, page):
         self.tabs.select(page)
@@ -440,10 +490,12 @@ class UnifiedClient(tk.Tk):
             codes = ()
         else:
             codes = tuple(task for task, variable in self.task_vars.items() if variable.get())
+            if page == 1 and self.pipeline_task_vars['bond'].get():
+                codes = (*codes, 'bond')
         self.current_setting_codes = tuple(codes)
         row = 0
         if 'arena' in codes:
-            arena_box = ttk.LabelFrame(self.task_specific_box, text='竞技场', padding=7)
+            arena_box = ttk.LabelFrame(self.task_specific_box, text='竞技场（按实际战令或所选目标结束）', padding=7)
             arena_box.grid(row=row, column=0, sticky='ew', pady=(0, 5))
             self.task_specific_box.columnconfigure(0, weight=1)
             ttk.Label(arena_box, text='结束条件').pack(side='left', padx=(0, 8))
@@ -464,16 +516,35 @@ class UnifiedClient(tk.Tk):
         if 'bond' in codes:
             bond_box = ttk.Frame(self.task_specific_box)
             bond_box.grid(row=row, column=0, sticky='w', pady=(0, 5))
-            ttk.Label(bond_box, text='羁绊场数').pack(side='left')
-            self.bond_count_control = ttk.Spinbox(
-                bond_box, from_=1, to=99, width=5, textvariable=self.bond_count)
+            ttk.Label(bond_box, text='羁绊目标' if page == 2 else '羁绊场数').pack(side='left')
+            self.bond_count_control = (ttk.Combobox(bond_box, values=('一直打','打5次','5场胜利'),
+                state='readonly', width=12, textvariable=self.bond_stop_mode) if page == 2 else ttk.Spinbox(
+                bond_box, from_=1, to=99, width=5, textvariable=self.bond_count))
             self.bond_count_control.pack(side='left', padx=8)
             self.new_bond_round_control = ttk.Checkbutton(
                 bond_box, text='开始新一轮羁绊', variable=self.new_bond_round)
             self.new_bond_round_control.pack(side='left', padx=8)
             row += 1
+            if page == 1:
+                goals = ttk.Frame(self.task_specific_box)
+                goals.grid(row=row, column=0, sticky='w', pady=(0,5))
+                ttk.Label(goals, text='羁绊默认结束条件').grid(row=0,column=0,sticky='w')
+                ttk.Combobox(goals, values=('固定场数','击杀数达标','积分降到指定值'), state='readonly',
+                             textvariable=self.bond_target_mode, width=17).grid(row=0,column=1,padx=8)
+                ttk.Label(goals,text='击杀宝箱领取至（打满160人档）').grid(row=1,column=0,sticky='w')
+                ttk.Spinbox(goals,from_=0,to=999,textvariable=self.bond_kill_target,width=6).grid(row=1,column=1,sticky='w',padx=8)
+                ttk.Label(goals,text='积分降至此值及以下').grid(row=2,column=0,sticky='w')
+                ttk.Spinbox(goals,from_=0,to=99999,textvariable=self.bond_score_target,width=6).grid(row=2,column=1,sticky='w',padx=8)
+                for n,i in enumerate(range(3),3):
+                    ttk.Label(goals,text=f'第{i+1}队单队目标').grid(row=n,column=0,sticky='w')
+                    ttk.Combobox(goals,values=('沿用默认','固定场数','击杀数达标','积分降到指定值'),state='readonly',
+                        textvariable=self.bond_team_modes[i],width=17).grid(row=n,column=1,padx=8)
+                    ttk.Spinbox(goals,from_=0,to=99999,textvariable=self.bond_team_targets[i],width=6).grid(row=n,column=2)
+                row += 1
         for code, message in (
                 ('weekend', '周末任务：拼图三难度＋达摩；仅在活动开放日执行。'),
+                ('puzzle', '忍者拼图：逐账号完成简单、普通、困难并核实领奖；每日05:00刷新。'),
+                ('training_record', '修行录：先领完奖励，再复扫缺项并定制各账号日常，每完成一项重新领取和计算。'),
                 ('treasure', '挖宝：每账号固定 5 分钟，到时自动暂停并回村。'),
                 ('daruma', '达摩：自动执行至奖励次数核实归零。'),
                 ('quiz', '忍者测验：沿用现有规则，不增加额外参数。'),
@@ -520,7 +591,7 @@ class UnifiedClient(tk.Tk):
             return ()
         if request.mode in ('solo', 'multi', 'team_then_multi'):
             codes = list(request.tasks)
-        elif request.mode in ('arena', 'weekend', 'treasure'):
+        elif request.mode in ('arena', 'weekend', 'treasure','puzzle','training_record'):
             codes = [request.mode]
         elif request.mode == 'bond':
             codes = []
@@ -541,7 +612,7 @@ class UnifiedClient(tk.Tk):
                 for item in current:
                     self.account_tree.delete(item)
                 request = self.active_request
-                if request is not None and request.mode in ('solo', 'arena', 'bond', 'weekend', 'treasure'):
+                if request is not None and request.mode in ('solo', 'arena', 'bond', 'weekend', 'treasure','puzzle','training_record'):
                     task_codes = [code for code in self._active_task_codes() if code != 'managed']
                     task_label = ('羁绊' if request.mode == 'bond' else
                                   SOLO_LABELS.get(task_codes[0], task_codes[0])
@@ -569,7 +640,7 @@ class UnifiedClient(tk.Tk):
                 if not index:
                     continue
                 account = str(row.get('account') or row.get('label') or f'账号{index}')
-                if account.startswith('当前窗口标签'):
+                if account.startswith('当前窗口标签') or (account.startswith('account_') and len(account)==40):
                     account = str(row.get('label') or f'标签{index}')
                 task_rows = row.get('tasks', {})
                 relevant = [(task, task_rows.get(task, {})) for task in selected if task in task_rows]
@@ -584,6 +655,9 @@ class UnifiedClient(tk.Tk):
                 elif health == '身份待核实':
                     status = '待核验'
                     task_label = '—'
+                elif 'mail' in selected and mail_cleanup_required(task_rows.get('mail', {})):
+                    status = '背包满需清理'
+                    task_label = 'mail'
                 elif pending:
                     status = '待处理'
                     task_label = pending[0]
@@ -656,7 +730,8 @@ class UnifiedClient(tk.Tk):
             request = self.request()
             if self.controller.start(request):
                 self.new_bond_round.set(False)
-                self.progress_view.set_run(self.controller.identifier)
+                self._active_run_id = self.controller.identifier
+                self.progress_view.set_run(self._active_run_id)
                 self.active_request = request
                 self._refresh_account_list()
                 self.log.configure(state='normal')
@@ -696,7 +771,14 @@ class UnifiedClient(tk.Tk):
             while True:
                 event = self.events.get_nowait()
                 name = event.get('event', '')
-                if name.startswith('unified_') and event.get('run_id') != self.controller.identifier:
+                if name == 'unified_run_started':
+                    # A resumed training run rebinds the identifier inside the
+                    # worker; the event carries the authoritative run id.
+                    active = str(event.get('run_id') or self.controller.identifier or '')
+                    if active and active != getattr(self, '_active_run_id', None):
+                        self._active_run_id = active
+                        self.progress_view.set_run(active)
+                elif name.startswith('unified_') and event.get('run_id') != getattr(self, '_active_run_id', None):
                     continue
                 if name == 'unified_idle':
                     for button in (self.start_button, self.check_button):
@@ -737,7 +819,10 @@ class UnifiedClient(tk.Tk):
                         self.status.set(format_task_event(event, self.active_mode))
         except queue.Empty:
             pass
-        self.after(150, self._drain)
+        finally:
+            # One unexpected event handler error must not permanently freeze
+            # the whole UI event pump.
+            self.after(150, self._drain)
 
     def _open_logs(self):
         path = self.root_path/'logs'
@@ -751,5 +836,21 @@ class UnifiedClient(tk.Tk):
         self.destroy()
 
 
+def main():
+    import argparse
+    parser=argparse.ArgumentParser(description='火影OL完整客户端')
+    parser.add_argument('--task',choices=('puzzle','training_record'))
+    parser.add_argument('--account-count',type=int,choices=range(1,7),default=6)
+    parser.add_argument('--start',action='store_true',help='直接开始指定任务')
+    args=parser.parse_args()
+    app=UnifiedClient()
+    if args.task:
+        app.independent.set(next(label for label,code in INDEPENDENT.items() if code==args.task))
+        app.account_count.set(str(args.account_count))
+        app.tabs.select(2);app._on_page_changed()
+        if args.start:app.after(750,app._start)
+    app.mainloop()
+
+
 if __name__ == '__main__':
-    UnifiedClient().mainloop()
+    main()

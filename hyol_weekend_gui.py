@@ -6,7 +6,6 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-import hyol_scheduler as hs
 from hyol_daily_tasks import DailyRunner
 from hyol_weekend import is_weekend
 from tools.preflight_live import run as preflight_live

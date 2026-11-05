@@ -32,6 +32,8 @@ class RunContext:
     pid: int = 0
     rebind_count: int = 0
     probing: bool = False
+    execution_day: str | None = None
+    preserve_activity_notices: bool = False
 
     @classmethod
     def create(cls, root, config=None, **kwargs):
@@ -79,7 +81,8 @@ class RunContext:
 
     def remember(self, centers, mapping, observations, frames, refs, unavailable):
         self.binding = dict(centers=tuple(centers), mapping=dict(mapping),
-                            masks={slot:rows[-1] for slot,rows in observations.items()},
+                            observations={slot:tuple(rows) for slot,rows in observations.items() if slot in mapping},
+                            masks={slot:rows[-1] for slot,rows in observations.items() if slot in mapping},
                             frames=dict(frames), refs=refs, unavailable=dict(unavailable))
 
     def adopt_solo(self, scheduler):
@@ -91,7 +94,8 @@ class RunContext:
             raise hs.PendingError('本轮尚未完成账号识别')
         scheduler.accounts = [hs.Account(i,key,row['centers'][i-1]) for i,key in sorted(row['mapping'].items())]
         scheduler.by_name = {a.name:a for a in scheduler.accounts}
-        scheduler.state = hs.StateStore(list(scheduler.by_name), directory=self.directory, restore_history=False)
+        scheduler.state = hs.StateStore(list(scheduler.by_name), directory=self.directory, restore_history=False,
+                                       execution_day=self.execution_day)
         scheduler.available_account_names = set(scheduler.by_name)
         scheduler.joint_identity_bound = set(scheduler.by_name)
         scheduler._dynamic_identity_materials = row['refs']
@@ -107,6 +111,45 @@ class RunContext:
         scheduler.active = None
         scheduler.event('dynamic_accounts_bound', mapping=row['mapping'], unavailable=row['unavailable'],
                         reused=True, observations=0, content_clicks=0)
+
+    def adopt_prepared_current(self, scheduler, frame):
+        """Reuse this Start's prepared role after a fresh, fail-closed check."""
+        import hyol_scheduler as hs
+        from hyol_navigation import LEAF_NAME_ROI, preparation_blocked
+        from hyol_checkpoints import current_identity_mask, guard_legacy_local_unresolved
+        row = self.binding
+        if not row or row.get('prepared_leaf_verified') is not True or len(row['mapping']) != 1:
+            raise hs.PendingError('当前账号的准备结果不完整，未启动任务')
+        self.check_window(scheduler)
+        slot, owner = next(iter(row['mapping'].items()))
+        if not self.layout_matches(frame):
+            raise hs.PendingError('准备后的浏览器标签布局已变化，未启动任务')
+        # The new runner still has the INI's historical tab positions here.
+        # Measure selection against this Start's freshly verified layout,
+        # just as preparation did, before comparing exact tab coordinates.
+        scheduler.config['TabXs'] = ','.join(map(str, row['centers']))
+        if (scheduler._generic_active_tab_x(frame) != row['centers'][slot - 1]
+                or scheduler.offline_dialog_visible(frame)
+                or not scheduler.healthy(frame)
+                or not scheduler.main_ready(frame)
+                or preparation_blocked(scheduler, frame)
+                or not scheduler.template('leaf_village_name_current.bmp', LEAF_NAME_ROI,
+                                          frame, threshold=.92)[0]):
+            raise hs.PendingError('准备后的当前标签或木叶主界面已变化，未启动任务')
+        self.adopt_solo(scheduler)
+        account = scheduler.by_name[owner]
+        if not scheduler.verify_identity(account, frame)[0]:
+            raise hs.PendingError('准备后的账号身份已变化或不明确，未启动任务')
+        scheduler.current_account_only = account.name
+        scheduler.generic_current_tab_x = account.tab_x
+        scheduler.active = account
+        scheduler._capture_account = account
+        scheduler._capture_binding_probe = False
+        scheduler._verified_current_mask = current_identity_mask(frame, scheduler.templates)
+        guard_legacy_local_unresolved(scheduler)
+        scheduler.event('prepared_current_identity_reused', account, observations=1,
+                        tab_clicks=0, detail='复用本次准备的身份，已用当前画面重新核实')
+        return account
 
     @staticmethod
     def resolve(scheduler, account):
@@ -215,21 +258,55 @@ class RunContext:
                     'map_loading_path_current.bmp','map_loading_npc_path_current.bmp',
                     'map_loading_finished_current.bmp')))
 
-    def select(self, scheduler, account, *, allow_hidden=False, allow_transition=False):
+    def hidden_identity_observation(self, scheduler, account, frame):
+        """A bound title permits observation only while the role strip is hidden."""
+        import numpy as np
+        import hyol_scheduler as hs
+        from hyol_checkpoints import current_identity_mask
+        row = self.binding
+        if row is None or account.tab_x not in row['centers']:
+            return False
+        slot = row['centers'].index(account.tab_x) + 1
+        owner = scheduler.state.aliases.get(account.name, account.name)
+        if row['mapping'].get(slot) != owner:
+            return False
+        if int(current_identity_mask(frame, scheduler.templates).sum()) >= 50:
+            return False
+        reference = row['frames'].get(slot)
+        if reference is None:
+            return False
+
+        def title_mask(image):
+            patch = image.crop((account.tab_x-48, 5, account.tab_x+24, 30)).convert('L')
+            return (np.asarray(patch) < 105).astype(np.uint8)
+
+        left, right = title_mask(reference), title_mask(frame)
+        return np.array_equal(left, right) or hs.mask_f1(left, right) >= .70
+
+    def select(self, scheduler, account, *, allow_hidden=False, allow_transition=False, combat_mode=None):
         prior = getattr(scheduler,'_capture_account',None)
         scheduler._capture_account = self.resolve(scheduler,account)
         try:
-            return self._select(scheduler,account,allow_hidden=allow_hidden,allow_transition=allow_transition)
+            return self._select(scheduler,account,allow_hidden=allow_hidden,
+                                allow_transition=allow_transition,combat_mode=combat_mode)
         finally:
             scheduler._capture_account = prior
 
-    def _select(self, scheduler, account, *, allow_hidden=False, allow_transition=False):
+    def _select(self, scheduler, account, *, allow_hidden=False, allow_transition=False, combat_mode=None):
         """One selected-tab observation, with fresh frames for redraws and actual switches."""
         import hyol_scheduler as hs
         from hyol_checkpoints import current_identity_mask, identity_mask_scores
         account = self.resolve(scheduler,account)
         scheduler.check_stop()
-        frame = scheduler.capture()
+        try:
+            frame = scheduler.capture()
+        except hs.SafetyError as exc:
+            if str(exc) != 'game content surface is ambiguous: 0 visible regions':
+                raise
+            # The last discovered tab may be empty. Its guarded browser frame
+            # permits selecting an existing mapped title only; a fresh content
+            # capture and role identity are still required after the switch.
+            frame = scheduler._blank_browser_chrome_frame()
         if not self.layout_matches(frame):
             frame = self.stable_layout_frame(scheduler,frame)
             account = self.resolve(scheduler,account)
@@ -253,26 +330,30 @@ class RunContext:
                 raise hs.AccountOffline(account,'当前标签已掉线')
             if not self.layout_matches(frame):
                 self.stable_layout_frame(scheduler,frame)
-                return self.select(scheduler,account,allow_hidden=allow_hidden,allow_transition=allow_transition)
+                return self.select(scheduler,account,allow_hidden=allow_hidden,
+                                   allow_transition=allow_transition,combat_mode=combat_mode)
             if scheduler.healthy(frame) and scheduler.verify_identity(account,frame)[0]:
                 scheduler.active = account
                 scheduler.event('account_bound',account,tab_click_suppressed=selected)
                 return frame
+            if (combat_mode in ('arena','ranking','survival')
+                    and scheduler._generic_active_tab_x(frame) == account.tab_x
+                    and self.hidden_identity_observation(scheduler,account,frame)
+                    and scheduler._combat_ready_visible(combat_mode,frame)):
+                scheduler.active = account
+                scheduler.event('account_observation_bound',account,content_authorized=False,
+                                phase='combat_ready',mode=combat_mode)
+                return frame
             if allow_transition and scheduler._generic_active_tab_x(frame) == account.tab_x:
-                _role_ok, _scores, visible = scheduler._bound_role_verified(account,frame)
-                reference = scheduler._tab_title_masks.get(account.index)
-                if (not visible and reference is not None
-                        and hs.mask_f1(reference,scheduler._title_mask(frame,account.tab_x)) >= .70
+                if (self.hidden_identity_observation(scheduler,account,frame)
                         and self.loading_scene_visible(scheduler,frame)):
                     scheduler.active = account
                     scheduler.event('account_observation_bound',account,
                                     content_authorized=False,phase='map_loading')
                     return frame
             if allow_hidden and scheduler._generic_active_tab_x(frame) == account.tab_x:
-                role_ok, _scores, visible = scheduler._bound_role_verified(account,frame)
-                reference = scheduler._tab_title_masks.get(account.index)
-                if (not visible and reference is not None
-                        and hs.mask_f1(reference,scheduler._title_mask(frame,account.tab_x)) >= .70):
+                bond_observed = (getattr(scheduler,'bond_observation_owned',lambda *_args:False)(account,frame) is True)
+                if self.hidden_identity_observation(scheduler,account,frame) or bond_observed:
                     # Observation of our running battle is allowed. Content inputs still
                     # require content_guard's fresh identity/positive page-anchor checks.
                     scheduler.active = account
@@ -287,6 +368,7 @@ class RunContext:
         best = max(scores,key=scores.get,default=None)
         if best is not None and best != owner and scores[best] >= .92 and self.rebind_count == 0:
             self.rebuild(scheduler)
-            return self.select(scheduler,account,allow_hidden=allow_hidden,allow_transition=allow_transition)
+            return self.select(scheduler,account,allow_hidden=allow_hidden,
+                               allow_transition=allow_transition,combat_mode=combat_mode)
         evidence = scheduler.save_raw_evidence(frame,account,'current_run_identity','pending')
         raise hs.PendingError(f'当前标签身份或页面未稳定确认：{evidence}')

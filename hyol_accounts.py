@@ -8,6 +8,7 @@ import uuid
 import ctypes
 import time
 import hashlib
+import itertools
 
 import numpy as np
 
@@ -28,6 +29,21 @@ def state_directory(config, root, *, environ=None):
     return (Path(local)/'HYOLClient'/'state' if local else Path(root)/'state').resolve()
 
 
+def identity_registry_path(scheduler):
+    """Portable runs own their observations; never open a machine's role library."""
+    if not getattr(scheduler, 'portable_accounts', False):
+        return getattr(scheduler, 'identity_directory', scheduler.shared_state_directory)/'account_identities.json'
+    context = getattr(scheduler, 'run_context', None)
+    if context is not None:
+        return context.directory/'account_identities.json'
+    directory = getattr(scheduler, '_portable_identity_directory', None)
+    if directory is None:
+        identifier = getattr(getattr(scheduler, 'diagnostics', None), 'identifier', None) or uuid.uuid4().hex
+        directory = Path(scheduler.shared_state_directory)/'runs'/identifier
+        scheduler._portable_identity_directory = directory
+    return Path(directory)/'account_identities.json'
+
+
 def game_session_token(scheduler):
     import hyol_scheduler as hs
     pid = hs.Win32.pid(scheduler.hwnd)
@@ -45,7 +61,13 @@ def game_session_token(scheduler):
 
 
 def session_is_alive(token):
-    """A reused PID or HWND is a different session; unverifiable input fails closed."""
+    """A reused PID or HWND is a different session; unverifiable input fails closed.
+
+    True strictly means "no reuse evidence was found" — never "verified same
+    session". Callers must not treat True as an authorization signal; the only
+    current caller (history archiving) uses True to keep unknown results
+    pending, which is the conservative direction.
+    """
     import hyol_scheduler as hs
     try:
         pid_text, hwnd_text, creation = token.split(':')
@@ -77,7 +99,8 @@ def resolve_observations(observations, identities, *, id_factory=None):
         return {}, refs
     for slot, masks in observations.items():
         if (len(masks) < 3 or min(int(mask.sum()) for mask in masks) < 50
-                or any(hs.mask_f1(masks[0], mask) < .92 for mask in masks[1:])):
+                or any(hs.mask_f1(first, second) < .92
+                       for first, second in itertools.combinations(masks, 2))):
             raise hs.PendingError(f'第{slot}个标签的身份特征未连续三帧确认')
         scores = [identity_mask_scores(mask, refs) for mask in masks]
         if all(max(row.values(), default=0) < .92 for row in scores):
@@ -92,11 +115,70 @@ def resolve_observations(observations, identities, *, id_factory=None):
             refs[key] = dict(mask=encode_mask(masks[0]), shape=list(masks[0].shape),
                              account_id=key, display_label=f'账号{len(refs)+1}',
                              origin='automatic_three_frame_observation')
+    # A newly seen role can resemble a role already observed on another tab.
+    # Do not let that occupied candidate suppress enrollment of the new glyphs.
+    # Add a candidate only when every above-floor identity has a different,
+    # unique strongest observation in all three frames. The final assignment
+    # still has to pass the original .92 floor and .08 global ambiguity gap.
+    matrices = [{slot: identity_mask_scores(masks[i], refs)
+                 for slot, masks in observations.items()} for i in range(3)]
+    owners = {}
+    for key in refs:
+        winners = []
+        for matrix in matrices:
+            ranked = sorted(((row[key], slot) for slot, row in matrix.items()), reverse=True)
+            if (ranked[0][0] < .92 or len(ranked) > 1 and ranked[0][0] == ranked[1][0]):
+                break
+            winners.append(ranked[0][1])
+        if len(winners) == 3 and len(set(winners)) == 1:
+            owners[key] = winners[0]
+    additions = []
+    for slot, masks in observations.items():
+        matching = {key for matrix in matrices for key, score in matrix[slot].items() if score >= .92}
+        if matching and all(key in owners and owners[key] != slot for key in matching):
+            unresolved = {key for matrix in matrices for key, score in matrix[slot].items()
+                          if score >= .80 and refs[key].get('has_unresolved_work')}
+            if any(key not in owners or owners[key] == slot for key in unresolved):
+                continue
+            additions.append((slot, masks[0]))
+    for slot, mask in additions:
+        key = id_factory()
+        if key in refs:
+            raise hs.PendingError('新账号标识重复，保留原身份资料')
+        refs[key] = dict(mask=encode_mask(mask), shape=list(mask.shape), account_id=key,
+                         display_label=f'账号{len(refs)+1}', origin='automatic_three_frame_observation')
     assignments = [joint_identity_assignment({slot:masks[i] for slot,masks in observations.items()}, refs)[0]
                    for i in range(3)]
     if not assignments[0] or any(mapping != assignments[0] for mapping in assignments[1:]):
         raise hs.PendingError('账号身份重复或存在歧义，未关联历史断点')
     return assignments[0], refs
+
+
+def resolve_available_observations(observations, identities):
+    """Quarantine ambiguous tabs; never pick one side of a duplicate identity."""
+    import hyol_scheduler as hs
+    successful = []
+    slots = tuple(observations)
+    # At most six tabs: inspect all largest valid subsets, retaining only
+    # identities whose ownership is invariant across every possible subset.
+    for size in range(len(slots) - 1, 0, -1):
+        for chosen in itertools.combinations(slots, size):
+            try:
+                mapping, _refs = resolve_observations({s: observations[s] for s in chosen}, identities)
+            except hs.PendingError:
+                continue
+            successful.append(mapping)
+        if successful:
+            break
+    common = set.intersection(*(set(row) for row in successful)) if successful else set()
+    for slot in tuple(common):
+        owners = {row[slot] if row[slot] in identities else None for row in successful}
+        if len(owners) != 1:
+            common.remove(slot)
+    if not common:
+        raise hs.PendingError('账号身份重复或存在歧义，没有可独立确认的账号')
+    mapping, refs = resolve_observations({s: observations[s] for s in slots if s in common}, identities)
+    return mapping, refs, {s: '账号身份重复或存在歧义，保留本号原断点' for s in slots if s not in mapping}
 
 
 def _has_unresolved_work(directory, key):
@@ -122,6 +204,8 @@ def collect_current_identity(scheduler, account, frame=None):
     for sample in range(5):
         scheduler.check_stop()
         frame = frame if sample == 0 and frame is not None else scheduler.capture()
+        if getattr(frame, '_hyol_chrome_only', False):
+            raise hs.PendingError('当前标签没有可用游戏内容区域；原始浏览器帧不能登记身份')
         if scheduler.offline_dialog_visible(frame):
             raise hs.AccountOffline(account, '当前标签显示掉线弹窗')
         if scheduler._generic_active_tab_x(frame) != account.tab_x:
@@ -129,13 +213,15 @@ def collect_current_identity(scheduler, account, frame=None):
         masks.append(current_identity_mask(frame, scheduler.templates))
         badges.append(is_captain(scheduler, frame))
         if (len(masks) >= 3 and min(int(mask.sum()) for mask in masks[-3:]) >= 50
-                and all(hs.mask_f1(masks[-3],mask) >= .92 for mask in masks[-2:])):
+                and all(hs.mask_f1(first, second) >= .92
+                        for first, second in itertools.combinations(masks[-3:], 2))):
             masks, badges = masks[-3:], badges[-3:]
             break
         if sample < 4:
             scheduler.wait_interruptible(.35)
     if (min(int(mask.sum()) for mask in masks) < 50
-            or any(hs.mask_f1(masks[0], mask) < .92 for mask in masks[1:])):
+            or any(hs.mask_f1(first, second) < .92
+                   for first, second in itertools.combinations(masks, 2))):
         if any(scheduler.template(asset,roi,frame,threshold=.98)[0] for asset,roi in (
                 ('team_result_confirm.bmp',hs.TEAM_BATTLE_RESULT_ROI),
                 ('arena_result_confirm.bmp',(651,449,1151,829)),
@@ -244,7 +330,8 @@ def _reconcile_result_cleanup(scheduler, account, frame):
     return frame
 
 
-def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0):
+def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0,
+                                 allow_reward_confirmation=True):
     """Close a normal member result before its hidden name can be identified.
 
     This is only a UI acknowledgement. Its separate receipt never credits a
@@ -260,6 +347,9 @@ def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0):
     expected = _final_result(scheduler, frame)
     if expected is None:
         return _reconcile_result_cleanup(scheduler,account,frame)
+    if not allow_reward_confirmation and expected[3][0] not in (
+            'arena_victory_banner.bmp', 'arena_defeat_banner.bmp'):
+        raise hs.PendingError('检查仅可关闭明确的胜负提示，领奖或其他结算保留给原任务核实')
     if _layers >= 3:
         raise hs.PendingError('已确认的结算层数超过安全上限，未继续确认')
     title = _tab_title_mask(frame,account.tab_x)
@@ -345,7 +435,8 @@ def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0):
         if following and following[3][0] != expected[3][0]:
             # Arena defeat and strong loot can each paint a second known
             # acknowledgement. Every layer has its own UI receipt, no credit.
-            frame = dismiss_current_final_result(scheduler,account,frame,_layers=_layers+1)
+            frame = dismiss_current_final_result(scheduler,account,frame,_layers=_layers+1,
+                        allow_reward_confirmation=allow_reward_confirmation)
             # The nested reward acknowledgement has its own bounded wait.
             # Give this outer receipt fresh time to observe the returned page.
             deadline = time.monotonic()+12
@@ -363,6 +454,8 @@ def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0):
             if stable == 3:
                 after = str(scheduler.save_raw_evidence(frame, account, 'normal_member_result', 'verified'))
                 receipts = read_checkpoint(path)
+                if receipts.get(identifier) != row:
+                    raise hs.PendingError('结算关闭凭据被并发更新，请重新核实')
                 receipts[identifier] = dict(row, status='done', home_returned=True,
                                              evidence=after, finished_at=hs.now_iso())
                 hs.atomic_json(path, receipts)
@@ -389,12 +482,54 @@ def observe_accounts(scheduler):
             scheduler._capture_binding_probe = prior
 
 
+def _capture_observed_account(scheduler):
+    capture = getattr(scheduler, 'capture_account_observation', None)
+    previous = scheduler.no_content_clicks
+    scheduler.no_content_clicks = True
+    try:
+        return capture() if callable(capture) else scheduler.capture()
+    finally:
+        scheduler.no_content_clicks = previous
+
+
+def _select_observed_account(scheduler, account):
+    previous = scheduler.no_content_clicks
+    scheduler.no_content_clicks = True
+    try:
+        scheduler.chrome_click(account.tab_x, 10, f'observe_account:{account.index}', account)
+    finally:
+        scheduler.no_content_clicks = previous
+
+
+def wait_observed_tab(scheduler, account, frame, expected_markers):
+    """Wait for a stable selected title before collecting any role pixels."""
+    import hyol_scheduler as hs
+    from hyol_multi_solo import tab_close_positions
+    deadline = time.monotonic() + 3
+    stable = 0
+    while True:
+        scheduler.check_stop()
+        if tab_close_positions(frame) != expected_markers:
+            raise hs.PendingError('身份采集前标签布局改变；未注册账号或点击内容')
+        try:
+            selected = scheduler._generic_active_tab_x(frame) == account.tab_x
+        except hs.PendingError:
+            selected = False
+        stable = stable + 1 if selected else 0
+        if stable >= 2:
+            return frame
+        if time.monotonic() >= deadline:
+            raise hs.PendingError('切号后标签高亮未稳定，未采集或注册账号')
+        scheduler.wait_interruptible(.2)
+        frame = _capture_observed_account(scheduler)
+
+
 def _observe_accounts(scheduler):
     import hyol_scheduler as hs
     from hyol_multi_solo import tab_close_positions, active_tab_centers
-    first = tab_close_positions(scheduler.capture())
+    first = tab_close_positions(_capture_observed_account(scheduler))
     scheduler.wait_interruptible(.3)
-    if first != tab_close_positions(scheduler.capture()):
+    if first != tab_close_positions(_capture_observed_account(scheduler)):
         raise hs.PendingError('游戏标签位置变化，未注册账号')
     centers = active_tab_centers(first)
     if not 1 <= len(centers) <= 6:
@@ -406,28 +541,35 @@ def _observe_accounts(scheduler):
     for slot, x in enumerate(centers, 1):
         scheduler.check_stop()
         account = hs.Account(slot, f'当前窗口标签{slot}', x)
-        frame = scheduler.capture()
+        if slot in getattr(scheduler, '_explicitly_deferred_slots', ()):
+            unavailable[slot] = 'user_deferred: 用户要求保留待完成，未切换或操作内容'
+            scheduler.event('account_user_deferred', account, content_clicks=0)
+            continue
+        frame = _capture_observed_account(scheduler)
         try:
             selected = scheduler._generic_active_tab_x(frame) == x
         except hs.PendingError:
             selected = False
         if not selected:
-            scheduler.chrome_click(x, 10, f'observe_account:{slot}', account)
+            _select_observed_account(scheduler, account)
             scheduler.wait_interruptible(.35)
-            frame = scheduler.capture()
-        if (scheduler.offline_dialog_visible(frame)
-                or scheduler.template('offline_login_prompt.bmp',(780,450,1140,660),frame,threshold=.98)[0]):
-            unavailable[slot] = 'offline_prompt'
-            scheduler.event('account_disconnected_skipped', account, identity='unconfirmed')
-            continue
+            frame = _capture_observed_account(scheduler)
         try:
+            frame = wait_observed_tab(scheduler, account, frame, first)
+            if getattr(frame, '_hyol_chrome_only', False):
+                raise hs.PendingError('content_surface_unavailable: 当前标签没有游戏内容区域，保留原断点')
+            if (scheduler.offline_dialog_visible(frame)
+                    or scheduler.template('offline_login_prompt.bmp',(780,450,1140,660),frame,threshold=.98)[0]):
+                raise hs.AccountOffline(account, '当前标签显示掉线弹窗')
             from hyol_identity_overlays import dismiss_identity_overlays
             for repaint in range(4):
                 clicks_before = scheduler.content_click_count
                 try:
-                    frame = dismiss_identity_overlays(scheduler,account,frame,only_kind='arena_trial_notice')
-                    frame = dismiss_current_final_result(scheduler, account, frame)
-                    frame = dismiss_identity_overlays(scheduler, account, frame)
+                    if not (scheduler.no_content_clicks
+                            or getattr(scheduler, '_identity_observation_only', False)):
+                        frame = dismiss_identity_overlays(scheduler,account,frame,only_kind='arena_trial_notice')
+                        frame = dismiss_current_final_result(scheduler, account, frame)
+                        frame = dismiss_identity_overlays(scheduler, account, frame)
                     observations[slot], frames[slot] = collect_current_identity(scheduler, account, frame)
                     break
                 except hs.PendingError:
@@ -452,21 +594,55 @@ def _observe_accounts(scheduler):
             save = getattr(scheduler,'save_raw_evidence',None)
             evidence = str(save(frame,account,'account_identity_unavailable','pending')) if callable(save) else ''
             scheduler.event('account_identity_pending', account, detail=str(exc),evidence=evidence)
+    scheduler._account_observation_frames = frames
     return centers, observations, frames, unavailable
 
 
 def register_observations(scheduler, observations):
     from hyol_checkpoints import read_checkpoint
     import hyol_scheduler as hs
-    path = getattr(scheduler, 'identity_directory', scheduler.shared_state_directory)/'account_identities.json'
+    path = identity_registry_path(scheduler)
     original = read_checkpoint(path)
     refs = deepcopy(original)
+    portable = getattr(scheduler, 'portable_accounts', False)
+    context = getattr(scheduler, 'run_context', None)
+    # An explicitly continued old run may already carry its own binding.
+    # New Start has no binding and always enrolls from this run's live frames.
+    if portable and not refs and context is not None and context.binding is not None:
+        refs = deepcopy(context.binding['refs'])
     for key, row in refs.items():
-        row['has_unresolved_work'] = (False if getattr(scheduler, 'run_context', None)
+        row['has_unresolved_work'] = (False if context is not None or portable
                                       else _has_unresolved_work(scheduler.shared_state_directory, key))
-    mapping, refs = resolve_observations(observations, refs)
+    rejected = {}
+    try:
+        mapping, refs = resolve_observations(observations, refs)
+    except hs.PendingError as exc:
+        try:
+            mapping, accepted_refs, rejected = resolve_available_observations(observations, refs)
+        except hs.PendingError:
+            mapping = None
+        from hyol_checkpoints import encode_mask, identity_mask_scores
+        save = getattr(scheduler, 'save_raw_evidence', None)
+        evidence = {str(slot): str(save(frame, hs.Account(slot, f'当前窗口标签{slot}', 0),
+                    'identity_registration', 'pending'))
+                    for slot, frame in getattr(scheduler, '_account_observation_frames', {}).items()}
+        report = hs.LOGS/('identity_registration_'+scheduler.diagnostics.identifier+'.json')
+        hs.atomic_json(report, dict(detail=str(exc), evidence=evidence,
+            observations={str(slot): [dict(mask=encode_mask(mask), shape=list(mask.shape),
+                scores=identity_mask_scores(mask, refs)) for mask in masks]
+                for slot, masks in observations.items()}, content_clicks=scheduler.content_click_count))
+        scheduler.event('identity_registration_partial' if mapping else 'identity_registration_pending',
+                        detail=str(exc), report=str(report), evidence=evidence, unavailable=rejected)
+        if mapping is None:
+            raise
+        refs = accepted_refs
+    scheduler._identity_unavailable_reasons = rejected
     for row in refs.values():
         row.pop('has_unresolved_work', None)
+    if portable:
+        for slot,key in mapping.items():
+            refs[key]['display_label'] = f'标签{slot}'
+            refs[key]['scope'] = 'current_run'
     # Recheck before merging so an unrelated updater cannot be overwritten.
     if read_checkpoint(path) != original:
         raise hs.PendingError('账号注册资料被另一入口更新，请重新观察')
@@ -481,6 +657,7 @@ def discover_accounts(scheduler):
     import hyol_scheduler as hs
     centers, observations, frames, unavailable = observe_accounts(scheduler)
     mapping, refs = register_observations(scheduler, observations)
+    unavailable.update(getattr(scheduler, '_identity_unavailable_reasons', {}))
     accounts = [hs.Account(slot, key, centers[slot-1]) for slot,key in sorted(mapping.items())]
     scheduler.accounts = accounts
     scheduler.by_name = {account.name:account for account in accounts}
@@ -490,7 +667,7 @@ def discover_accounts(scheduler):
     scheduler.available_account_names = {a.name for a in accounts}
     scheduler.joint_identity_bound = set(scheduler.available_account_names)
     scheduler._dynamic_identity_materials = refs
-    scheduler._dynamic_identity_masks = {slot:masks[-1] for slot,masks in observations.items()}
+    scheduler._dynamic_identity_masks = {slot:masks[-1] for slot,masks in observations.items() if slot in mapping}
     scheduler._dynamic_identity_names = mapping
     if getattr(scheduler, 'run_context', None):
         scheduler.run_context.remember(centers,mapping,observations,frames,refs,unavailable)
@@ -512,12 +689,24 @@ def bind_visible_identity(scheduler, anonymous):
     import hyol_scheduler as hs
     from hyol_checkpoints import joint_identity_assignment
     from hyol_identity_overlays import dismiss_identity_overlays
-    frame = dismiss_current_final_result(scheduler, anonymous)
-    frame = dismiss_identity_overlays(scheduler, anonymous, frame)
+    # The quiz result may have an unclaimed reward. Its name glyph is visible
+    # under a recognized dim layer, so observe it directly rather than closing
+    # the result merely to establish identity.
+    from PIL import Image
+    from hyol_quiz import result_visible
+    capture = getattr(scheduler, 'capture', None)
+    frame = capture() if callable(capture) else None
+    quiz_result = isinstance(frame, Image.Image) and result_visible(scheduler,frame)
+    if not quiz_result:
+        frame = (dismiss_current_final_result(scheduler, anonymous, frame)
+                 if frame is not None else dismiss_current_final_result(scheduler, anonymous))
+        frame = dismiss_identity_overlays(scheduler, anonymous, frame)
     masks, _frame = collect_current_identity(scheduler, anonymous, frame)
     try:
         mapping, _refs = register_observations(scheduler, {anonymous.index:masks})
     except hs.PendingError:
+        if scheduler.config.get('CurrentWindowOnly') == '1':
+            raise hs.PendingError('独立任务仅运行当前窗口；本窗口身份不能唯一确认，未切换其他标签')
         # Similar server glyphs may need the complete simultaneous assignment.
         # This scope permits only observed title tabs; game content remains
         # disabled until the original selected role has been observed again.
@@ -551,6 +740,8 @@ def bind_visible_identity(scheduler, anonymous):
         # Keep exactly the context that passed this three-frame observation.
         scheduler._dynamic_identity_masks = {anonymous.index:masks[-1]}
         scheduler._dynamic_identity_names = mapping
+    if anonymous.index not in mapping:
+        raise hs.PendingError('当前窗口身份仍有歧义，保留原断点；未启动其他账号任务')
     return mapping[anonymous.index]
 
 

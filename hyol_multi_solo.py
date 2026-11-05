@@ -16,8 +16,9 @@ import numpy as np
 from PIL import Image, ImageGrab
 
 import hyol_scheduler as hs
-from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json
+from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json, calendar_task_plan
 from hyol_daruma_task import verified as daruma_verified
+from hyol_escort import verified as escort_verified
 
 TAB_MARKER_CORE = "microclient_tab_close_core.bmp"
 TAB_CHROME_ROI = (0, 0, 1800, 39)
@@ -34,9 +35,9 @@ def tab_close_positions(frame: Image.Image) -> tuple[int, ...]:
     key = ('tab_close_positions', str(asset), stat.st_mtime_ns, stat.st_size, TAB_MARKER_THRESHOLD)
     if cache is not None and key in cache:
         return cache[key]
-    image = np.asarray(frame.crop(TAB_CHROME_ROI).convert("L"), dtype=np.float64)
-    marker = np.asarray(Image.open(hs.ASSETS / TAB_MARKER_CORE).convert("L"), dtype=np.float64)
-    scores = hs.ncc_map(image, marker)
+    image = np.asarray(frame.crop(TAB_CHROME_ROI).convert("L"), dtype=np.uint8)
+    marker = np.asarray(Image.open(hs.ASSETS / TAB_MARKER_CORE).convert("L"), dtype=np.uint8)
+    scores = hs.ncc_map(image, marker, backend='opencv', cutoff=TAB_MARKER_THRESHOLD)
     positions = []
     while scores.size:
         y, x = np.unravel_index(np.argmax(scores), scores.shape)
@@ -60,18 +61,32 @@ def active_tab_centers(close_positions: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(x-34 for x in close_positions)
 
 
+def observe_ranking_wait(s, account, record, watches):
+    """Measure observed frame progress, retaining the existing background policy."""
+    key = (record.get('completed', 0), record.get('phase', 'ready'))
+    previous = watches.get(account.name)
+    if previous is None or previous[0] != key:
+        watch = hs.BattleWatchdog.from_config(getattr(s, 'config', {}))
+        watches[account.name] = (key, watch)
+    else:
+        watch = previous[1]
+    frame = s.capture()
+    hs.check_battle_watchdog(s, watch, account, frame, 'ranking_interleave_wait', mode='ranking')
+
+
 class MultiSoloRunner:
     def __init__(self, tasks=DEFAULT_SOLO_OPTIONS, *, config_path=None, account_count=None,
-                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None):
+                 arena_wins=5, arena_target_mode='tickets', formation="keep", event_sink=None, managed_enabled=True, run_context=None,
+                 execution_day=None):
         chosen = tuple(tasks)
         if not chosen or len(set(chosen)) != len(chosen) or any(task not in SOLO_OPTIONS for task in chosen):
             raise ValueError("请选择不重复的单人日常任务")
-        self.tasks = tuple(task for task in SOLO_OPTIONS if task in chosen)
-        from hyol_weekend import is_weekend
-        if not is_weekend():
-            self.tasks = tuple(task for task in self.tasks if task != 'weekend')
+        self.requested_tasks = chosen
+        self.calendar_plan = calendar_task_plan(self.requested_tasks, execution_day)
+        self.tasks = tuple(self.calendar_plan['effective_tasks'])
         if not self.tasks:
-            raise ValueError('非周末不能执行仅包含周末任务的请求；未启动游戏，请选择其他任务')
+            raise ValueError(f"{self.calendar_plan['execution_day']}非周末，达摩和周末活动已按日历跳过；"
+                             '没有其他可执行任务，未启动游戏')
         self.arena_wins = arena_wins
         self.arena_target_mode = arena_target_mode
         if not 1 <= arena_wins <= hs.ARENA_MAX_ATTEMPTS:
@@ -87,6 +102,8 @@ class MultiSoloRunner:
         self.config_path = Path(config_path or hs.ROOT / "HYOL_Daily.ini")
         config = hs.read_config(self.config_path)
         config['AllowMarketPurchase'] = '0'
+        config['EscortCompletionPolicy'] = 'coupon_priority_remaining'
+        config['HideOtherPlayers'] = '1'
         self.automatic_accounts = config.get('AccountDiscovery', 'automatic') == 'automatic'
         names = hs.parse_csv(config.get("TabAccountNames", ""))
         if self.automatic_accounts:
@@ -96,7 +113,7 @@ class MultiSoloRunner:
         if account_count is None:
             account_count = len(names)
         if account_count < 1 or account_count > len(names):
-            raise ValueError(f"账号数量须在1到{len(names)}之间；新增账号先配置TabAccountNames并采集身份模板")
+            raise ValueError(f"账号数量须在1到{len(names)}之间；通用模式从当前游戏标签自动建立本轮记录")
         selected_names = names
         missing = [] if self.automatic_accounts else [name for name in selected_names if not (hs.ASSETS / 'accounts' / f'{hs.slug(name)}_identity.bmp').exists()]
         if missing:
@@ -152,6 +169,10 @@ class MultiSoloRunner:
             "arena_target_mode": self.arena_target_mode,
             "managed_enabled": getattr(self, 'managed_enabled', True),
             "tasks": list(self.tasks),
+            "requested_tasks": list(getattr(self, 'requested_tasks', self.tasks)),
+            "effective_tasks": list(self.tasks),
+            "calendar_skipped": getattr(self, 'calendar_plan', {}).get('calendar_skipped', {}),
+            "execution_day": getattr(self, 'calendar_plan', {}).get('execution_day'),
             "run_id": self.scheduler.diagnostics.identifier,
             "tab_bindings": {str(a.index): a.name for a in self.scheduler.accounts},
             "blocked_tasks": getattr(self, 'blocked_tasks', {}),
@@ -237,6 +258,8 @@ class MultiSoloRunner:
         runner.group_selection_cancelled = False
         runner.wanted_selection_cancelled = False
         runner.selected_tasks = self.tasks
+        runner.requested_tasks = getattr(self, 'requested_tasks', self.tasks)
+        runner.calendar_plan = getattr(self, 'calendar_plan', {})
         runner.managed_enabled = getattr(self, 'managed_enabled', True)
         from hyol_checkpoints import load_tasks
         runner.path, runner.records = load_tasks(self.scheduler.state, account.name)
@@ -272,6 +295,9 @@ class MultiSoloRunner:
         if not identity_ok:
             raise hs.PendingError(
                 f'开场回村前账号身份未确认；证据={before}；scores={identity_scores}')
+        if set(getattr(self, 'tasks', ())) & {'puzzle', 'training_record'}:
+            s.exit_managed_for_market(account)
+            frame=s.capture()
         account_state = s.state.accounts.get(account.name, {})
         actions = account_state.get('actions', {})
         pending = [key for key, value in actions.items()
@@ -310,7 +336,8 @@ class MultiSoloRunner:
                                  navigation.SPRING_PROMPT_ROI, frame, threshold=.98)[0]
                       and s.template('hot_spring_leave_confirm.bmp',
                                      navigation.SPRING_PROMPT_ROI, frame, threshold=.98)[0])
-            if not spring and not prompt:
+            in_home=navigation.home_visible(s,frame)
+            if not spring and not prompt and not in_home:
                 raise hs.PendingError(f'开场回村前主界面与温泉页面未确认；证据={before}')
         already_home = (main and s.template('leaf_village_name_current.bmp',
                                            navigation.LEAF_NAME_ROI, frame, threshold=.92)[0])
@@ -389,6 +416,14 @@ class MultiSoloRunner:
             if self.scheduler.check_pause_boundary():
                 return False
             pending_task = self.unresolved_combat_task(account)
+            if (pending_task == 'training_record' and tuple(self.tasks) == ('training_record',)
+                    and getattr(self.scheduler,'training_cooperative_enabled',False)):
+                # Its owned child/scan must resume in the shared loop, never
+                # recursively run an entire single-account training session.
+                self.startup_returned.add(account.name)
+                self.event('multi_solo_training_resume_queued',account,task='training_record',
+                           detail='原修行录已登记，交给多账号轮转恢复；未执行内容输入')
+                continue
             if pending_task and self._preserve_unselected_idle_task(account, pending_task):
                 pending_task = self.unresolved_combat_task(account)
             if pending_task:
@@ -531,7 +566,6 @@ class MultiSoloRunner:
         if not isinstance(mapping, dict) or mapping.get(account.name) != account.tab_x:
             raise hs.LeaseBlocked('30秒无变化，但标签身份绑定未核实；停止交接') from exc
         self.excluded.add(account.name)
-        self.disconnected.add(account.name)
         self.exclusion_reasons[account.name] = 'unchanged_30s'
         self.deferred.pop(account.name, None)
         self.deferred_at.pop(account.name, None)
@@ -552,7 +586,21 @@ class MultiSoloRunner:
         try:
             if not getattr(self, 'run_context', None) and not self._tab_exists(account):
                 raise hs.PendingError("浏览器标签缺失")
-            self.scheduler.switch_account(account)
+            try:
+                self.scheduler.switch_account(account)
+            except hs.PendingError:
+                # A background robbery defense may finish after preparation.
+                # Escort-only startup can acknowledge its known win/loss UI;
+                # owned unfinished tasks still go through their original flow.
+                if tuple(getattr(self,'tasks',()))!=('escort',) or self.unresolved_combat_task(account):
+                    raise
+                from hyol_accounts import _final_result, dismiss_current_final_result
+                frame=self.scheduler.capture()
+                if (self.scheduler._generic_active_tab_x(frame)!=account.tab_x
+                        or _final_result(self.scheduler,frame) is None):
+                    raise
+                dismiss_current_final_result(self.scheduler,account,frame,allow_reward_confirmation=False)
+                self.scheduler.switch_account(account)
             self.stall_checks[name] = 0
             self.last_failed_at.pop(name, None)
             if hasattr(self.scheduler, 'available_account_names'):
@@ -643,6 +691,10 @@ class MultiSoloRunner:
                     'leaf_village_name_current.bmp', (1690,110,1920,148), frame,
                     threshold=.92)[0]):
                 raise hs.PendingError(f"{task}结束后未确认木叶村主界面；保留断点")
+            if task == 'anniversary' and rec.get('availability',{}).get('status')=='not_open':
+                rec.update(status='skipped',task_completed=False,home_returned=True,last_error='')
+                runner.save()
+                return
             rec.update(status="done", task_completed=True, home_returned=True,
                        finished_at=hs.now_iso(), last_error="")
             if task == "survival":
@@ -708,23 +760,24 @@ class MultiSoloRunner:
                        seconds=round(time.monotonic() - started_at, 3),
                        status=rec.get('status', 'unknown'))
 
-    def probe_deferred(self, account):
+    def probe_deferred(self, account, *, force=False):
         task = self.deferred.get(account.name)
         if not task or account.name in self.excluded:
-            return
+            return False
         now = time.monotonic()
         probed = getattr(self, 'deferred_probed_at', {})
         last = probed.get(account.name, getattr(self, 'deferred_at', {}).get(account.name))
-        if last is not None and now - last < DEFERRED_RECHECK_SECONDS:
+        if not force and last is not None and now - last < DEFERRED_RECHECK_SECONDS:
             self.event('multi_solo_deferred_probe_throttled', account, task=task,
                        seconds_remaining=round(DEFERRED_RECHECK_SECONDS-(now-last),2))
-            return
+            return False
         self.deferred_probed_at = probed
         probed[account.name] = now
         try:
             self.scheduler.switch_account_for_combat(account, task, running=True)
             self.stall_checks[account.name] = 0
             self.event("multi_solo_deferred_healthy", account, task=task)
+            return True
         except hs.AccountOffline as exc:
             self.skip_disconnected(exc.account, task)
         except (hs.PendingError, hs.SafetyError) as exc:
@@ -736,6 +789,7 @@ class MultiSoloRunner:
                 self.exclusion_reasons[account.name] = "combat_page_unverified"
                 self.event("multi_solo_account_excluded", account, checks=checks,
                            reason="combat_page_unverified", detail="战斗标签两次无法确认健康状态")
+        return False
 
 
     def _run_survival_stage(self):
@@ -809,6 +863,7 @@ class MultiSoloRunner:
                 runner.save()
                 runners[account.name] = runner
                 candidates.append(account)
+                self.event('multi_solo_task_started', account, task='survival')
             if not candidates:
                 self.event('multi_solo_survival_no_eligible_accounts',
                            detail='没有需要继续执行的生存演习账号')
@@ -881,8 +936,7 @@ class MultiSoloRunner:
         candidates = []
         pending = {}
         next_polls = {}
-        waiting_since = {}
-        waiting_keys = {}
+        wait_watches = {}
         started_at = time.monotonic()
         try:
             for configured in tuple(original_accounts):
@@ -904,6 +958,7 @@ class MultiSoloRunner:
                     continue
                 candidates.append(account)
                 pending[account.name] = account
+                self.event('multi_solo_task_started', account, task='ranking')
             if not candidates:
                 self.event('multi_solo_ranking_no_eligible_accounts',
                            detail='没有需要继续执行的排位赛账号')
@@ -929,7 +984,8 @@ class MultiSoloRunner:
                     record = runner.record('ranking')
                     phase = record.get('phase', 'ready')
                     attempt = record.get('completed', 0) + 1
-                    action_base = f'daily_ranking_{attempt}'
+                    from hyol_ranking import action_base as ranking_action_base
+                    action_base = ranking_action_base(record,attempt)
                     has_pending_action = any(
                         s.state.action_status(account.name, action_base + '_' + suffix) == 'pending'
                         for suffix in ('start', 'confirm', 'end', 'result', 'result_recover'))
@@ -945,20 +1001,14 @@ class MultiSoloRunner:
                         if result in ('yield_after_end', 'yield_waiting_result'):
                             if result == 'yield_after_end':
                                 record['ranking_interleave_wait_checks'] = 0
-                                waiting_since[account.name] = time.monotonic()
-                                waiting_keys[account.name] = (record.get('completed', 0), record.get('phase'))
+                                wait_watches.pop(account.name, None)
                                 detail = '结束战斗动作已发送，立即切换账号；结果和剩余次数延后核实'
                                 event_name = 'multi_solo_ranking_end_sent_yield'
                                 progressed = True
                             else:
                                 checks = int(record.get('ranking_interleave_wait_checks', 0)) + 1
                                 record['ranking_interleave_wait_checks'] = checks
-                                key = (record.get('completed', 0), record.get('phase'))
-                                if waiting_keys.get(account.name) != key:
-                                    waiting_since[account.name] = time.monotonic()
-                                    waiting_keys[account.name] = key
-                                if time.monotonic() - waiting_since.setdefault(account.name, time.monotonic()) >= 30:
-                                    raise hs.PendingError('排位结果连续30秒无进展；保留断点并继续其他账号')
+                                observe_ranking_wait(s, account, record, wait_watches)
                                 detail = '排位结果尚未稳定，已让出本轮继续处理其他账号'
                                 event_name = 'multi_solo_ranking_wait_yield'
                                 persist_progress = checks == 1 or checks % 5 == 0
@@ -996,6 +1046,9 @@ class MultiSoloRunner:
                         pending.pop(account.name, None)
                         progressed = True
                     except hs.BattleStalled as exc:
+                        record.update(status='pending',task_completed=False,home_returned=False,
+                                      last_error=str(exc))
+                        runner.save()
                         self.skip_stalled(account, 'ranking', exc)
                         pending.pop(account.name, None)
                         progressed = True
@@ -1011,8 +1064,14 @@ class MultiSoloRunner:
                                    and s._combat_active_visible('ranking', frame))
                         if not custody and not s.ensure_account_main_before_release(account, 'ranking'):
                             raise hs.LeaseBlocked(f'{account.name}排位异常后无法确认安全交接') from exc
-                        self.deferred[account.name] = 'ranking'
-                        self.deferred_at[account.name] = time.monotonic()
+                        # A missing entry on a verified idle village is a
+                        # task-local skip, not a battle occupying this tab.
+                        # Retain its original record/actions and release the
+                        # other selected tasks through the existing audit.
+                        released = not custody and self._allow_other_selected_tasks(account,str(exc))
+                        if not released:
+                            self.deferred[account.name] = 'ranking'
+                            self.deferred_at[account.name] = time.monotonic()
                         self.event('multi_solo_ranking_stage_pending', account, detail=str(exc))
                         pending.pop(account.name, None)
                         progressed = True
@@ -1120,9 +1179,13 @@ class MultiSoloRunner:
                 self.event('multi_solo_task_started', account, task='arena',
                            target_mode=self.arena_target_mode,
                            requested_wins=self.arena_wins,
-                           detail=('先逐号发起战斗，默认直到战令次数归零'
+                           detail=(('先逐号发起战斗，按实际战令归零结束'
+                                    if self.arena_target_mode == 'tickets'
+                                    else f'先逐号发起战斗，每号目标新增{self.arena_wins}胜')
+                                   if getattr(s, 'arena_calendar_policy_enabled', False) else
+                                   '先逐号发起战斗，每账号每轮最多3场，战令目标未完成下次继续'
                                    if self.arena_target_mode == 'tickets'
-                                   else f'先逐号发起战斗，每号新增确认胜场目标为{self.arena_wins}'))
+                                   else f'每号目标新增{self.arena_wins}胜，本轮最多3场，未完成下次继续'))
             if requests:
                 s.arena_attempt_limit = max(
                     int(item.get('attempt_limit', hs.ARENA_MAX_ATTEMPTS))
@@ -1156,7 +1219,10 @@ class MultiSoloRunner:
                                completed=s._arena_victory_count(account))
                 else:
                     detail = pending_detail or '竞技场目标、战令归零或奖励领取尚未全部核实'
-                    record.update(status='pending', task_completed=False, home_returned=False,
+                    request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
+                    limited = isinstance(request, dict) and request.get('status') == 'limited'
+                    record.update(status='pending', task_completed=False,
+                                  home_returned=limited and request.get('home_returned') is True,
                                   followup_check_due=False, last_error=detail,
                                   arena_requested_wins=self.arena_wins,
                                   arena_target_mode=self.arena_target_mode)
@@ -1208,6 +1274,38 @@ class MultiSoloRunner:
         original_accounts = s.accounts
         observation = s.begin_task_observation(account, 'survival')
         try:
+            frame = s.capture()
+            original_battle_visible = (s._battle_hud_visible(frame) is True or any(
+                runner.visible(name, roi, frame) is True for name, roi in (
+                    ('survival_result_confirm.bmp', (701,519,1151,819)),
+                    ('survival_reward_result_confirm.bmp', (701,569,1151,819)))))
+            if original_battle_visible:
+                actions = s.state.accounts.get(account.name, {}).get('actions', {})
+                if not any(key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
+                           and isinstance(row, dict) and row.get('status') == 'pending'
+                           for key, row in actions.items()):
+                    raise hs.PendingError('当前生存战斗缺少原未决凭据，不接管或重新进入活动')
+                # A follow-up can be interrupted inside its second run. Resume
+                # that exact battle/result before trying to open a village menu.
+                runner.formation_checked = True
+                s.accounts = [account]
+                self.event('multi_solo_survival_original_battle_resumed', account,
+                           detail='先核对原战斗和结果，不重新打开活动或切换阵容')
+                s.run_combat_interleaved('survival')
+                if not s._account_module_complete(account, 'survival'):
+                    raise hs.PendingError('原生存战斗、积分或领奖仍未核实，保留补跑断点')
+                if not s.main_ready(s.capture()):
+                    runner.return_to_main()
+                if not s.main_ready(s.capture()):
+                    raise hs.PendingError('原生存战斗对账后未确认回村')
+                runner.survival_inline_complete = True
+                completed = (2 if s.state.action_status(account.name, 'survival_second_run_started') == 'done'
+                             else max(1, rec.get('completed', 0)))
+                rec.update(status='done', home_returned=True, followup_check_due=False,
+                           task_completed=True, completed=completed, finished_at=hs.now_iso(), last_error='')
+                runner.save()
+                self.event('multi_solo_survival_second_run_complete', account)
+                return
             if not runner.formation_checked:
                 if runner.visible("survival_anchor.bmp", (201, 69, 601, 419)):
                     runner.close_page("survival")
@@ -1338,19 +1436,31 @@ class MultiSoloRunner:
         self.event('multi_solo_survival_second_run_queued', account, reason=reason)
 
     def unresolved_combat_task(self, account):
+        reconcile = getattr(self.scheduler, 'reconcile_survival_finished_speed_controls', None)
+        if callable(reconcile):
+            reconcile(account)
         actions = self.scheduler.state.accounts.get(account.name, {}).get('actions', {})
         if not isinstance(actions, dict):
             actions = {}
+        runner = getattr(self,'runners',{}).get(account.name)
+        records = getattr(runner,'records',None)
+        def owner(task):
+            parent=records.get('training_record',{}) if isinstance(records,dict) else {}
+            if ('training_record' in getattr(self,'tasks',())
+                    and task in parent.get('planned_tasks',())):
+                return 'training_record'
+            return task
         for prefixes, task in ((('arena_', 'daily_arena_'), 'arena'),
                                (('ranking_', 'daily_ranking_'), 'ranking'),
                                (('survival_', 'daily_survival_'), 'survival'),
                                (('daruma_',), 'daruma' if 'daruma' in getattr(self, 'tasks', ()) else 'weekend'),
-                               (('puzzle_', 'daily_weekend_'), 'weekend')):
+                               (('puzzle_', 'daily_weekend_'), 'puzzle' if 'puzzle' in getattr(self,'tasks',()) else 'weekend')):
+            from hyol_manual_continuation import quarantined_external_action
             if any(key.startswith(prefixes) and isinstance(record, dict)
-                   and record.get('status') == 'pending' for key, record in actions.items()):
-                return task
-        runner = getattr(self,'runners',{}).get(account.name)
-        records = getattr(runner,'records',None)
+                   and record.get('status') == 'pending'
+                   and not quarantined_external_action(record,account.name)
+                   for key, record in actions.items()):
+                return owner(task)
         if isinstance(records,dict):
             for task, record in records.items():
                 if (isinstance(record,dict) and (record.get('status') in ('pending','running')
@@ -1359,7 +1469,7 @@ class MultiSoloRunner:
                     # A pre-click recognition failure has no pending battle
                     # action, but still needs its original task resumed before
                     # the generic origin gate; otherwise every stage skips it.
-                    return task
+                    return owner(task)
         return None
 
     def run_skipped_tasks(self):
@@ -1418,11 +1528,19 @@ class MultiSoloRunner:
         return True
 
     def finish_managed_accounts(self):
+        self.scheduler._performance_task = 'managed'
         """Start managed mode last, only for accounts with a complete solo run."""
         if not getattr(self, 'managed_enabled', True):
             self.event('multi_solo_managed_disabled', detail='本轮最后进入托管未勾选')
             return True
         s = self.scheduler
+        if 'escort' in self.tasks:
+            expected=getattr(self,'requested_account_count',None) or len(s.accounts)
+            if (len(s.accounts)!=expected or getattr(self,'initial_unavailable',set())
+                    or any(not escort_verified(self.runner_for(a).record('escort')) for a in s.accounts)):
+                self.event('multi_solo_managed_waiting_for_all_escort',
+                    detail='先完成全部所选账号的押镖及日常0/3核实，再统一逐号进入托管')
+                return True
         for configured in tuple(s.accounts):
             if s.check_pause_boundary():
                 return False
@@ -1438,6 +1556,7 @@ class MultiSoloRunner:
                 or not runner.record(task).get('home_returned')
                 or runner.record(task).get('followup_check_due')
                 or task == 'daruma' and not daruma_verified(runner.record(task))
+                or task == 'escort' and not escort_verified(runner.record(task))
                 for task in self.tasks
             ):
                 self.event('multi_solo_managed_pending', account,
@@ -1485,6 +1604,9 @@ class MultiSoloRunner:
             meter = PerformanceMeter(s)
             self.event('multi_solo_run_started', tasks=list(self.tasks), managed_enabled=getattr(self, 'managed_enabled', True),
                        requested_account_count=getattr(self, 'requested_account_count', None))
+            if getattr(self, 'calendar_plan', {}).get('calendar_skipped'):
+                self.event('solo_calendar_filtered', **self.calendar_plan,
+                           detail='执行日非周末，跳过达摩和周末活动；原请求及旧断点保留')
             context = getattr(self, 'run_context', None)
             if context and manage_lease:
                 context.begin()
@@ -1498,6 +1620,8 @@ class MultiSoloRunner:
                 s.by_name = {a.name:a for a in s.accounts}
                 self.configured_names = tuple(s.by_name)
                 self.stall_checks = {a.name:0 for a in s.accounts}
+                if context.binding.get('resumed_original_binding'):
+                    self.startup_returned=set(context.binding.get('training_prepared_accounts',())) & set(s.by_name)
                 self.event('multi_solo_accounts_bound',online=list(s.by_name),reused=True)
             else:
                 if not getattr(self, 'automatic_accounts', False):
@@ -1520,7 +1644,22 @@ class MultiSoloRunner:
                     self.save_progress("paused")
                     return 2
                 stage_started = time.monotonic()
+                s._performance_task = task
                 self.event("multi_solo_stage_started", task=task)
+                if task == 'training_record' and getattr(s, 'training_cooperative_enabled', False):
+                    from hyol_training_coordinator import run_multi
+                    run_multi(self)
+                    self.save_progress('training_record')
+                    self.event('multi_solo_stage_finished', task=task,
+                               seconds=round(time.monotonic()-stage_started,3))
+                    continue
+                if task == 'escort':
+                    from hyol_escort import run_multi
+                    run_multi(self)
+                    self.save_progress('escort')
+                    self.event('multi_solo_stage_finished',task=task,
+                               seconds=round(time.monotonic()-stage_started,3))
+                    continue
                 if task == 'treasure':
                     from hyol_treasure import run_multi
                     run_multi(self)
@@ -1602,12 +1741,15 @@ class MultiSoloRunner:
                 if name not in self.startup_returned:
                     continue
                 if name not in self.excluded:
-                    self.probe_deferred(account)
                     recent = time.monotonic() - getattr(self, 'deferred_at', {}).get(name, 0) < 60
                     if recent:
                         self.event('multi_solo_deferred_waiting', account, task=task,
                                    detail='刚观察到匹配、加载或战斗；本轮不立即重复进入')
-                    if name not in self.excluded and not recent:
+                    # An informational probe may be throttled and leave a
+                    # different tab active. A real resume must acquire this
+                    # exact account again immediately before task execution.
+                    acquired = not recent and self.probe_deferred(account,force=True)
+                    if name not in self.excluded and acquired:
                         self._run_task(self.runner_for(account), task)
                         if self.runner_for(account).record(task).get("status") == "done":
                             self.deferred.pop(name, None)
@@ -1631,12 +1773,15 @@ class MultiSoloRunner:
             if not self.finish_managed_accounts():
                 self.save_progress('paused')
                 return 2
+            from hyol_anniversary import request_satisfied as anniversary_satisfied
             result = 0 if not self.excluded and not self.startup_pending and all(
+                anniversary_satisfied(self.runner_for(account).record(task)) if task=='anniversary' else
                 self.runner_for(account).record(task).get("status") == "done"
                 and self.runner_for(account).record(task).get('task_completed') is True
                 and self.runner_for(account).record(task).get('home_returned') is True
                 and not self.runner_for(account).record(task).get("followup_check_due")
                 and (task != 'daruma' or daruma_verified(self.runner_for(account).record(task)))
+                and (task != 'escort' or escort_verified(self.runner_for(account).record(task)))
                 for account in s.accounts for task in self.tasks
             ) and (not getattr(self, 'managed_enabled', True) or all(
                 self.runner_for(account).record('managed').get('status') == 'done'
@@ -1653,9 +1798,9 @@ class MultiSoloRunner:
             finally:
                 try:
                     if meter is not None:
-                        timings = meter.snapshot()
+                        timings, scopes = meter.snapshot(), meter.scope_snapshot()
                         meter.close()
-                        self.event('multi_solo_performance', timings=timings,
+                        self.event('multi_solo_performance', timings=timings, scopes=scopes,
                                    detail='seconds为嵌套总时长；仅exclusive_seconds可相加')
                 finally:
                     s.stop.set()

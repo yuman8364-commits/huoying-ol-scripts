@@ -50,7 +50,7 @@ def verify_package(root, executable, *, archive_factory=None):
     archive = archive_factory(str(executable))
     pyz = archive.open_embedded_archive('PYZ.pyz')
     def project_module(module):
-        return (module.startswith('hyol_') or module == 'daruma_standalone_gui'
+        return (module.startswith('hyol_') or module == 'tools.preflight_live' or module == 'daruma_standalone_gui'
                 or module == 'daruma_standalone' or module.startswith('daruma_standalone.'))
     checks = [dict(compare_source(root, module, pyz.extract(module)), location='PYZ')
               for module in sorted(pyz.toc) if project_module(module)]

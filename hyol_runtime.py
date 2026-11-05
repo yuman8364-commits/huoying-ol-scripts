@@ -10,13 +10,17 @@ import hyol_scheduler as hs
 from hyol_daily_tasks import DailyRunner, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS
 from hyol_multi_solo import MultiSoloRunner
 from hyol_team_pipeline import TeamPipelineRunner, SUPPORTED_TEAM_TASKS as PIPELINE_TEAM_TASKS, detect_leaders
-from hyol_team_six import TeamRunner, TeamSelection, TASKS as TEAM_TASKS, DEFAULT_TASKS
-from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES
-from hyol_diagnostics import clear_manual_pause, manual_pause_status, mark_manual_pause, run_id
+from hyol_team_six import TeamRunner, TeamSelection, DEFAULT_TASKS
+from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES, target_reached
+from hyol_diagnostics import manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.10.22.2'
-MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure')
+VERSION = '2026.11.05.1-opencv'
+RELEASE_DATE = '2026-11-05'
+EDITION = 'OpenCV版'
+BASELINE_VERSION = '2026.10.25.4-opencv'
+MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure', 'puzzle', 'training_record', 'anniversary')
+INDEPENDENT_MODES = ('arena', 'bond', 'weekend', 'treasure', 'puzzle', 'training_record')
 
 
 @dataclass(frozen=True)
@@ -31,35 +35,74 @@ class RunRequest:
     members: tuple[int, ...] = (2, 3)
     friend_shortcut: bool = False
     team_tasks: tuple[str, ...] = DEFAULT_TASKS
+    preformed_duos: bool = False
+    preformed_pairs: tuple[tuple[int, int], ...] = ()
     bond_count: int = 5
+    bond_stop_mode: str = 'battles'
+    bond_target_mode: str = 'battles'
+    bond_kill_target: int = 160
+    bond_score_target: int = 100
+    bond_team_goals: tuple[tuple[int, str, int], ...] = ()
     new_bond_round: bool = False
     final_managed: bool = True
     arena_target_mode: str = 'tickets'
+    escort_remaining: int = 0
+    escort_prior_settled: bool = False
 
     def __post_init__(self):
+        from hyol_bond_goals import validate_options, validate_pairs
+        validate_options(self.bond_target_mode, self.bond_kill_target, self.bond_score_target, self.bond_team_goals)
+        validate_pairs(self.preformed_pairs, self.leaders)
+        if self.preformed_pairs and (not self.preformed_duos or self.mode != 'team_then_multi'):
+            raise ValueError('指定配对仅用于已有二人队')
+        if (self.bond_target_mode != 'battles' or self.bond_team_goals) and self.mode != 'team_then_multi':
+            raise ValueError('击杀数和掉分目标请在已有队伍的二人羁绊中设置')
+        if self.bond_team_goals and (any(row[0] not in self.leaders for row in self.bond_team_goals) if self.leaders else False):
+            raise ValueError('羁绊单队目标须对应本轮选择的队长标签')
         if self.mode not in MODES:
             raise ValueError('请选择有效任务类型')
+        if self.mode == 'anniversary':
+            object.__setattr__(self,'tasks',('anniversary',))
+            object.__setattr__(self,'final_managed',False)
+            object.__setattr__(self,'formation','keep')
+        if self.bond_stop_mode not in ('endless', 'battles', 'wins') or self.mode != 'bond' and self.bond_stop_mode != 'battles':
+            raise ValueError('独立羁绊目标须为一直打、打5次或5场胜利')
         if not 1 <= self.account_count <= 6 or not 1 <= self.arena_wins <= hs.ARENA_MAX_ATTEMPTS:
             raise ValueError('账号数量须为1～6，竞技场辅助胜场数须为1～10')
+        if self.mode in INDEPENDENT_MODES:
+            object.__setattr__(self, 'account_count', 1)
         if self.arena_target_mode not in ('tickets', 'wins'):
             raise ValueError('竞技场结束条件须为战令归零或指定胜场')
         if self.formation not in ('keep', 'main', 'fast') or not 1 <= self.bond_count <= MAX_BATTLES:
             raise ValueError('阵容或羁绊次数无效')
         if not isinstance(self.final_managed, bool) or not isinstance(self.new_bond_round, bool):
             raise ValueError('最后托管选项必须为开启或关闭')
+        if type(self.preformed_duos) is not bool or self.preformed_duos and self.mode != 'team_then_multi':
+            raise ValueError('已组好的二人队仅用于已有队伍模式')
+        if type(self.escort_remaining) is not int or self.escort_remaining not in (0,1,2):
+            raise ValueError('押镖剩余续做次数须为1或2')
+        if type(self.escort_prior_settled) is not bool:
+            raise ValueError('此前押镖交付确认必须为布尔值')
+        if self.escort_remaining and (self.mode!='solo' or self.tasks!=('escort',)
+                or self.final_managed or not self.escort_prior_settled):
+            raise ValueError('剩余押镖续做须仅选择当前账号押镖，确认此前已交付并关闭最后托管')
+        if not self.escort_remaining and self.escort_prior_settled:
+            raise ValueError('未选择剩余押镖续做时不能使用交付确认')
         if self.mode in ('solo', 'multi', 'team_then_multi'):
-            if (not self.tasks or len(set(self.tasks)) != len(self.tasks)
+            if ((not self.tasks and self.mode != 'team_then_multi') or len(set(self.tasks)) != len(self.tasks)
                     or any(task not in SOLO_OPTIONS for task in self.tasks)):
                 raise ValueError('请至少选择一项有效的日常任务')
         if self.mode == 'team':
             TeamSelection(self.leader, () if self.friend_shortcut else self.members,
                           self.friend_shortcut, self.team_tasks)
         if self.mode == 'team_then_multi':
+            if self.preformed_duos and not self.preformed_pairs and any(slot not in (1,3,5) for slot in self.leaders):
+                raise ValueError('已组好二人队按标签1+2、3+4、5+6执行，队长须为1、3、5')
             if (len(self.leaders) > 6 or len(set(self.leaders)) != len(self.leaders)
                     or any(type(slot) is not int or slot not in range(1,7) for slot in self.leaders)):
                 raise ValueError('队长标签须互不重复；留空可自动识别')
             if not self.team_tasks or len(set(self.team_tasks)) != len(self.team_tasks) or any(t not in PIPELINE_TEAM_TASKS for t in self.team_tasks):
-                raise ValueError('已有队伍衔接请勾选副本、通缉或强者')
+                raise ValueError('已有队伍衔接请勾选副本、通缉、强者或二人羁绊')
 
 
 def prohibit_purchase(scheduler):
@@ -138,6 +181,11 @@ def bond_legacy_paths(root):
     return tuple(dict.fromkeys(paths))
 
 
+def preserve_activity_notices(request):
+    # Escort targets do not use the friend controls covered by optional cards.
+    return request.preformed_duos or (request.mode in ('solo','multi') and request.tasks==('escort',))
+
+
 def make_runner(request, event_sink, root=hs.ROOT, *, run_context=None):
     from contextlib import nullcontext
     from hyol_run_context import RunContext
@@ -153,12 +201,18 @@ def _make_runner(request, event_sink, root, run_context):
     """Construct an existing runner, not its GUI and not another worker."""
     root = Path(root)
     if request.mode == 'team_then_multi':
-        runner = TeamPipelineRunner(request.leaders, request.team_tasks, request.tasks,
+        original = getattr(run_context, 'pipeline_original_request_key', None)
+        solo_tasks = tuple(original['tasks']) if isinstance(original, dict) else request.tasks
+        runner = TeamPipelineRunner(request.leaders, request.team_tasks, solo_tasks,
                                     arena_wins=request.arena_wins, arena_target_mode=request.arena_target_mode,
                                     formation=request.formation,
                                     managed_enabled=request.final_managed, event_sink=event_sink, root=root,
-                                    run_context=run_context)
-    elif request.mode == 'multi':
+                                    run_context=run_context, bond_count=request.bond_count,
+                                    preformed_duos=request.preformed_duos,
+                                    preformed_pairs=request.preformed_pairs,
+                                    bond_target_mode=request.bond_target_mode, bond_kill_target=request.bond_kill_target,
+                                    bond_score_target=request.bond_score_target, bond_team_goals=request.bond_team_goals)
+    elif request.mode in ('multi','anniversary'):
         runner = MultiSoloRunner(request.tasks, config_path=root/'HYOL_Daily.ini',
                                  account_count=request.account_count, arena_wins=request.arena_wins,
                                  arena_target_mode=request.arena_target_mode, formation=request.formation,
@@ -172,7 +226,8 @@ def _make_runner(request, event_sink, root, run_context):
     elif request.mode == 'bond':
         runner = BondRunner(request.bond_count, event_sink=event_sink,
                             config_path=root/'HYOL_Daily.ini', require_identity=True,
-                            legacy_state_paths=bond_legacy_paths(root), new_round=request.new_bond_round)
+                            legacy_state_paths=bond_legacy_paths(root), new_round=request.new_bond_round,
+                            keep_ready=True, stop_mode=request.bond_stop_mode)
     else:
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
         runner = DailyRunner('all', selected_tasks=tasks, config_path=root/'DAILY_Client.ini',
@@ -180,7 +235,19 @@ def _make_runner(request, event_sink, root, run_context):
                              arena_wins=request.arena_wins, arena_target_mode=request.arena_target_mode,
                              managed_enabled=request.final_managed,
                              event_sink=event_sink)
+        if request.mode == 'solo' and request.escort_remaining:
+            runner.escort_remaining_only = request.escort_remaining
+            runner.escort_prior_settled = request.escort_prior_settled
     prohibit_purchase(runner.scheduler)
+    if request.mode in INDEPENDENT_MODES:
+        runner.scheduler.config['CurrentWindowOnly'] = '1'
+    if preserve_activity_notices(request):
+        runner.scheduler.config['PreserveActivityNotices']='1'
+    # The explicit Start preparation has already handed focus to the verified
+    # game window. Never repeatedly steal it back from another application
+    # during the task, even when a preserved INI enables AutoForeground.
+    runner.scheduler.config['AutoForeground'] = '0'
+    runner.scheduler.auto_foreground = False
     return runner
 
 
@@ -188,25 +255,39 @@ def completion_verified(request, runner, result):
     """Zero exit alone cannot turn a calendar skip or incomplete record into done."""
     if result != 0:
         return False
+    if request.mode == 'anniversary':
+        from dataclasses import replace
+        return completion_verified(replace(request,mode='multi'),runner,result)
+    if request.escort_remaining:
+        from hyol_escort import remaining_verified
+        return remaining_verified(runner.records.get('escort_remaining',{}),request.escort_remaining)
+    if request.mode in ('puzzle', 'training_record'):
+        from dataclasses import replace
+        return completion_verified(replace(request,mode='solo',tasks=(request.mode,)),runner,result)
     if request.mode == 'team_then_multi':
         return runner.completed()
     if request.mode in ('solo', 'arena', 'weekend', 'treasure'):
         from hyol_puzzle import weekend_verified
         from hyol_daruma_task import verified as daruma_verified
+        from hyol_escort import verified as escort_verified
+        from hyol_anniversary import request_satisfied
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
         records = runner.records
-        return all(records.get(task, {}).get('status') == 'done'
+        return all(request_satisfied(records.get(task,{})) if task=='anniversary' else
+                   records.get(task, {}).get('status') == 'done'
                    and records[task].get('task_completed') is True
                    and records[task].get('home_returned') is True
-                   and (task != 'weekend' or weekend_verified(records[task]))
+                   and (task not in ('weekend','puzzle') or weekend_verified(records[task]))
                    and (task != 'daruma' or daruma_verified(records[task]))
+                   and (task != 'escort' or escort_verified(records[task]))
+                   and (task != 'training_record' or records[task].get('all_goals_complete') is True)
                    and not records[task].get('followup_check_due') for task in tasks) and (
                        not request.final_managed or records.get('managed', {}).get('status') == 'done'
                        and records['managed'].get('task_completed') is True
                        and bool(records['managed'].get('evidence')))
     if request.mode == 'multi':
         s = runner.scheduler
-        if runner.excluded or runner.startup_pending or not s.accounts:
+        if runner.excluded or runner.startup_pending or len(s.accounts) != request.account_count:
             return False
         for account in s.accounts:
             local = runner.runners.get(account.name)
@@ -245,7 +326,12 @@ class RuntimeController:
         return self.worker is not None and self.worker.is_alive()
 
     def emit(self, event, **fields):
-        self.sink({'event': event, 'run_id': self.identifier, **fields})
+        # Observer exceptions must never break the worker's finally chain;
+        # same swallow policy as Scheduler.event.
+        try:
+            self.sink({'event': event, 'run_id': self.identifier, **fields})
+        except Exception:
+            pass
 
     def _launch(self, operation, target):
         with self.lock:
@@ -260,8 +346,10 @@ class RuntimeController:
     def start(self, request):
         return self._launch('run', lambda: self._run(request))
 
-    def check_window(self):
-        return self._launch('check', self._check)
+    def check_window(self, scope=None):
+        from hyol_preparation import validate_scope
+        scope = validate_scope(scope)
+        return self._launch('check', lambda: self._check(scope))
 
     def detect_team_leaders(self):
         return self._launch('leaders',self._detect_leaders)
@@ -305,10 +393,12 @@ class RuntimeController:
         if check_pause and manual_pause_status(self.root)['paused']:
             raise KeyboardInterrupt('人工暂停仍在，停止交接并保留断点')
 
-    def _check(self):
+    def _check(self, scope=None):
         try:
             self._not_cancelled()
-            check = preflight_live()
+            from hyol_preparation import validate_scope
+            check = preflight_live(prepare_scope=validate_scope(scope),stop_event=self.cancel,
+                                   event_sink=self.sink,on_scheduler=lambda s:setattr(self,'scheduler',s))
             self._not_cancelled()
             self.emit('unified_window_check', check=check)
         except BaseException as exc:
@@ -329,6 +419,7 @@ class RuntimeController:
         if not owner:
             raise hs.PendingError('原羁绊账号未唯一确认；战斗已完成，回村和托管保留待处理，不重开战斗')
         config = hs.read_config(self.root/'DAILY_Client.ini')
+        config['AutoForeground'] = '0'
         scheduler = hs.Scheduler(config, 'unified_bond_finish', False, False, event_sink=self.sink)
         self.scheduler = scheduler
         prohibit_purchase(scheduler)
@@ -376,6 +467,7 @@ class RuntimeController:
         if not self.identifier:
             self.identifier = run_id()
         code, complete, detail = 2, False, ''
+        bond_kept_ready = False
         exception_type, exception_traceback = '', ''
         self.runner = None
         evidence = ''
@@ -386,22 +478,76 @@ class RuntimeController:
             if not lease.acquire():
                 raise hs.PendingError('已有脚本占用游戏窗口')
             from hyol_run_context import RunContext
-            context = RunContext.create(self.root,identifier=self.identifier)
+            from hyol_training_resume import is_training, read_candidate, save_cursor
+            from hyol_training_policy import local_day
+            training = is_training(request)
+            pipeline = request.mode == 'team_then_multi'
+            if pipeline:
+                from hyol_team_resume import read_candidate as read_pipeline_candidate
+                candidate = read_pipeline_candidate(shared_directory(self.root),request)
+            else:
+                candidate = read_candidate(shared_directory(self.root),request) if training else None
+            if candidate:self.identifier=candidate['run_id']
+            context = RunContext.create(self.root,identifier=self.identifier,
+                execution_day=candidate['execution_day'] if candidate else local_day() if training or pipeline else None,
+                session_token=candidate['session_token'] if candidate else '')
             self.run_context = context
+            if pipeline:
+                context.pipeline_request = request
+                context.pipeline_resume = bool(candidate)
+                if candidate:
+                    context.pipeline_original_request_key = candidate['request_key']
+                    context.pipeline_deferred_tasks = tuple(candidate.get('deferred_tasks', ()))
+            context.preserve_activity_notices = preserve_activity_notices(request)
             context.begin()
+            if training:save_cursor(context,request,status='preparing',resumable=True)
             self.emit('unified_run_started',state_directory=str(context.directory))
-            self.emit('unified_status', detail='只读检查游戏窗口与当前页面……')
+            self.emit('unified_status', detail='检查当前羁绊准备页……' if request.mode == 'bond' else '检查所选账号并自动回木叶村……')
             with context.activate():
-                check = preflight_live()
+                from hyol_preparation import scope_for_request
+                from hyol_training_resume import restore_binding, verify_resume_window
+                restored = bool((training or pipeline) and candidate and restore_binding(context,candidate))
+                if pipeline and candidate and not restored:
+                    raise hs.PendingError('已有队伍原身份绑定缺失，保留原场，不重新准备或开战')
+                if pipeline and restored:
+                    # This flag records the original three-frame preparation;
+                    # it does not assert that the resumed battle is now home.
+                    context.binding['prepared_leaf_verified']=True
+                if restored:
+                    check=verify_resume_window(self.root,context,self.sink,lambda s:setattr(self,'scheduler',s))
+                else:
+                    check = preflight_live(prepare_scope=scope_for_request(request),stop_event=context.stop,
+                                           event_sink=self.sink,on_scheduler=lambda s:setattr(self,'scheduler',s),
+                                           preserve_bond=request.mode == 'bond')
+                if training and context.binding and check.get('preparation'):
+                    context.binding['training_prepared_accounts']=[row['account'] for row in check.get('accounts',())
+                                                                  if row.get('leaf_verified') and row.get('account')]
+                if training:save_cursor(context,request,status='running',resumable=True)
+                if check.get('preparation') is True:
+                    self.emit('unified_preparation_result',check=check)
+                    self._not_cancelled(check_pause=True)
+                    if check.get('status') == 'stopped':
+                        raise KeyboardInterrupt('准备检查已停止')
+                    if check.get('status') not in ('ready', 'pending'):
+                        raise hs.SafetyError('准备检查已中止：'+str(check.get('reason', check.get('status'))))
+                    if not any(row.get('leaf_verified') is True for row in check.get('accounts',())):
+                        raise hs.PendingError('所选账号尚未确认回木叶村：'+str(check.get('reason','请查看逐号原因')))
+                    check = preflight_live(stop_event=context.stop)
             if not (check.get('status') == 'ready' and check.get('healthy') is True
                     and check.get('content_clicks') == 0):
                 raise hs.PendingError('游戏窗口检查未通过：'+str(check.get('reason', check.get('status'))))
+            if request.escort_remaining and check.get('main_ready') is not True:
+                raise hs.PendingError('剩余押镖开始前未确认主界面，未发送任务操作')
             self._not_cancelled(check_pause=True)
             self.runner = make_runner(request, self.sink, self.root, run_context=context)
+            if pipeline:
+                from hyol_team_resume import save_cursor as save_pipeline_cursor
+                save_pipeline_cursor(context,request,status='running')
             self.scheduler = self.runner.scheduler
             self._not_cancelled(check_pause=True)
-            self.emit('unified_status', detail='执行所选任务；最后逐账号核实木叶回村'
-                      +('与托管。' if request.final_managed else '。'))
+            self.emit('unified_status', detail=('当前窗口：匹配、检查自动、结算后下一场；保留队伍，不领取宝箱。'
+                      if request.mode == 'bond' else '执行所选任务；最后逐账号核实木叶回村'
+                      +('与托管。' if request.final_managed else '。')))
             bond_path = shared_directory(self.root)/'unified_bond_finish.json' if request.mode == 'bond' else None
             finish = read_record(bond_path) if bond_path else {}
             original = validated_bond_finish(finish) if bond_path else None
@@ -416,7 +562,7 @@ class RuntimeController:
             else:
                 self._not_cancelled(check_pause=True)
                 code = self.runner.run()
-                if request.mode == 'bond' and code == 0:
+                if request.mode == 'bond' and code == 0 and not getattr(self.runner, 'keep_ready', False):
                     owner = getattr(self.runner, '_unified_owner', '')
                     if not owner or self.runner.request.get('owner') != owner:
                         raise hs.PendingError('羁绊开战身份与原轮次未关联；战斗结果保留，不能收尾')
@@ -425,7 +571,16 @@ class RuntimeController:
                               'at': hs.now_iso(), 'entry_root': str(self.root)}
                     hs.atomic_json(bond_path, finish)
             self._not_cancelled(check_pause=True)
-            if request.mode == 'bond' and code == 0:
+            if request.mode == 'bond' and code == 0 and getattr(self.runner, 'keep_ready', False) and not original:
+                rec = self.runner.request
+                evidence = rec.get('ready_evidence', '')
+                bond_kept_ready = True
+                complete = (rec.get('status') == 'done' and rec.get('phase') == 'ready'
+                            and rec.get('owner') == getattr(self.runner, '_unified_owner', None)
+                            and target_reached(rec) and bool(evidence)
+                            and Path(evidence).is_file())
+                detail = '当前窗口羁绊场次与结算已核实；停留准备页，可开始新一轮。' if complete else '羁绊准备页完成凭据仍待核实。'
+            elif request.mode == 'bond' and code == 0:
                 evidence = self._finish_bond(self.runner, managed_enabled=request.final_managed)
                 complete = bool(evidence)
                 finish.update(status='done', evidence=evidence, managed_enabled=request.final_managed,
@@ -433,15 +588,23 @@ class RuntimeController:
                 hs.atomic_json(bond_path, finish)
             else:
                 complete = completion_verified(request, self.runner, code)
+                if complete and request.escort_remaining:
+                    detail = f'本次剩余{request.escort_remaining}次押镖和回村已核实；此前次数保留原记录。'
             if code == 0 and not complete:
                 code = 2
-                detail = '当前任务、领奖、木叶回村'+('或最后托管' if request.final_managed else '')+'证据未齐全；保留待处理。'
+                calendar = getattr(self.runner, 'calendar_plan', None)
+                if (isinstance(calendar, dict) and calendar.get('calendar_skipped')
+                        and not calendar.get('effective_tasks')):
+                    detail = f"执行日{calendar.get('execution_day', '')}：所选活动当前未开放，未执行；不计完成。"
+                else:
+                    detail = '当前任务、领奖、木叶回村'+('或最后托管' if request.final_managed else '')+'证据未齐全；保留待处理。'
                 if request.mode == 'team' and self.runner.team:
                     source_day = self.runner._run_record(self.runner.team).get('source_day')
                     if source_day != self.runner.scheduler.state.day:
                         detail = f'已核实{source_day}原队伍收尾；本日任务尚未实机确认，保留待验。'
         except KeyboardInterrupt:
-            code, complete, detail = 130, False, '本轮已停止；再次开始将按当前画面和选择创建新运行。'
+            code, complete, detail = 130, False, ('羁绊已停止；再次开始继续原轮次，未决场次不重复匹配。'
+                if request.mode == 'bond' else '本轮已停止；再次开始将按当前画面和选择创建新运行。')
             mark_manual_pause(self.root, self.identifier, 'F12或用户停止统一客户端')
         except Exception as exc:
             code, complete, detail = 2, False, str(exc)
@@ -463,9 +626,31 @@ class RuntimeController:
                        'state_directory': str(context.directory) if context else '',
                        'error_type': exception_type, 'error_traceback': exception_traceback,
                        'result': code, 'status': 'complete' if complete else 'stopped' if code == 130 else 'pending',
-                       'detail': detail, 'final_managed_evidence': evidence if request.final_managed else '',
-                       'home_evidence': evidence if not request.final_managed else '', 'at': hs.now_iso(),
+                       'detail': detail, 'final_managed_evidence': evidence if request.final_managed and not bond_kept_ready else '',
+                       'home_evidence': evidence if not request.final_managed and not bond_kept_ready else '',
+                       'bond_ready_evidence': evidence if bond_kept_ready else '',
+                       'bond_kept_ready': bond_kept_ready, 'at': hs.now_iso(),
                        'live_acceptance': '未实测条目须由逐项实机验收记录确认'}
+            if context is not None:
+                from hyol_training_resume import is_training, save_cursor
+                if is_training(request):
+                    try:
+                        cursor=save_cursor(context,request,status=receipt['status'])
+                        receipt['training_resumable']=cursor['resumable']
+                        if code == 130:receipt['detail']='修行录已停止；再次开始会沿原轮次、原动作及数量预算继续。'
+                    except OSError as exc:
+                        receipt.update(status='pending',result=2,save_error=str(exc),
+                                       detail='修行录原轮次入口保存失败；原任务文件保留，请先核实入口。')
+                elif request.mode == 'team_then_multi':
+                    from hyol_team_resume import save_cursor as save_pipeline_cursor
+                    try:
+                        cursor=save_pipeline_cursor(context,request,status=receipt['status'])
+                        receipt['pipeline_resumable']=cursor['resumable']
+                        if code==130:
+                            receipt['detail']='已有队伍本轮已停止；再次开始沿原场次、原通缉与押镖凭据继续。'
+                    except OSError as exc:
+                        receipt.update(status='pending',result=2,save_error=str(exc),
+                                       detail='已有队伍原轮次入口保存失败；原任务文件保留，请先核实入口。')
             if pipeline_summary:
                 receipt['pipeline'] = pipeline_summary
             if isinstance(runner_summary, dict):
@@ -475,7 +660,28 @@ class RuntimeController:
                 hs.atomic_json(self.root/'logs/unified_latest.json', receipt)
             except OSError as exc:
                 receipt['save_error'] = str(exc)
-            self.emit('unified_finished', **receipt)
-            self.scheduler = None
-            self.run_context = None
+            try:
+                self.emit('unified_finished', **receipt)
+            finally:
+                self._release_run_resources()
             self.emit('unified_idle')
+
+    def _release_run_resources(self):
+        # The receipt owns only plain data. The GUI no longer needs runners or
+        # captures; drop even cyclic nested runners after the worker is finished.
+        pending = [self.runner, self.scheduler]
+        self.runner = self.scheduler = self.run_context = None
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            values = getattr(current, '__dict__', {})
+            pending.extend(values.get(key) for key in ('scheduler', 'solo'))
+            runners = values.get('runners')
+            if isinstance(runners, dict):
+                pending.extend(runners.values())
+            if isinstance(current, hs.Scheduler):
+                current.release_resources()
+

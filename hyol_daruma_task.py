@@ -38,7 +38,11 @@ def run(r):
 
     # Windows mutex ownership is recursive for this same worker thread.
     # Desktop takes/releases its own recursion, retaining the parent lease.
-    engine = DarumaRunner(s.hwnd, stop=s.stop, root=directory, sink=emit, expected_binding=expected)
+    request = getattr(r, 'training_request', None)
+    request = request if isinstance(request, dict) and request.get('task') == 'daruma' else None
+    quantity = dict(round_limit=request['required'] if request.get('unit') == 'count' else 1,
+                    quantity_request_id=request['id']) if request else {}
+    engine = DarumaRunner(s.hwnd, stop=s.stop, root=directory, sink=emit, expected_binding=expected, **quantity)
     try:
         result = engine.run()
     finally:
@@ -56,6 +60,21 @@ def run(r):
     rec.update(engine_version=VERSION, checkpoint=result.get('checkpoint'), last_report=result)
     r.save()
     s.check_stop()
+    if result.get('status') == 'request_satisfied' and request and engine.journal is not None:
+        data = engine.journal.data
+        if data.get('intent') or data.get('round_active'):
+            raise hs.PendingError('达摩原局或敲击尚未结算，保留数量请求')
+        count_unit = request.get('unit') == 'count'
+        request.update(quantity_state='verified' if count_unit else 'requires_goal_rescan', available=data.get('chance'),
+                       settled=quantity['round_limit'] if count_unit else None, scheduled=quantity['round_limit'],
+                       quota_unit='round_chances',
+                       evidence=str(engine.journal.path))
+        rec.update(status='pending', task_completed=False, remaining=data.get('remaining'),
+                   training_request_satisfied=request['id'])
+        r.click('daruma_weekend_close.bmp', (1330,288,1385,345),16,16,
+                'daruma_training_close',['daruma_weekend_page.bmp'],threshold=.93,anchor_threshold=.93)
+        r.return_to_main();r.save()
+        return
     if result.get('status') == 'stopped':
         raise hs.SafetyError(result.get('reason', '达摩安全停止，原动作保留'))
     if result.get('status') != 'done' or engine.journal is None:

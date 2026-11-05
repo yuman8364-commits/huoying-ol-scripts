@@ -51,7 +51,7 @@ class TeamSelection:
             raise ValueError("队长与队员标签不能重复")
         if not self.tasks or len(set(self.tasks)) != len(self.tasks) or any(task not in TASKS for task in self.tasks):
             raise ValueError("须勾选有效的组队任务")
-        object.__setattr__(self, "tasks", tuple(task for task in TASKS if task in self.tasks))
+        object.__setattr__(self, "tasks", tuple(self.tasks))
 
 
 def _trim(mask: np.ndarray) -> np.ndarray | None:
@@ -165,7 +165,11 @@ def room_member_assignment(frame: Image.Image, references: dict[str, np.ndarray]
                 continue
             score = (.6*hs.mask_f1(reference[:, :hs.IDENTITY_SERVER_WIDTH], got[:, :hs.IDENTITY_SERVER_WIDTH])
                      + .4*hs.mask_f1(reference, got))
-            scores.append((score, corr, name))
+            # A high glyph-overlap score at a poor correlation location is
+            # not an identity candidate. Ranking it first used to mask the
+            # correctly located role and reject otherwise verified rooms.
+            if score >= .85 and corr >= .85:
+                scores.append((score, corr, name))
         scores.sort(reverse=True)
         if (not scores or scores[0][0] < .85 or scores[0][1] < .85
                 or len(scores) > 1 and scores[0][0] - scores[1][0] < .06):
@@ -183,6 +187,12 @@ def room_member_assignment(frame: Image.Image, references: dict[str, np.ndarray]
 class SixTabScheduler(hs.Scheduler):
     """Use tab highlights and transient visuals as the account lease."""
 
+    def template(self, name, roi=hs.VIEW, frame=None, threshold=None):
+        result = super().template(name,roi,frame,threshold=threshold)
+        if name == 'friends_panel_close.bmp' and not result[0]:
+            return super().template('friends_panel_close_core_20261030.bmp',(1840,260,1920,350),frame,threshold=.98)
+        return result
+
     def __init__(self, event_sink=None):
         config = hs.read_config(hs.ROOT / "TEAM_Client.ini")
         config.update(AccountMode="tab6", TabAccountNames=",".join(f"当前窗口标签{i}" for i in range(1, 7)),
@@ -199,6 +209,7 @@ class SixTabScheduler(hs.Scheduler):
         self._bound_identity_masks: dict[int, np.ndarray] = {}
         self._bound_identity_names: dict[int, str] = {}
         self.automatic_accounts = True
+        self.portable_accounts = self.config.get('PortableAccounts', '1') == '1'
         self.config['AccountDiscovery'] = 'automatic'
 
     @staticmethod
@@ -215,7 +226,12 @@ class SixTabScheduler(hs.Scheduler):
         except hs.PendingError:
             active = False
         reference = self._tab_title_masks.get(account.index)
-        title_score = hs.mask_f1(reference, self._title_mask(frame, account.tab_x)) if reference is not None else 0.0
+        current_title = self._title_mask(frame, account.tab_x)
+        title_score = hs.mask_f1(reference, current_title) if reference is not None else 0.0
+        if reference is not None and not reference.any() and not current_title.any():
+            # A blank browser title is valid. The selected-tab highlight and
+            # the independently bound, unique role still have to match.
+            title_score = 1.0
         role_ok, role_scores, _visible = self._bound_role_verified(account, frame)
         return active and title_score >= .70 and role_ok, {**role_scores, "tab_title": title_score}
 
@@ -243,7 +259,8 @@ class SixTabScheduler(hs.Scheduler):
     def switch_account(self, account: hs.Account, verify: bool = True):
         context = getattr(self, 'run_context', None)
         if context and context.binding and not context.probing:
-            return context.select(self, account)
+            return context.select(self, account,allow_hidden=not verify
+                or account.name in getattr(self,'expected_invitation_members',set()))
         self.chrome_click(account.tab_x, 10, f"switch_tab:{account.index}", account)
         self.wait_interruptible(.8)
         frame = self.capture()
@@ -276,7 +293,18 @@ class SixTabScheduler(hs.Scheduler):
     def content_guard(self, account, page_anchors=(), anchor_threshold=None):
         anchors = tuple(page_anchors)
         frame = super().content_guard(account, anchors, anchor_threshold)
-        if self.template("team_invite_question_current.bmp", (500,300,1400,800), frame, threshold=.95)[0]:
+        from hyol_team_invitation import inspect as inspect_invitation, QUESTION
+        modal = inspect_invitation(frame,self.templates)
+        if modal is not None:
+            decline = getattr(self,'_approved_invitation_decline',None)
+            accept = getattr(self,'_approved_invitation',None)
+            accepting = (accept and accept[0] == account.name and 'team_invite_accept_yes.bmp' in anchors
+                         and self.template(accept[1],(601,350,1301,750),frame,threshold=.98)[0])
+            declining = (decline == (account.name,modal) and QUESTION in anchors
+                         and account.name not in self.expected_invitation_members)
+            if not (accepting or declining):
+                raise hs.PendingError('邀请来源或原动作未核实，弹窗保留；不接受、不拒绝、不点击其他页面')
+        if modal is None and self.template("team_invite_question_current.bmp", (500,300,1400,800), frame, threshold=.95)[0]:
             approved = getattr(self, "_approved_invitation", None)
             if (not approved or approved[0] != account.name or "team_invite_accept_yes.bmp" not in anchors
                     or not self.template(approved[1], (601,350,1301,750), frame, threshold=.98)[0]):
@@ -506,15 +534,30 @@ class SixTabScheduler(hs.Scheduler):
         from hyol_accounts import observe_accounts, register_observations, game_session_token
         from hyol_checkpoints import current_identity_crop, encode_mask
         self.bind_window(wait=True, timeout_seconds=15)
-        centers, observations, frames, unavailable = observe_accounts(self)
+        context=getattr(self,'run_context',None)
+        shared=context.binding if context else None
+        if (isinstance(shared,dict) and shared.get('prepared_leaf_verified') is True
+                and isinstance(shared.get('observations'),dict)
+                and shared['observations'] and context.layout_matches(self.capture())):
+            from hyol_accounts import is_captain
+            centers=shared['centers'];observations=shared['observations'];frames=shared['frames']
+            unavailable=shared['unavailable'];mapping=shared['mapping'];refs=shared['refs']
+            self._observed_captain_tabs={centers[i-1]:is_captain(self,frames[i]) for i in mapping}
+            self.event('account_scan_reused',count=len(mapping),content_clicks=0,
+                       detail='复用本轮检查回村的三帧身份映射；每次操作继续核对新画面')
+        else:
+            centers, observations, frames, unavailable = observe_accounts(self)
+            mapping, refs = register_observations(self, observations)
         if any(slot > len(centers) for slot in slots):
             raise hs.PendingError('所选账号标签已不存在，原断点保留')
         if tab_positions is not None and (set(tab_positions) != set(range(1,len(centers)+1))
                                          or set(tab_positions.values()) != set(centers)):
             raise hs.PendingError('恢复映射不是当前位置的完整排列')
-        mapping, refs = register_observations(self, observations)
+        # The fresh preparation measured the physical browser layout. Keep
+        # highlight detection on that same layout instead of the old INI Xs.
+        self.config['TabXs'] = ','.join(map(str, centers))
         self.session_token = game_session_token(self)
-        self.accounts = [hs.Account(i,f'当前窗口标签{i}',
+        self.accounts[:] = [hs.Account(i,f'当前窗口标签{i}',
                             tab_positions[i] if tab_positions is not None else x)
                          for i,x in enumerate(centers,1)]
         self.by_name = {a.name:a for a in self.accounts}
@@ -564,7 +607,17 @@ class SixTabScheduler(hs.Scheduler):
     def _open_friends(self, leader: hs.Account) -> Image.Image:
         self.switch_account(leader)
         self.prepare_main(leader)
-        if not self.click_template(leader, "friends_toolbar.bmp", (1715,70,1770,120),
+        if self.template('mail_ready_anchor.bmp',(500,200,1420,850))[0]:
+            if not self.click_template(leader,'mail_close.bmp',(1301,249,1401,349),20,20,
+                    'generic_friends_close_mail',['mail_ready_anchor.bmp'],threshold=.98):
+                raise hs.PendingError('好友入口前邮件面板关闭未确认')
+            if not self.wait_absent('mail_ready_anchor.bmp',(500,200,1420,850),5):
+                raise hs.PendingError('邮件面板尚未关闭，未点击好友')
+        if self.template('friends_panel_close.bmp',(1870,260,1920,350))[0]:
+            return self.capture()
+        core = self.click_template(leader, 'friends_toolbar_core_20261030.bmp', (1710,70,1740,125),
+                                  8,10,'generic_open_friends',['anchor_top_menu.bmp'],threshold=.98)
+        if not core and not self.click_template(leader, "friends_toolbar.bmp", (1715,70,1770,120),
                                    12, 11, "generic_open_friends", ["anchor_top_menu.bmp"], threshold=.88):
             raise hs.PendingError("队长好友按钮未确认")
         if not self.wait_template("friends_panel_close.bmp", (1870,260,1920,350), 5):
@@ -574,7 +627,7 @@ class SixTabScheduler(hs.Scheduler):
 
     def _close_friends(self, leader: hs.Account) -> None:
         if not self.click_template(leader, "friends_panel_close.bmp", (1870,260,1920,350),
-                                   20, 20, "generic_close_friends", ["friends_panel_close.bmp"]):
+                                   10, 10, "generic_close_friends", ["friends_panel_close.bmp"]):
             raise hs.PendingError("好友列表关闭按钮未确认")
         if not self.wait_absent("friends_panel_close.bmp", (1870,260,1920,350), 5):
             raise hs.PendingError("好友列表未关闭")
@@ -683,7 +736,7 @@ class SixTabScheduler(hs.Scheduler):
         self.expected_invitation_members.add(member.name)
         try:
             self.switch_account(member)
-            if not self.wait_template("team_invite_question_current.bmp", (601,350,1301,750), 30):
+            if not self.wait_template(origin, (601,350,1301,750), 30, threshold=.98):
                 self.reconcile_team_membership(team, leader)
                 return
             for sample in range(2):
@@ -698,7 +751,7 @@ class SixTabScheduler(hs.Scheduler):
             if not self.click_template(member, "team_invite_accept_yes.bmp", (751,500,1051,700),
                                        50,16,accepted,[origin,"team_invite_accept_yes.bmp"],irreversible=True):
                 raise hs.PendingError("邀请接受按钮消失")
-            if not self.wait_absent("team_invite_question_current.bmp", (601,350,1301,750), 5):
+            if not self.wait_absent(origin, (601,350,1301,750), 5, threshold=.98):
                 raise hs.PendingError("邀请确认框仍在，接受结果待核实；不重复接受")
         finally:
             self._approved_invitation = None

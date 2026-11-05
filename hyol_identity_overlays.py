@@ -41,8 +41,86 @@ def clear_hover_preview(s):
     return True
 
 
+def inspect_arena_entry_notice(s, frame):
+    """Recognize informational arena dialogs independently of the obscured lobby."""
+    title = s.template('arena_season_notice_title_20261101.bmp', (830,310,1090,390), frame, threshold=.98)[0]
+    body = s.template('arena_season_notice_body_20261101.bmp', (825,375,1130,435), frame, threshold=.98)[0]
+    if title or body:
+        button = 'arena_season_notice_confirm_20261101.bmp'
+        roi = (890,675,1040,735)
+        confirm = s.template(button, roi, frame, threshold=.98)
+        if not (title and body and confirm[0]):
+            return ('blocked_arena_season_notice',)
+        return ('arena_season_notice', button, roi, 40, 10, confirm[2], confirm[3])
+    if s.template('arena_rankup_notice_body_20261031.bmp', (800,360,1150,430), frame, threshold=.98)[0]:
+        button = 'arena_rankup_notice_confirm_core_20261031.bmp'
+        roi = (875,650,1030,725)
+        confirm = s.template(button, roi, frame, threshold=.98)
+        if not confirm[0]:
+            return ('blocked_arena_rankup_notice',)
+        return ('arena_rankup_notice', button, roi, 32, 11, confirm[2], confirm[3])
+    if s.template('arena_trial_notice_title_current.bmp', (780,270,1190,390), frame, threshold=.98)[0]:
+        close = s.template('arena_trial_notice_close_current.bmp', (1190,290,1290,390), frame, threshold=.98)
+        fingerprint = _trial_notice_fingerprint(frame)
+        if not close[0] or fingerprint is None:
+            return ('blocked_arena_trial_notice',)
+        return ('arena_trial_notice', 'arena_trial_notice_close_current.bmp', (1190,290,1290,390),
+                11, 11, close[2], close[3], fingerprint)
+    return None
+
+
+def inspect_bond_shell(s, frame):
+    """Recognize only finished points and the idle lobby for leaving Bond."""
+    import hyol_scheduler as hs
+    current_body=s.template('bond_points_body_20261031.bmp',(850,395,1090,455),frame,threshold=.98)[0]
+    current_points=s.template('bond_points_label_20261031.bmp',(870,565,1030,640),frame,threshold=.98)[0]
+    if current_body or current_points:
+        button='bond_points_close_core_20261030.bmp'
+        roi=(1190,285,1290,390)
+        close=s.template(button,roi,frame,threshold=.98)
+        if current_body and current_points and close[0]:
+            return ('bond_points_result',button,roi,12,12,close[2],close[3])
+    body=s.template('bond_points_body_20261030.bmp',(835,365,1070,430),frame,threshold=.98)[0]
+    points=s.template('bond_points_label_20261030.bmp',(870,545,1000,610),frame,threshold=.98)[0]
+    button='login_update_notice_close_core_current.bmp'
+    if body or points:
+        button='bond_points_close_core_20261030.bmp'
+        roi=(1190,285,1290,390)
+        close=s.template(button,roi,frame,threshold=.98)
+        if not (body and points and close[0]):return ('blocked_bond_points',)
+        return ('bond_points_result',button,roi,12,12,close[2],close[3])
+    if current_body or current_points:
+        return ('blocked_bond_points',)
+    ready=s.template('bond_ready_anchor.bmp',(1000,200,1500,450),frame,threshold=.98)[0]
+    match=s.template('bond_match_battle.bmp',(650,700,1050,900),frame,threshold=.98)[0]
+    if not (ready and match):return None
+    if (s._battle_hud_visible(frame)
+            or s.template('arena_matching_anchor.bmp',(601,349,1201,751),frame,threshold=.98)[0]
+            or s.template('arena_loading_anchor.bmp',hs.ARENA_LOADING_ROI,frame,threshold=.98)[0]):
+        return ('blocked_bond_lobby',)
+    roi=(1550,80,1700,165)
+    close=s.template(button,roi,frame,threshold=.98)
+    if not close[0]:return ('blocked_bond_lobby',)
+    return ('bond_idle_lobby',button,roi,12,12,close[2],close[3])
+
+
 def inspect(s, frame):
     import hyol_scheduler as hs
+    from hyol_navigation import content_loading_visible
+    if content_loading_visible(s, frame):
+        return ('blocked_content_loading',)
+    # Rank notices also contain "积分". Their full arena-specific body must
+    # take priority over a partial Bond points-label match on the same frame.
+    arena_notice = inspect_arena_entry_notice(s, frame)
+    if arena_notice is not None:
+        return arena_notice
+    bond=inspect_bond_shell(s,frame)
+    if bond is not None:return bond
+    from hyol_quiz import result_visible
+    if result_visible(s,frame):
+        # A quiz result can still contain an unclaimed reward. Only its own
+        # task handler may reconcile it; identity discovery must not close it.
+        return ('blocked_quiz_finished',)
     title = s.template('login_update_notice_title_current.bmp', (900,380,1230,490), frame, threshold=.98)
     body = s.template('login_update_notice_body_current.bmp', (760,550,1040,640), frame, threshold=.98)
     close = s.template('login_update_notice_close_core_current.bmp', (1350,415,1425,490), frame, threshold=.98)
@@ -51,29 +129,41 @@ def inspect(s, frame):
             return ('update_notice', 'login_update_notice_close_core_current.bmp',
                     (1350,415,1425,490), 12, 12, close[2], close[3])
         return ('blocked_update_notice',)
-    if s.template('arena_trial_notice_title_current.bmp',(780,270,1190,390),frame,threshold=.98)[0]:
-        close = s.template('arena_trial_notice_close_current.bmp',(1190,290,1290,390),frame,threshold=.98)
-        fingerprint = _trial_notice_fingerprint(frame)
-        if not close[0] or fingerprint is None:
-            return ('blocked_arena_trial_notice',)
-        return ('arena_trial_notice','arena_trial_notice_close_current.bmp',(1190,290,1290,390),11,11,close[2],close[3],fingerprint)
+    if s.template('daily_practice_title_core_20261029.bmp',(1100,150,1260,260),frame,threshold=.98)[0]:
+        close=s.template('login_update_notice_close_core_current.bmp',(1370,200,1460,280),frame,threshold=.98)
+        if not close[0]:return ('blocked_daily_practice',)
+        return ('daily_practice','login_update_notice_close_core_current.bmp',(1370,200,1460,280),
+                12,12,close[2],close[3])
+    if s.template('interference_recharge_title_20261022.bmp',(900,235,1250,325),frame,threshold=.98)[0]:
+        close=s.template('interference_recharge_close_20261022.bmp',(1290,285,1350,350),frame,threshold=.98)
+        if not close[0]:
+            return ('blocked_recharge_activity',)
+        return ('recharge_activity','interference_recharge_close_20261022.bmp',
+                (1290,285,1350,350),13,14,close[2],close[3])
     if (s.template('team_public_room_title_current.bmp',(900,230,1100,315),frame,threshold=.98)[0]
             and s.template('team_create_button.bmp',(951,650,1301,850),frame,threshold=.98)[0]):
         close = s.template('team_room_close.bmp',(1360,250,1450,340),frame,threshold=.98)
         if not close[0]:
             return ('blocked_public_team_room',)
         return ('public_team_room','team_room_close.bmp',(1360,250,1450,340),20,20,close[2],close[3])
-    if (s.template('quiz_page.bmp',(820,380,1060,450),frame,threshold=.98)[0]
-            and s.template('quiz_zero.bmp',(1150,413,1250,445),frame,threshold=.98)[0]
-            and s.template('quiz_finish.bmp',(550,300,1350,850),frame,threshold=.98)[0]):
-        # A timed-out quiz can finish while another tab is running. Close its
-        # proven terminal page to reveal the name, without claiming rewards or
-        # changing the previous quiz/submission receipts.
-        close = s.template('market_close.bmp',(1250,325,1350,410),frame,threshold=.98)
-        if not close[0]:
-            return ('blocked_quiz_finished',)
-        return ('quiz_finished','market_close.bmp',(1250,325,1350,410),15,15,close[2],close[3])
+    for kind,body in (('hot_spring_exit_prompt','hot_spring_leave_prompt_text.bmp'),
+                      ('home_exit_prompt','home_leave_prompt_text.bmp')):
+        if s.template(body,(600,350,1300,800),frame,threshold=.98)[0]:
+            confirm=s.template('hot_spring_leave_confirm.bmp',(600,350,1300,800),frame,threshold=.98)
+            if not confirm[0]:return ('blocked_'+kind,)
+            return (kind,'hot_spring_leave_confirm.bmp',(600,350,1300,800),45,22,confirm[2],confirm[3])
+    if s.template('hot_spring_title_current.bmp',(780,230,1100,430),frame,threshold=.98)[0]:
+        close=s.template('hot_spring_panel_close.bmp',(550,70,1650,450),frame,threshold=.98)
+        if not close[0]:return ('blocked_hot_spring',)
+        return ('hot_spring','hot_spring_panel_close.bmp',(550,70,1650,450),20,20,close[2],close[3])
+    if (s.template('story_instance_title_current.bmp',(750,230,1000,320),frame,threshold=.98)[0]
+            and s.template('story_instance_elite_current.bmp',(960,240,1160,320),frame,threshold=.98)[0]):
+        close=s.template('story_instance_close_current.bmp',(1380,250,1480,330),frame,threshold=.98)
+        if not close[0] or s._battle_hud_visible(frame):return ('blocked_story_instance',)
+        return ('story_instance','story_instance_close_current.bmp',(1380,250,1480,330),18,18,close[2],close[3])
     for kind, anchor, roi, button, close_roi, offset in (
+            ('training_record','training_record_title.bmp',(390,120,770,280),
+             'training_record_close.bmp',(1350,215,1420,290),14),
             ('black_market', 'market_anchor.bmp', (651,69,1251,319),
              'market_close.bmp', (1301,219,1919,369), 15),
             ('welfare', 'welfare_title_current.bmp', (1120,230,1320,380),
@@ -83,6 +173,14 @@ def inspect(s, frame):
         anchor_match = s.template(anchor, roi, frame, threshold=.98)
         close_match = s.template(button, close_roi, frame, threshold=.98)
         if anchor_match[0]:
+            if kind=='welfare' and not close_match[0]:
+                # Login backgrounds can differ behind the transparent rim of
+                # this X. Its already enrolled opaque core is shared with the
+                # update notice; require the welfare title independently.
+                core='login_update_notice_close_core_current.bmp'
+                core_match=s.template(core,close_roi,frame,threshold=.98)
+                if core_match[0]:
+                    return (kind,core,close_roi,12,12,core_match[2],core_match[3])
             if not close_match[0]:
                 return ('blocked_'+kind,)
             return (kind, button, close_roi, offset, offset, close_match[2], close_match[3])
@@ -121,10 +219,32 @@ def inspect(s, frame):
         if button and close[0]:
             return ('arena_lobby','market_close.bmp',(1585,77,1685,177),15,15,close[2],close[3])
         return ('blocked_arena_lobby',)
+    # Preparation and identity discovery share the same positively enrolled
+    # shell pairs, including a ninja screen covering the role name. Keep the
+    # existing overlay journal, tab custody and fresh click guard for these
+    # closes too, so restarting preparation cannot resend an unknown X.
+    from hyol_navigation import preparation_blocked, preparation_panel
+    panel = preparation_panel(s, frame)
+    if panel is not None:
+        if preparation_blocked(s, frame):
+            return ('blocked_preparation_result',)
+        anchor, _anchor_roi, button, close_roi = panel
+        close = s.template(button, close_roi, frame, threshold=.98)
+        return ('preparation_panel_'+anchor.removesuffix('.bmp'), button, close_roi,
+                17, 17, close[2], close[3])
+    if (s.template('friends_panel_title_20261029.bmp',(1730,280,1840,340),frame,threshold=.98)[0]
+            or s.template('friends_panel_title_core_20261030.bmp',(1730,280,1840,340),frame,threshold=.98)[0]):
+        if preparation_blocked(s,frame):return ('blocked_friends_panel',)
+        old_close=s.template('friends_panel_close.bmp',(1840,260,1920,350),frame,threshold=.98)
+        if old_close[0]:
+            return ('friends_panel','friends_panel_close.bmp',(1840,260,1920,350),15,15,old_close[2],old_close[3])
+        close=s.template('friends_panel_close_core_20261030.bmp',(1840,260,1920,350),frame,threshold=.98)
+        if not close[0]:return ('blocked_friends_panel',)
+        return ('friends_panel','friends_panel_close_core_20261030.bmp',(1840,260,1920,350),10,10,close[2],close[3])
     return None
 
 
-def dismiss_identity_overlays(s, account, frame=None, *, only_kind=None):
+def dismiss_identity_overlays(s, account, frame=None, *, only_kind=None, frame_predicate=None):
     """Acknowledge UI only; never identify an account or settle a task/result."""
     import hyol_scheduler as hs
     from hyol_accounts import _tab_title_mask, _same_tab_title, game_session_token
@@ -144,17 +264,24 @@ def dismiss_identity_overlays(s, account, frame=None, *, only_kind=None):
     title_hash = hashlib.sha256(title_mask.tobytes()).hexdigest()
     path = s.shared_state_directory/'identity_overlay_cleanup.json'
     nontrial_layers = 0
+    preparation_layers = 0
     for layer in range(8):
         expected = inspect(s, frame)
         if expected is None:
             return frame
         if only_kind is not None and expected[0] != only_kind:
             return frame
-        if expected[0] != 'arena_trial_notice':
+        if expected[0].startswith('preparation_panel_'):
+            preparation_layers += 1
+            if preparation_layers > 6:
+                raise hs.PendingError('普通面板超过六层，保留待核实')
+        elif expected[0] != 'arena_trial_notice':
             nontrial_layers += 1
             if nontrial_layers > 3:
                 raise hs.PendingError('身份遮挡页面超过三层，保留待核实')
         if expected[0].startswith('blocked_'):
+            if expected[0] == 'blocked_content_loading':
+                raise hs.PendingError('资源加载遮罩仍在进行，未点击下层关闭按钮')
             raise hs.PendingError('身份遮挡页面标题已确认，但其独立关闭X未确认；未点击下层窗口')
         def require(current):
             observed = inspect(s,current)
@@ -165,7 +292,8 @@ def dismiss_identity_overlays(s, account, frame=None, *, only_kind=None):
             if (s.offline_dialog_visible(current)
                     or s._generic_active_tab_x(current) != account.tab_x
                     or not _same_tab_title(title_mask, _tab_title_mask(current,account.tab_x))
-                    or not same_close):
+                    or not same_close
+                    or (frame_predicate is not None and not frame_predicate(current))):
                 evidence = str(s.save_raw_evidence(current,account,'identity_overlay_changed','pending'))
                 s.event('identity_overlay_changed',account,expected=expected,observed=observed,
                         selected_tab=s._generic_active_tab_x(current),expected_tab=account.tab_x,
@@ -250,6 +378,8 @@ def dismiss_identity_overlays(s, account, frame=None, *, only_kind=None):
             if stable == 3:
                 after = str(s.save_raw_evidence(frame,account,'identity_overlay_'+expected[0],'verified'))
                 records = read_checkpoint(path)
+                if records.get(identifier) != row:
+                    raise s.PendingError('遮挡关闭凭据被并发更新，保留待核实')
                 records[identifier] = dict(row,status='done',evidence=after,finished_at=hs.now_iso(),
                                            main_ready=s.main_ready(frame))
                 hs.atomic_json(path,records)

@@ -18,13 +18,24 @@ def claim_button_disabled(frame):
 
 
 def result_visible(scheduler, frame):
-    return (scheduler.template('quiz_finish.bmp',(550,300,1350,850),frame,threshold=.92)[0]
-            and scheduler.template('quiz_zero.bmp',(1150,413,1250,445),frame,threshold=.95)[0]
-            and scheduler.template('quiz_close.bmp',(1250,325,1350,410),frame,threshold=.90)[0])
+    return (scheduler.template('quiz_zero.bmp',(1150,413,1250,445),frame,threshold=.95)[0]
+            and scheduler.template('quiz_close.bmp',(1250,325,1350,410),frame,threshold=.90)[0]
+            and (scheduler.template('quiz_finish.bmp',(550,300,1350,850),frame,threshold=.92)[0]
+                 or scheduler.template('quiz_solo_layout.bmp',(0,160,300,300),frame,threshold=.98)[0]))
 
 
 def claimed_result_visible(scheduler, frame):
-    return result_visible(scheduler, frame) and claim_button_disabled(frame)
+    return (result_visible(scheduler, frame) and claim_button_disabled(frame)
+            and scheduler.template('quiz_finish.bmp',(550,300,1350,850),frame,threshold=.92)[0])
+
+
+def claim_button_template(scheduler, frame):
+    if not result_visible(scheduler,frame) or claim_button_disabled(frame):return None
+    if scheduler.template('quiz_finish.bmp',(550,300,1350,850),frame,threshold=.92)[0]:
+        return 'quiz_finish.bmp',.92
+    if scheduler.template('quiz_finish_current_20261027.bmp',(550,300,1350,850),frame,threshold=.98)[0]:
+        return 'quiz_finish_current_20261027.bmp',.98
+    return None
 
 
 def start_dialog_visible(scheduler, frame):
@@ -36,9 +47,13 @@ def start_dialog_visible(scheduler, frame):
 
 def finish_claimed_result(r, frame):
     s, rec = r.scheduler, r.record('quiz')
-    s.save_raw_evidence(frame, r.account, 'quiz_claim_disabled', 'verified')
+    if not claimed_result_visible(s,frame):
+        raise hs.PendingError('测验领奖状态未确认，保留原结果')
+    evidence=str(s.save_raw_evidence(frame, r.account, 'quiz_claim_disabled', 'verified'))
+    if s.state.action_status(r.account.name,'daily_quiz_finish')=='pending':
+        s.commit_action(r.account,'daily_quiz_finish','测验结果页领取按钮已禁用：'+evidence)
     for key, status in rec.get('submissions', {}).items():
-        if status == 'submitted':
+        if status == 'submitted' and s.state.action_status(r.account.name,'daily_quiz_submit_'+key)=='pending':
             s.commit_action(r.account,'daily_quiz_submit_'+key,'剩余题目为0且领取按钮已禁用')
     r.click('quiz_close.bmp',(1250,325,1350,410),17,17,'daily_quiz_close',
             ['quiz_finish.bmp','quiz_close.bmp'])
@@ -55,27 +70,54 @@ def solo_verified(runner, frame):
             and not runner.visible('quiz_team_leave.bmp',(280,165,455,240),frame,.90)
             and not runner.visible('sealed_leader_badge.bmp',(0,69,65,150),frame,.90))
 
+
+def solo_pending_reason(runner, frame):
+    from PIL import Image
+    if not isinstance(frame,Image.Image):return '忍者测验单人状态尚未核实'
+    if (runner.visible('quiz_team_leave.bmp',(280,165,455,240),frame,.90)
+            or runner.visible('sealed_leader_badge.bmp',(0,69,65,150),frame,.90)):
+        return '忍者测验仅限单人：当前已识别组队控件，未进入答题'
+    if not runner.visible('quiz_task_link.bmp',(0,200,300,500),frame,.84):
+        return '当前未确认忍者测验任务入口，保留待核实；未判定组队或完成'
+    return '忍者测验单人状态尚未核实'
+
 def question_key(frame):
     # The stable text area includes the question number, never the countdown.
     return hashlib.sha256(frame.crop(QUESTION).convert('L').tobytes()).hexdigest()[:20]
 
 def run(r):
+    iterator=run_steps(r)
+    while True:
+        try:next(iterator)
+        except StopIteration as result:return result.value
+
+
+def run_steps(r):
     s, rec = r.scheduler, r.record('quiz')
     initial = s.capture()
     if claimed_result_visible(s, initial):
         finish_claimed_result(r, initial)
         return
     if not solo_verified(r, initial):
-        rec.update(status='pending', last_error='忍者测验仅限单人，当前未确认单人状态')
+        rec.update(status='pending', last_error=solo_pending_reason(r,initial))
         r.save()
         raise hs.PendingError(rec['last_error'])
-    if not r.visible('quiz_page.bmp',PAGE) and not r.visible('quiz_start.bmp',(800,540,1000,650)):
+    initial_result=result_visible(s,initial)
+    initial_question=r.visible('quiz_page.bmp',PAGE,initial)
+    actions=s.state.accounts.get(r.account.name,{}).get('actions',{})
+    started=any(str(key).startswith('daily_quiz_start_') and isinstance(value,dict)
+                and value.get('status') in ('pending','done') for key,value in actions.items())
+    if not initial_result and not initial_question and (started or rec.get('submissions')):
+        raise hs.PendingError('原测验已启动但题目或结果页未确认，禁止重新进入')
+    if (not initial_result and not initial_question
+            and not r.visible('quiz_start.bmp',(800,540,1000,650))):
         r.click('quiz_task_link.bmp',(0,200,300,500),60,7,'daily_quiz_entry',
                 ['quiz_task_link.bmp', 'quiz_npc_anchor.bmp'], threshold=.84,
                 anchor_threshold=.84)
         deadline, total = time.monotonic()+60, time.monotonic()+300
         position = None
         while not r.visible('quiz_start.bmp',(800,540,1000,650)):
+            yield
             frame = s.capture()
             new_position = frame.crop((1700,117,1905,137)).tobytes()
             if new_position != position:
@@ -84,39 +126,46 @@ def run(r):
             if time.monotonic() >= min(deadline,total):
                 raise hs.PendingError('测验寻路未到达：60秒位置无进展或总寻路超过5分钟')
             s.wait_interruptible(.5)
-    if r.visible('quiz_start.bmp',(800,540,1000,650)):
+    if not initial_result and start_dialog_visible(s,s.capture()):
         r.once('quiz_start.bmp',(800,540,1000,650),40,10,'daily_quiz_start_'+s.diagnostics.identifier)
         r.wait('quiz_page.bmp',PAGE,12)
     deadline = time.monotonic()+60
     last_seen = None
     while time.monotonic() < deadline:
+        yield
         s.check_stop()
         frame = s.capture()
         if not solo_verified(r, frame):
             raise hs.PendingError('测验中单人状态无法确认，停止答题')
-        if r.visible('quiz_finish.bmp',(550,300,1350,850),frame,.92):
+        button=claim_button_template(s,frame)
+        if button:
             if not r.visible('quiz_zero.bmp',(1150,413,1250,445),frame,.95):
                 raise hs.PendingError('领取按钮出现但未确认剩余题目为0')
             s.save_raw_evidence(frame, r.account, 'quiz_zero', 'verified')
             for key, status in rec.get('submissions', {}).items():
-                if status == 'submitted':
+                if status == 'submitted' and s.state.action_status(r.account.name,'daily_quiz_submit_'+key)=='pending':
                     s.commit_action(r.account,'daily_quiz_submit_'+key,'剩余题目为0，答题流程已结束')
-            r.click('quiz_finish.bmp',(550,300,1350,850),30,10,'daily_quiz_finish',['quiz_finish.bmp'])
-            claimed = False
+            if s.state.action_status(r.account.name,'daily_quiz_finish') in ('pending','done'):
+                raise hs.PendingError('原测验领奖凭据尚未核实或按钮状态冲突，禁止重复领取')
+            name,threshold=button
+            for sample in range(3):
+                frame=s.content_guard(r.account,[name],anchor_threshold=threshold)
+                if claim_button_template(s,frame)!=(name,threshold):
+                    raise hs.PendingError('测验领奖按钮未连续确认，未发送点击')
+                if sample<2:s.wait_interruptible(.2)
+            r.click(name,(550,300,1350,850),30,10,'daily_quiz_finish',
+                    [name],True,threshold=threshold,anchor_threshold=threshold,
+                    frame_predicate=lambda fresh:claim_button_template(s,fresh)==(name,threshold))
+            claimed = False;stable=0
             claim_deadline = time.monotonic() + 12
             while time.monotonic() < claim_deadline:
-                after = s.capture()
-                if not r.visible('quiz_finish.bmp',(550,300,1350,850),after,.92):
-                    claimed = True
-                    break
-                if claim_button_disabled(after):
-                    claimed = True
-                    s.save_raw_evidence(after, r.account, 'quiz_claim_disabled', 'verified')
-                    break
+                after = s.content_guard(r.account,['quiz_zero.bmp'],anchor_threshold=.95)
+                stable=stable+1 if claimed_result_visible(s,after) else 0
+                if stable>=3:claimed=True;break
                 s.wait_interruptible(.3)
             if not claimed:
-                raise hs.PendingError('领取后按钮仍可点击，未确认领取结果')
-            finish_claimed_result(r, s.capture())
+                raise hs.PendingError('领取后未连续核实禁用状态，保留原领奖凭据')
+            finish_claimed_result(r, after)
             return
         if not r.visible('quiz_page.bmp',PAGE,frame):
             s.wait_interruptible(.3)
@@ -143,8 +192,15 @@ def run(r):
         # that fresh observation; submit still performs its own content guard.
         selected_frame = getattr(s, '_last_frame', None)
         if question_key(selected_frame if selected_frame is not None else s.capture()) != key:
-            raise hs.PendingError('选项点击时题目已变化，未提交')
-        r.click('quiz_submit.bmp',(850,710,1000,785),45,20,'daily_quiz_submit_'+key,['quiz_page.bmp'],True)
+            # Selection is reversible. Keep its receipt, observe the new
+            # question in this same quiz, and never submit the stale key.
+            r.event('daily_quiz_question_changed', question=key,
+                    detail='选项后题目刷新，未提交原题；继续观察本场测验')
+            s.wait_interruptible(.3)
+            continue
+        r.click('quiz_submit.bmp',(850,710,1000,785),45,20,'daily_quiz_submit_'+key,['quiz_page.bmp'],True,
+                frame_predicate=lambda fresh: question_key(fresh) == key
+                    and r.visible('quiz_page.bmp',PAGE,fresh))
         submissions[key] = 'submitted'
         r.save()
         r.event('daily_quiz_submitted', detail='已选第一项并提交，等待下一题', question=key)

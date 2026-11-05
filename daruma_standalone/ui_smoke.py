@@ -1,5 +1,4 @@
 """Native Tk checks and a screenshot; no game task is started."""
-from pathlib import Path
 from PIL import ImageGrab
 import ctypes
 import time

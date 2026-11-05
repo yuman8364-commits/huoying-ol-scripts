@@ -1,6 +1,7 @@
 """Ranking daily: first opponent, end battle once, verify the game counter."""
 import time
 import hashlib
+import re
 from pathlib import Path
 import numpy as np
 import hyol_scheduler as hs
@@ -18,6 +19,16 @@ HIGH_DIGIT = (1563, 156, 1586, 183)
 FIRST = (535, 845, 681, 932)
 END = (1410, 850, 1550, 980)
 RESULT = (860, 640, 1060, 710)
+WAITING_PHASES = frozenset(('start_pending', 'confirmed', 'end_pending',
+                            'end_sent', 'result_pending', 'result_sent'))
+
+
+def action_base(record, index):
+    prefix=record.get('action_prefix','daily_ranking')
+    if (not isinstance(prefix,str) or (prefix!='daily_ranking'
+            and not re.fullmatch(r'daily_ranking_manual_[0-9a-f]{12}',prefix))):
+        raise hs.PendingError('排位动作编号来源未核实')
+    return f'{prefix}_{index}'
 
 
 def transition_loading_visible(frame):
@@ -103,7 +114,7 @@ def sent_result_can_reopen(r, rec):
     if (not isinstance(completed, int) or isinstance(completed, bool) or completed < 0
             or not isinstance(before, int) or isinstance(before, bool) or not 1 <= before <= 10):
         return False
-    base = f'daily_ranking_{completed+1}'
+    base = action_base(rec,completed+1)
     result = r.scheduler.state.action_record(r.account.name, base+'_result')
     if result.get('status') not in ('pending', 'done'):
         return False
@@ -131,11 +142,39 @@ def _yield_waiting_result(r, rec, detail):
         r._last_ranking_wait_yield_key = key
     return 'yield_waiting_result'
 
+
+def original_start_witness_valid(r, rec):
+    """A natural victory must still belong to this account's original attempt."""
+    day=getattr(r.scheduler.state,'day',None)
+    if day!=hs.date.today().isoformat():return False
+    before=rec.get('before');completed=rec.get('completed',0)
+    if type(before) is not int or not 1<=before<=10 or type(completed) is not int:return False
+    base=action_base(rec,completed+1)
+    for suffix in ('start','confirm') if rec.get('phase')=='confirmed' else ('start',):
+        row=r.scheduler.state.action_record(r.account.name,base+'_'+suffix)
+        if (not isinstance(row,dict) or row.get('status') not in ('pending','done')
+                or row.get('origin') or row.get('checkpoint_conflict')
+                or not str(row.get('updated_at','')).startswith(day+'T')
+                or not Path(row.get('before_evidence','')).is_file()):return False
+    try:
+        path=Path(rec['counter_before_evidence'])
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=rec['counter_before_sha256']:return False
+        with hs.Image.open(path) as image:
+            return remaining(r,image.convert('RGB'),save_unknown=False)==before
+    except (KeyError,OSError,ValueError,hs.PendingError):return False
+
+
+def natural_victory_visible(r, frame):
+    return all(r.visible(name,roi,frame,threshold) for name,roi,threshold in (
+        ('arena_victory_banner.bmp',(650,320,1250,800),.98),
+        ('ranking_result_stats.bmp',(890,605,1035,653),.95),
+        ('ranking_result_confirm.bmp',RESULT,.95)))
+
 def run(r):
     s, rec = r.scheduler, r.record('ranking')
     if rec.get('phase', 'ready') == 'ready':
         attempt = rec.get('completed', 0) + 1
-        base = f'daily_ranking_{attempt}'
+        base = action_base(rec,attempt)
         pending = [base + '_' + suffix for suffix in ('start', 'confirm', 'end', 'result', 'result_recover')
                    if s.state.action_status(r.account.name, base + '_' + suffix) == 'pending']
         if pending:
@@ -145,7 +184,10 @@ def run(r):
     manual_result = rec.get('manual_defeat_result_evidence')
     recover_manual_result = (rec.get('phase') == 'confirmed'
         and manual_result_witness_valid(rec))
-    recover_sent_result = sent_result_can_reopen(r, rec)
+    # A receipt permits reopening only from a verified main page. While its
+    # original result/loading screen remains visible, observe that attempt
+    # below instead of treating the missing main page as a recovery failure.
+    recover_sent_result = sent_result_can_reopen(r, rec) and s.main_ready()
     if (rec.get('phase', 'ready') == 'ready' or recover_manual_result or recover_sent_result) and not r.visible('ranking_page.bmp', PAGE):
         if (recover_manual_result or recover_sent_result) and not s.main_ready():
             raise hs.PendingError('排位原结果虽已留证，但当前未回到主界面；保留未决动作')
@@ -158,22 +200,23 @@ def run(r):
                     detail='只重进原排位页核对次数；未重复开战或发送结算')
     watchdog = hs.BattleWatchdog(mode='ranking')
     main_seen_at = None
+    unchanged_page_since = None
     while True:
         s.check_stop()
         frame = s.capture()
         hs.check_battle_watchdog(s, watchdog, r.account, frame, 'ranking', mode='ranking')
         phase = rec.get('phase', 'ready')
         index = rec.get('completed', 0) + 1
-        base = f'daily_ranking_{index}'
+        base = action_base(rec,index)
         if (phase != 'ready' and s.main_ready(frame)
                 and not r.visible('ranking_page.bmp', PAGE, frame, .95)):
             if transition_loading_visible(frame):
                 main_seen_at = None
-                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                if getattr(r, 'interleave_after_end', False) and phase in WAITING_PHASES:
                     return _yield_waiting_result(r, rec, '排位结算页面正在加载，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
-            if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+            if getattr(r, 'interleave_after_end', False) and phase in WAITING_PHASES:
                 return _yield_waiting_result(r, rec, '排位结果页尚未稳定，先轮询其他账号')
             if main_seen_at is None:
                 main_seen_at = time.monotonic()
@@ -186,11 +229,11 @@ def run(r):
         if r.visible('ranking_page.bmp', PAGE, frame, .95) and not r.visible('ranking_power_warning.bmp',(790,505,1130,560),frame,.95):
             try:
                 count = stable_remaining(r, seconds=(1.5 if getattr(r, 'interleave_after_end', False)
-                                                   and phase in ('end_sent', 'result_sent') else 8))
+                                                   and phase in WAITING_PHASES else 8))
             except hs.PendingError:
                 if phase == 'ready':
                     raise
-                if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
+                if getattr(r, 'interleave_after_end', False) and phase in WAITING_PHASES:
                     return _yield_waiting_result(r, rec, '排位剩余次数暂不可读，先轮询其他账号')
                 # The challenge starts between two captures. Observe the
                 # existing attempt; never interpret a repaint as zero/new work.
@@ -198,14 +241,22 @@ def run(r):
                 continue
             # The title and counter can paint before the opponent list.
             if count > 0 and not r.visible('ranking_challenge.bmp', FIRST, frame, .95):
+                if getattr(r, 'interleave_after_end', False):
+                    return _yield_waiting_result(r, rec, '排位对手列表尚未稳定，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
             if phase != 'ready':
                 if count == rec.get('before'):
-                    if getattr(r, 'interleave_after_end', False) and phase in ('end_sent', 'result_sent'):
-                        return _yield_waiting_result(r, rec, '结算后的剩余次数尚未变化，先轮询其他账号')
+                    if getattr(r, 'interleave_after_end', False):
+                        return _yield_waiting_result(r, rec, '原挑战的剩余次数尚未变化，保留动作并轮询其他账号')
+                    if unchanged_page_since is None:
+                        unchanged_page_since = time.monotonic()
+                    if time.monotonic() - unchanged_page_since >= 30:
+                        evidence = s.save_raw_evidence(frame, r.account, 'ranking_unchanged_after_input', 'pending')
+                        raise hs.PendingError(f'排位原动作后次数连续30秒未变化；保留阶段与动作，不重复挑战：{evidence}')
                     s.wait_interruptible(.4)
                     continue
+                unchanged_page_since = None
                 manual_decrement = (phase == 'confirmed'
                     and manual_result_witness_valid(rec))
                 if (phase not in ('end_sent', 'result_sent') and not manual_decrement) or count != rec.get('before', -1)-1:
@@ -224,9 +275,11 @@ def run(r):
                 r.save()
                 r.event('daily_ranking_battle_complete', completed=index, remaining=count,
                         detail=f'排位第{index}场结算已核实，剩余{count}次')
+                if getattr(r, 'training_yield_each_battle', False):
+                    return 'yield_after_battle'
                 deadline = time.monotonic()+60
                 index += 1
-                base = f'daily_ranking_{index}'
+                base = action_base(rec,index)
             if count == 0:
                 evidence = s.save_raw_evidence(s.capture(),r.account,'ranking_zero','verified')
                 rec.update(remaining=0, zero_verified=True, zero_evidence=str(evidence))
@@ -235,6 +288,27 @@ def run(r):
                 if not s.wait_until_main(12):
                     raise hs.PendingError('排位次数归零，关闭后尚未确认主界面')
                 return
+            request = getattr(r, 'training_request', None)
+            if isinstance(request, dict) and request.get('task') == 'ranking':
+                from hyol_training_policy import bounded_count
+                request['available'] = count
+                if request.get('scheduled') is None:
+                    request['scheduled'] = bounded_count(request['required'], count)
+                settled = rec.get('completed', 0)-request['base_completed']
+                request.update(settled=settled, quantity_state='verified')
+                from hyol_training_policy import local_day
+                date_changed = request['execution_day'] != local_day()
+                if settled >= request['scheduled'] or date_changed:
+                    request.update(status='deferred' if date_changed else 'satisfied',
+                                   stop_reason='执行日期已改变，原场已结算' if date_changed else '目标缺口已补足')
+                    r.save()
+                    r.click('ranking_close.bmp',(1600,95,1670,160),17,17,
+                            'ranking_training_target_close',['ranking_page.bmp'])
+                    if not s.wait_until_main(12):
+                        raise hs.PendingError('排位本次目标已满足，关闭后尚未核实主界面')
+                    rec['training_request_satisfied'] = request['id']
+                    r.save()
+                    return 'training_day_changed' if date_changed else 'training_target_reached'
             counter_evidence = s.save_raw_evidence(frame, r.account, 'ranking_before', 'observed')
             rec.update(before=count, phase='start_pending', zero_verified=False,
                        counter_before_evidence=str(counter_evidence),
@@ -261,8 +335,20 @@ def run(r):
                 phase = 'end_sent'
             defeat_without_end = (phase in ('start_pending', 'confirmed')
                 and r.visible('arena_defeat_banner.bmp', (650, 320, 1250, 800), frame, .90))
-            if phase != 'end_sent' and not defeat_without_end:
+            victory_without_end=(phase in ('start_pending','confirmed')
+                and natural_victory_visible(r,frame) and original_start_witness_valid(r,rec))
+            if phase != 'end_sent' and not defeat_without_end and not victory_without_end:
                 raise hs.PendingError('未确认已点击结束战斗，且无明确失败结果；保留排位结果待核对')
+            if victory_without_end:
+                for sample in range(2):
+                    s.wait_interruptible(.2);fresh=s.capture()
+                    if (s._generic_active_tab_x(fresh)!=r.account.tab_x
+                            or not natural_victory_visible(r,fresh)):
+                        raise hs.PendingError('排位自然胜利结果未连续三帧确认，保留原场')
+                evidence=str(s.save_raw_evidence(fresh,r.account,'ranking_natural_victory','verified'))
+                rec['natural_victory_result_evidence']=evidence;r.save()
+                r.event('daily_ranking_natural_victory_verified',completed=index,evidence=evidence,
+                        detail='原开战凭据与自然胜利三帧一致；未补点结束战斗，待结果和次数核实')
             if defeat_without_end:
                 r.event('daily_ranking_defeat_verified', detail='明确失败结果出现；无需补点结束战斗',
                         completed=index)
@@ -279,6 +365,8 @@ def run(r):
             deadline=time.monotonic()+60
         elif phase in ('start_pending','confirmed','end_pending') and r.visible('ranking_battle_anchor.bmp',(1400,205,1510,251),frame,.95) and r.visible('ranking_end_battle.bmp',END,frame,.93):
             if phase == 'end_pending' and s.state.action_status(r.account.name,base+'_end') != 'new':
+                if getattr(r, 'interleave_after_end', False):
+                    return _yield_waiting_result(r, rec, '结束战斗点击结果未决，先轮询其他账号')
                 s.wait_interruptible(.4)
                 continue
             rec['phase']='end_pending'
@@ -301,6 +389,11 @@ def run(r):
                         detail='结束战斗动作已发送，结果留待下轮核实')
                 return 'yield_after_end'
             deadline=time.monotonic()+60
-        if getattr(r, 'interleave_after_end', False) and rec.get('phase', phase) in ('end_sent', 'result_sent'):
+        current_phase = rec.get('phase', phase)
+        if (getattr(r, 'interleave_after_end', False)
+                and (current_phase in ('end_sent', 'result_sent')
+                     or (current_phase == phase and phase in WAITING_PHASES))):
             return _yield_waiting_result(r, rec, '当前账号尚无可核实的排位结算状态，先轮询其他账号')
+        if not r.visible('ranking_page.bmp', PAGE, frame, .95):
+            unchanged_page_since = None
         s.wait_interruptible(.4)

@@ -1,42 +1,50 @@
-# 火影OL脚本
+# 火影OL 桌面客户端
 
-日常、组队、竞技场、羁绊及完整客户端版本：2026.10.20.1。达摩独立客户端保持2026.10.18.2，可从此前发布下载。
+当前版本：**2026.11.05.1-opencv**，Windows 10/11 64 位，OpenCV 标准版。
 
-## 直接打开
+[下载最新目录版](https://github.com/yuman8364-commits/huoying-ol-scripts/releases/tag/2026.11.05.1-opencv)
 
-Windows成品解压后双击各客户端EXE，无需安装Python。本机桌面和“可用脚本”目录提供快捷方式。
+下载发布页中的 `huoying-ol-desktop-folder-2026.11.05.1-opencv.zip`，完整解压后双击 `火影OL.exe`。保留文件夹里的配套文件；无需安装 Python，需要系统 WebView2 Runtime 与 .NET Framework 4.8。打开后保持空闲，选择任务和账号范围再开始；F12 或停止按钮结束本轮。
 
-| 功能 | 入口 | 使用说明 |
-|---|---|---|
-| 达摩独立版 | `火影OL达摩独立版.exe` / `daruma_standalone_gui.py` | [达摩说明](daruma_standalone/README.md) |
-| 完整客户端 | `火影OL完整客户端.exe` / `hyol_client.py` | [完整客户端说明](README_统一客户端.md) |
-| 单人日常 | `火影OL日常三合一.exe` / `hyol_daily_tasks.py` | [单人日常说明](DAILY_TASKS_README.md) |
-| 组队任务 | `火影OL组队任务通用版.exe` / `hyol_team_tasks.py` | [组队说明](TEAM_TASKS_README.md) |
-| 竞技场 | `火影OL竞技场通用v5.exe` / `hyol_arena.py` | [竞技场说明](ARENA_CLIENT_README.md) |
-| 羁绊 | `火影OL羁绊连续作战v1.exe` / `hyol_bond.py` | [羁绊说明](BOND_CLIENT_README.md) |
+## 本次更新
 
-打开客户端只显示操作界面。登录游戏、选择目标和任务后点击开始。F12或停止按钮结束当前操作并保存结果。
+- 新增独立「周年庆活动」板块，支持薪火签到，可处理前 1～6 个账号标签；按实际解锁日核对 10 天，活动未出现或到期时略过。
+- 已领取项目不重复领取；领取结果未知时保留凭据，重新启动后先核对。周年庆结束后关闭托管。
+- 修复空闲页面的排位入口缺失导致后续任务延后，以及恢复任务前账号绑定未重新取得的问题。
+- 目录版可改名、移动和整体压缩分享；设置与共享账本保存在当前 Windows 用户的 `%LOCALAPPDATA%\HYOLFolderClient`。
 
-日常和多人入口每次开始创建独立运行，使用当前页面和本轮选择；历史状态保留在磁盘。已有队伍使用本轮一次识别的队长和成员；队伍奖励须真实归零才进入收尾。默认保持阵容和游戏托管设置。
+程序还包含单人日常、竞技场、生存、修行录、组队、独立羁绊、拼图与达摩等既有入口。购买保持禁用；执行时保持游戏窗口可见，避免同时运行多个控制游戏的脚本。独立羁绊须手动组队并打开准备页，再由程序进行匹配、观察当前账号自动战斗状态和结算。
 
-组队副本和强者先让两队进入本轮战斗，再固定观察当前队直至结算，然后切换另一队等待结算。两队都完成本轮后才开始下一轮，等待期间不反复切队。已参战队伍结果未知时保留待处理，不开始下一轮。
+## 源码运行与构建
 
-达摩独立版保留其同账号断点续接规则，每层核实实际奖励图标，最终连续两帧核实奖励0及“已完成”。EXE旁runtime目录保存独立记录，更新时保留该目录。
+在 Windows 使用 Python 3.12：
 
-## 源码与构建
+```powershell
+python -m venv .build-env
+.\.build-env\Scripts\python.exe -m pip install -r requirements-build.txt -r requirements-desktop.txt
+.\.build-env\Scripts\python.exe hyol_desktop.py
+```
 
-建议在Windows使用Python 3.12，建立`.build-env`并安装`requirements.txt`。双击根目录`启动达摩独立版.cmd`可启动达摩源码窗口。
+构建同类干净目录版，请使用新的输出目录：
 
-达摩成品构建：`build_daruma_client.ps1 -InstallDesktop`。其他入口使用`build_daily_client.ps1`、`build_independent_clients.ps1`、`build_unified_client.ps1`和`build_team_client.ps1`。
+```powershell
+.\.build-env\Scripts\python.exe -B tools/build_shareable_folder.py --output releases/my-folder-build
+```
 
-统一离线回归入口：`run_offline_tests.ps1`。达摩及打包专项：`python -m unittest -q test_daruma_standalone test_hyol_daruma test_hyol_release`。部分旧实拍回放依赖本机历史证据；发布包中的测试资料不包含运行日志和账号配置。
+可独立运行的公开专项：
 
-## 验收与运行记录
+```powershell
+.\.build-env\Scripts\python.exe -B -m unittest -v test_hyol_skip_continue_20261105 test_template_spectra test_hyol_opencv test_hyol_independent_bond_20261031
+```
 
-发布成品核对嵌入源码、素材、ZIP校验和及原生GUI启动。游戏任务完成须有当前账号的结果、奖励和页面证据；离线通过和窗口启动不代表游戏挑战完成。
+部分历史回放依赖制作者本机的截图和状态资料，未随源码公开；历史测试目录不等于完整可独立运行的验收集。
 
-本版合入鼠标按下前焦点/F12/人工暂停检查、确保释放鼠标、账号重绑定失败回滚、断点读取去重、识别候选批量过滤和拼图进程冲突防护。361项本机专项回归全部通过；五个客户端和两个源码入口已在本机实际打开、检查响应，五客户端嵌入源码与交付源码一致。本版游戏内验收由用户进行，尚未完成；部分历史测试契约/夹具问题仍待维护，不宣称本机全量回归通过。
+## 验证范围
 
-发布包使用通用配置。本地状态、运行日志、本机账号配置和项目进度文档保存在本机。
+本次已在本机完成最终完整离线回归：19 阶段、2158 项，0 失败，2 项既有跳过。目录成品内嵌 68 个项目模块与源码一致，669 项资源检查、1746 个文件清单、隐私检查、ZIP CRC 和原生空闲启动验证通过。发布前重新检查了源码基线和下载包哈希。
 
-干净源码导出副本另通过113项独立专项、4项鼠标中断安全测试及214个Python文件语法检查。本机历史截图、身份资料和训练溯源未随包提供，依赖它们的旧回放测试须使用原始证据。
+实机仅验证本轮单账号签到：第 1 天领取 1 份，重开新增 0 份，第 2 天锁定并回村。第 2～10 天尚未自然解锁；入口缺失的修复已通过离线复现，未重跑原战斗。历史未决战斗、领奖和组队任务继续保留，不计为本次完成。
+
+本次发布的目录包和独立源码包不含制作者个人配置、账号素材、游戏登录数据、运行账本或本机日志。使用后产生的数据属于使用者，再分享请使用未运行过的原始压缩包。原拼图组件以既有哈希校验携带，其内部加密脚本未做完整源码审计。
+
+仓库保留原有提交历史；旧说明与回放中的历史游戏昵称、本机路径仍可能出现在旧版本中。
