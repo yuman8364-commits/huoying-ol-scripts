@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 import hyol_scheduler as hs
+from hyol_treasure_recognition import trap_layout
 
 DURATION_SECONDS = 300
 START_ACTION = "daily_treasure_auto_dig_once"
@@ -130,6 +131,7 @@ def world_visible(runner, frame):
             and not central_modal_visible(runner, frame)
             and not transformation_visible(runner, frame)
             and not reward_layout(runner,frame)
+            and trap_layout(frame, getattr(runner.scheduler, 'templates', None)) is None
             and not any(runner.visible(name, roi, frame, .96) for name, roi in (
                 ("treasure_page_anchor.bmp", PAGE_ROI),
                 ("treasure_result_anchor.bmp", RESULT_ROI),
@@ -140,6 +142,7 @@ def known_frame(runner, frame):
     return (loading_visible(runner, frame) or world_visible(runner, frame) or battle_visible(runner, frame)
             or transformation_visible(runner, frame)
             or reward_layout(runner,frame) is not None
+            or trap_layout(frame, getattr(runner.scheduler, 'templates', None)) is not None
             or any(runner.visible(name, roi, frame, .96) for name, roi in (
                 ("treasure_page_anchor.bmp", PAGE_ROI),
                 ("treasure_result_anchor.bmp", RESULT_ROI),
@@ -176,6 +179,8 @@ class TreasureRun:
         self.record = runner.record("treasure")
         self.clock = clock or time.time
         self.battle_watchdog = None
+        self.stop_verification_started_at = None
+        self.stop_verification_observations = 0
         suffix = self.record.get('training_action_suffix', '')
         self.start_action = START_ACTION+('_'+suffix if suffix else '')
         self.pause_action = PAUSE_ACTION+('_'+suffix if suffix else '')
@@ -295,6 +300,9 @@ class TreasureRun:
         now = self.clock()
         if now - rec.get('stop_observed_at', 0) < 3:
             return False
+        if self.stop_verification_started_at is None:
+            self.stop_verification_started_at = now
+        self.stop_verification_observations += 1
         frame = s.capture()
         patch = frame.crop(POSITION_ROI).convert('L')
         nonempty = float(np.asarray(patch).std()) > 8
@@ -309,7 +317,11 @@ class TreasureRun:
             s.commit_action(r.account,self.pause_action,'暂停后位置连续三帧稳定，非战斗且无自动寻路标识')
             self.save('stopped', stop_verified=True, stop_evidence=str(evidence))
             return True
-        if now - rec.get('stop_requested_at', now) >= 30:
+        # Restoring an old pause must allow fresh observations, not immediately
+        # expire against its original dispatch time. Interleaved accounts also
+        # need at least three foreground observations before a timeout verdict.
+        if (now - self.stop_verification_started_at >= 30
+                and self.stop_verification_observations >= 3):
             evidence = s.save_raw_evidence(frame,r.account,'treasure_stop_unverified','pending')
             raise hs.PendingError('挖宝暂停未核实，不重复点击；画面='+str(evidence))
         return False
@@ -321,6 +333,16 @@ class TreasureRun:
             return False
         status = s.state.action_status(r.account.name, waiting['action'])
         if status == 'new':
+            if (waiting['kind'] == 'traps'
+                    and trap_layout(frame, getattr(s, 'templates', None)) is None
+                    and battle_visible(r, frame)):
+                # The trap can naturally advance before the guarded click.
+                # Keep its original timer and observe that battle; no input or
+                # map-completion credit is manufactured for this transition.
+                self.save('battle', traps=waiting['index'], awaiting=None)
+                r.event('treasure_trap_naturally_advanced', action=waiting['action'],
+                        confirmation_inputs=0, map_count_incremented=False)
+                return True
             if (waiting['kind']=='rewards'
                     and reward_layout(r,frame) is None
                     and known_frame(r,frame)):
@@ -331,7 +353,8 @@ class TreasureRun:
                         confirmation_inputs=0,reward_count_incremented=False)
                 return True
             raise hs.PendingError('挖宝确认意图已保存但发送状态不明，保留断点')
-        if ((waiting['kind']=='rewards' and reward_layout(r,frame) is not None)
+        if ((waiting['kind']=='traps' and trap_layout(frame, getattr(s, 'templates', None)) is not None)
+                or (waiting['kind']=='rewards' and reward_layout(r,frame) is not None)
                 or r.visible(waiting['anchor'], tuple(waiting['roi']), frame, .96)):
             raise hs.PendingError('原挖宝确认框仍显示，不重复确认')
         advanced = battle_visible(r, frame) if waiting['kind'] == 'traps' else known_frame(r, frame)
@@ -340,8 +363,8 @@ class TreasureRun:
         if not advanced:
             raise hs.PendingError('挖宝确认后页面未知，保留原结果')
         s.commit_action(r.account, waiting['action'], '原确认框消失且后续页面已核实')
-        self.save('running', **{waiting['kind']: waiting['index']}, awaiting=None,
-                  stop_due=bool(rec.get('training_single_cycle')))
+        self.save('battle' if waiting['kind']=='traps' else 'running',
+                  **{waiting['kind']: waiting['index']}, awaiting=None)
         return True
 
     def step(self):
@@ -352,7 +375,7 @@ class TreasureRun:
         if rec.get("deadline_at") is None:
             self.begin()
         frame = s.capture()
-        expired = self.clock() >= rec["deadline_at"] or bool(rec.get("training_single_cycle") and rec.get("stop_due"))
+        expired = self.clock() >= rec["deadline_at"] or rec.get('verified_map_goal_reached') is True
         if expired:
             self.save(stop_due=True)
         if rec.get('stop_requested') and not world_visible(r, frame):
@@ -375,8 +398,18 @@ class TreasureRun:
             index = rec.get("rewards",0)+1
             self.save(awaiting={'action': self.action_name('daily_treasure_reward_' + str(index)), 'kind': 'rewards',
                                'index': index, 'anchor': reward[0], 'roi': list(reward[1])})
-            if settle_result(r, self.action_name("daily_treasure_reward_" + str(index))):
-                self.save("running",rewards=index,awaiting=None,stop_due=bool(rec.get("training_single_cycle")))
+            try:
+                settled = settle_result(r, self.action_name("daily_treasure_reward_" + str(index)))
+            except (hs.AccountOffline, hs.BattleStalled):
+                raise
+            except (hs.PendingError, hs.SafetyError):
+                if self._reconcile_awaiting(s.capture()):
+                    return False
+                raise
+            if settled:
+                self.save("running",rewards=index,awaiting=None)
+            else:
+                self._reconcile_awaiting(s.capture())
             return False
         if self._confirm_battle_result(frame):
             self.battle_watchdog = None
@@ -397,23 +430,30 @@ class TreasureRun:
             if not known_frame(r, current) or central_modal_visible(r, current) or transformation_visible(r, current):
                 raise hs.PendingError('变身确认后页面未核实，保留原动作')
             s.commit_action(r.account, action, '变身提示已关闭且后续页面已核实')
-            self.save('running', transformations=index, awaiting=None,
-                      stop_due=bool(rec.get('training_single_cycle')))
+            self.save('running', transformations=index, awaiting=None)
             return False
-        if r.visible("treasure_trap_anchor.bmp", TRAP_ROI, frame,.96):
+        trap = trap_layout(frame, getattr(s, 'templates', None))
+        if trap is not None:
             index = rec.get("traps",0)+1
             action = self.action_name("treasure_trap_" + str(index))
             if s.state.action_status(r.account.name,action) != "new":
                 raise hs.PendingError("埋伏确认未核实，禁止重复发送")
             self.save(awaiting={'action': action, 'kind': 'traps', 'index': index,
-                               'anchor': 'treasure_trap_anchor.bmp', 'roi': list(TRAP_ROI)})
-            r.click("treasure_trap_confirm.bmp", (880,540,1040,630),60,27,action,
-                    ["treasure_trap_anchor.bmp","treasure_trap_confirm.bmp"],
-                    irreversible=True,threshold=.96)
-            if not s.wait_absent("treasure_trap_anchor.bmp",TRAP_ROI,8,threshold=.92):
+                               'anchor': trap['anchor'], 'roi': list(trap['anchor_roi'])})
+            try:
+                r.click(trap['confirm'], trap['confirm_roi'],51,15,action,
+                        trap['anchors'], irreversible=True,threshold=.98,anchor_threshold=.98,
+                        frame_predicate=lambda fresh:trap_layout(fresh,s.templates)==trap)
+            except (hs.SafetyError, hs.PendingError):
+                if self._reconcile_awaiting(s.capture()):
+                    return False
+                raise
+            if not s.wait_absent(trap['anchor'],trap['anchor_roi'],8,threshold=.98):
                 raise hs.PendingError("埋伏确认后页面未变化")
+            if not battle_visible(r,s.capture()):
+                raise hs.PendingError('埋伏确认后尚未看到原战斗，保留确认凭据与原截止时间')
             s.commit_action(r.account,action,"埋伏已进入原战斗")
-            self.save("battle",traps=index,awaiting=None,stop_due=bool(rec.get('training_single_cycle')))
+            self.save("battle",traps=index,awaiting=None)
             return False
         if battle_visible(r,frame):
             if self.battle_watchdog is None:

@@ -1,8 +1,0 @@
-{
-  "offline_login_text_current.bmp": {
-    "source": "logs/scheduler_evidence/2026-10-01/account_c9ba2069ff/214000_653728_pending_multi_solo_start_before_return.png",
-    "box": [874, 518, 1045, 538],
-    "purpose": "识别新版掉线提示；仅用于阻断操作，不点击弹窗",
-    "reviewed": true
-  }
-}

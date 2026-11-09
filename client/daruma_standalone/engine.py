@@ -215,11 +215,13 @@ class DarumaRunner:
             self.desktop.wait(.16)
         raise Pending(f'动作后未确认预期页面：{", ".join(expected)}')
 
-    def click_template(self, name, roi, offset, allowed, expected, kind):
+    def click_template(self, name, roi, offset, allowed, expected, kind, *, threshold=.93, frame_predicate=None):
         frame = self.desktop.capture()
         if self.desktop.vision.page(frame) not in allowed:
             raise Pending(f'{kind} 操作前页面不符')
-        matched, _score, x, y = self.desktop.vision.match(frame, name, roi)
+        if frame_predicate is not None and not frame_predicate(frame):
+            raise Pending('活动目录在操作前发生变化，未发送点击')
+        matched, _score, x, y = self.desktop.vision.match(frame, name, roi, threshold)
         if not matched:
             raise Pending(f'{kind} 按钮未可靠定位')
         self.journal.begin(kind, expected=list(expected), before_page=self.desktop.vision.page(frame),
@@ -239,11 +241,41 @@ class DarumaRunner:
                                 (page,), ('menu',), 'open_hotspot')
             page = 'menu'
         if page == 'menu':
-            self.click_template('daruma_weekend_menu.bmp', (475, 240, 705, 755), (65, 15),
-                                ('menu',), ('weekend',), 'open_weekend')
+            self.select_weekend()
             page = 'weekend'
         if page != 'weekend':
             raise Pending('无法从当前已核实页面进入周末福利；未强制回村')
+
+    def select_weekend(self):
+        from hyol_anniversary import color_fraction
+        vision=self.desktop.vision;menu=(475,340,690,745);visited=set()
+        core='daruma_weekend_menu_core.bmp'
+        for number in range(4):
+            frame=self.desktop.capture()
+            if vision.visible(frame,core,menu,.95):
+                self.click_template(core,menu,(30,8),('menu',),('weekend',),'open_weekend',threshold=.95)
+                return
+            if not vision.catalogue(frame):
+                raise Pending('周末活动目录未核实，未翻页')
+            signature=frame.crop(menu).tobytes();selected=None
+            for key,roi in (('list_down',(595,753,645,800)),('list_up',(515,753,565,800))):
+                asset='anniversary_'+key+'_20261105.bmp'
+                def enabled(fresh, asset=asset,roi=roi):
+                    matched,_score,x,y=vision.match(fresh,asset,roi,.98)
+                    if not matched:return False
+                    with Image.open(vision.asset(asset)) as marker:w,h=marker.size
+                    return color_fraction(fresh,(x,y,x+w,y+h),'gold')>.04
+                if (signature,key) not in visited and enabled(frame):
+                    selected=(key,asset,roi,enabled);break
+            if selected is None:raise Pending('活动目录没有可核实的翻页入口，未找到周末活动')
+            key,asset,roi,enabled=selected;visited.add((signature,key))
+            self.click_template(asset,roi,(12,12),('menu',),('menu',),'catalogue_'+key,threshold=.98,
+                frame_predicate=lambda fresh:vision.catalogue(fresh)
+                    and fresh.crop(menu).tobytes()==signature and enabled(fresh))
+            self.desktop.wait(.3)
+            if self.desktop.capture().crop(menu).tobytes()==signature:
+                raise Pending('活动目录翻页未推进，保留原动作，不重复点击')
+        raise Pending('活动目录翻页后仍未找到周末活动')
 
     def reconcile(self):
         intent = self.journal.data.get('intent')
@@ -265,11 +297,14 @@ class DarumaRunner:
             self.verify_strike(intent, resuming=True)
         elif kind == 'start':
             self.verify_start(intent)
-        elif self.desktop.vision.page(self.desktop.capture()) in intent.get('expected', []):
-            frame = self.desktop.capture()
-            self.journal.resolve('page_verified_after_resume', evidence=self.journal.evidence(frame, 'resume_page'))
         else:
-            raise Pending('上一次页面操作结果仍未核实；保留原动作，不重复点击')
+            frame=self.desktop.capture();page=self.desktop.vision.page(frame)
+            advanced=(kind=='open_hotspot' and intent.get('sent') is True and page=='weekend')
+            if page in intent.get('expected',[]) or advanced:
+                self.journal.resolve('page_advanced_to_weekend' if advanced else 'page_verified_after_resume',
+                    evidence=self.journal.evidence(frame,'resume_page'),replayed=False)
+            else:
+                raise Pending('上一次页面操作结果仍未核实；保留原动作，不重复点击')
 
     def drive(self):
         self.reconcile()

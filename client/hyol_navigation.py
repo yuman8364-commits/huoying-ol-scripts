@@ -13,6 +13,7 @@ MARKET_CLOSE_ROI = (1301, 219, 1919, 369)
 
 # Only reversible page closes. Never include reward, start or dissolve controls.
 PREPARE_CLOSE_CONTROLS = (
+    ('daruma_weekend_page.bmp', (880,245,1190,360), 'daruma_weekend_close.bmp', (1330,288,1385,345)),
     ('anniversary_title_20261105.bmp', (880,210,1180,310), 'anniversary_close_20261105.bmp', (1325,280,1370,325)),
     ('anniversary_catalogue_title_20261105.bmp', (880,210,1180,310), 'anniversary_close_20261105.bmp', (1325,280,1370,325)),
     ('training_record_title.bmp', (390,120,770,280), 'training_record_close.bmp', (1350,215,1420,290)),
@@ -25,6 +26,7 @@ PREPARE_CLOSE_CONTROLS = (
     ('team_create_button.bmp', (951,650,1301,850), 'team_room_close.bmp', (1200,260,1280,340)),
     ('ninja_page_current.bmp', (1,69,1919,1031), 'ninja_close_current.bmp', (1570,100,1640,175)),
     ('grocery_title_current.bmp', (840,90,1100,185), 'grocery_close_current.bmp', (1570,110,1660,205)),
+    ('merchant_title_20261109.bmp', (800,230,1130,315), 'market_close.bmp', (1350,270,1420,340)),
     ('mail_warehouse_anchor.bmp', (1,69,1919,1031), 'mail_warehouse_close.bmp', (1174,259,1275,359)),
     ('mail_ready_anchor.bmp', (1,69,1919,1031), 'mail_close.bmp', (1301,249,1401,349)),
     ('welfare_title_current.bmp', (1,69,1919,1031), 'welfare_close_current.bmp', (1320,250,1450,350)),
@@ -55,10 +57,16 @@ def content_loading_visible(s, frame):
                 and s.template('map_loading_bar_right_current.bmp', (1140,520,1190,560), frame, threshold=.98)[0]))
 
 
+def group_card_result_visible(s, frame):
+    """The card settlement dims the village and hides its identity strip."""
+    return (s.template('group_card_result_title_20261109.bmp', (790,190,1140,330), frame, threshold=.98)[0]
+            and s.template('group_return_game_current.bmp', (1100,750,1400,880), frame, threshold=.98)[0])
+
+
 def preparation_blocked(s, frame):
     """A ready screen is navigable; a battle or unaccounted result is not."""
     import hyol_scheduler as hs
-    if content_loading_visible(s, frame):
+    if content_loading_visible(s, frame) or group_card_result_visible(s, frame):
         return True
     if s.template('quiz_page.bmp', (820,380,1060,450), frame, threshold=.92)[0]:
         return True
@@ -66,6 +74,8 @@ def preparation_blocked(s, frame):
         ('arena_result_confirm.bmp', (651,449,1151,829)),
         ('team_result_confirm.bmp', hs.TEAM_BATTLE_RESULT_ROI),
         ('team_reward_result_confirm.bmp', hs.TEAM_REWARD_RESULT_ROI),
+        ('team_reward_result_header_current.bmp', (780,340,1140,470)),
+        ('strong_score_title_20261109.bmp', (780,230,1140,370)),
         ('ranking_result_confirm.bmp', (860,640,1060,710)),
         ('survival_result_confirm.bmp', (701,519,1151,819)),
         ('survival_reward_result_confirm.bmp', (701,569,1151,819)),

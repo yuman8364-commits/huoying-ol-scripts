@@ -24,6 +24,7 @@ SOLO_LABELS['puzzle'] = '忍者拼图（三难度）'
 SOLO_LABELS['training_record'] = '修行录目标'
 SOLO_LABELS['escort'] = '押镖（两次点券＋一次铜币）'
 SOLO_LABELS['anniversary'] = '周年庆签到'
+SOLO_LABELS['grocery'] = '杂货屋（请在新版桌面设置）'
 INDEPENDENT = {'竞技场': 'arena', '羁绊': 'bond', '周末任务': 'weekend', '挖宝（5分钟）': 'treasure'}
 INDEPENDENT.update({'忍者拼图（全部账号）':'puzzle','修行录目标（全部账号）':'training_record'})
 EVENT_LABELS = {'daily_task_started': '任务开始', 'daily_task_complete': '任务与回村已确认',
@@ -250,7 +251,7 @@ class UnifiedClient(tk.Tk):
         task_box.pack(fill='x', pady=(0, 8))
         for index, task in enumerate(SOLO_OPTIONS):
             ttk.Checkbutton(task_box, text=SOLO_LABELS[task], variable=self.task_vars[task],
-                            command=self._refresh_task_settings).grid(
+                            command=self._refresh_task_settings,state='disabled' if task=='grocery' else 'normal').grid(
                 row=index // 3, column=index % 3, sticky='w', padx=(0, 12), pady=5)
         ttk.Label(daily, text='周末任务、达摩和挖宝默认不选；活动开放状态由运行时核实。',
                   style='Muted.TLabel', wraplength=560).pack(anchor='w', pady=(2, 0))
@@ -320,7 +321,7 @@ class UnifiedClient(tk.Tk):
         next_tasks.pack(fill='x', pady=(8, 0))
         for index, task in enumerate(SOLO_OPTIONS):
             ttk.Checkbutton(next_tasks, text=SOLO_LABELS[task], variable=self.task_vars[task],
-                            command=self._refresh_task_settings).grid(
+                            command=self._refresh_task_settings,state='disabled' if task=='grocery' else 'normal').grid(
                 row=index // 3, column=index % 3, sticky='w', padx=(0, 10), pady=3)
 
         independent_box = ttk.LabelFrame(independent, text='独立任务', padding=10)

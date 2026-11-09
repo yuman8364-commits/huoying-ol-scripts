@@ -19,6 +19,10 @@ from hyol_desktop_bridge import DesktopBridge, parse_request
 from hyol_scheduler import atomic_json
 from hyol_app_paths import application_root
 
+PLAN_CONTROLS_READY = ('!!window.HYOL_NATIVE?.ready && '
+                       '!!document.querySelector("[data-action=start]:not([disabled])") && '
+                       '!!document.querySelector("[data-section=independent]:not([disabled])")')
+
 
 def _save_acceptance_report(path, report):
     """Readers and Windows scanners may briefly deny replacing a report."""
@@ -35,6 +39,7 @@ def _request_script(request):
         const click=(selector)=>{const node=document.querySelector(selector);if(!node||node.disabled)throw new Error('Unavailable control: '+selector);node.click()};
         const change=(selector,value)=>{const node=document.querySelector(selector);if(!node||node.disabled)throw new Error('Unavailable field: '+selector);node.value=value;node.dispatchEvent(new Event('change',{bubbles:true}))};
         const toggle=(selector,value)=>{const node=document.querySelector(selector);if(!node)throw new Error('Missing toggle: '+selector);if(node.checked!==value)node.click()};
+    click('[data-section="independent"]');click('[data-independent="arena"]');toggle('[data-config="arenaSecondSkill"]',desired.arena_second_skill);
         click('[data-section="team"]');click('[data-team-mode="pipeline"]');
         toggle('[data-config="preformedDuos"]',desired.preformed_duos);
         toggle('[data-config="pipelineAuto"]',!desired.leaders.length);
@@ -57,16 +62,20 @@ def _request_script(request):
         }
         change('[data-config="formation"]',desired.formation);
         toggle('[data-config="finalManaged"]',desired.final_managed);
+        if(desired.tasks.includes('grocery')){click('[data-action="select-task"][data-task-code="grocery"]');for(const el of document.querySelectorAll('[data-grocery-item]'))toggle('[data-grocery-item="'+el.dataset.groceryItem+'"]',desired.grocery_items.includes(el.dataset.groceryItem));}
         click('[data-action="show-request"]');
         '''
     return 'const desired='+json.dumps(asdict(request),ensure_ascii=False)+''';
     const click=(selector)=>{const node=document.querySelector(selector);if(!node||node.disabled)throw new Error('Unavailable control: '+selector);node.click()};
     const change=(selector,value)=>{const node=document.querySelector(selector);if(!node||node.disabled)throw new Error('Unavailable field: '+selector);node.value=value;node.dispatchEvent(new Event('change',{bubbles:true}))};
     const toggle=(selector,value)=>{const node=document.querySelector(selector);if(!node)throw new Error('Missing toggle: '+selector);if(node.checked!==value)node.click()};
+    click('[data-section="independent"]');click('[data-independent="arena"]');toggle('[data-config="arenaSecondSkill"]',desired.arena_second_skill);
     click('[data-section="independent"]');click('[data-independent="bond"]');
     change('[data-config="bondStopMode"]',desired.bond_stop_mode);
     toggle('[data-config="newBondRound"]',desired.new_bond_round);
-    click('[data-section="daily"]');click('[data-daily-mode="manual"]');click('input[data-config="scope"][value="multi"]');
+    click('[data-section="daily"]');click('[data-daily-mode="training_record"]');
+    change('[data-config="trainingArenaStopPolicy"]',desired.training_arena_stop_policy||'auto');
+    click('[data-daily-mode="manual"]');click('input[data-config="scope"][value="multi"]');
     for(let index=0;index<6;index++) {
         const count=Number(document.querySelector('output[aria-label="账号数量"]').textContent.split('/')[0].trim());
         if(count===desired.account_count)break;
@@ -74,6 +83,7 @@ def _request_script(request):
     }
     const arena=document.querySelector('input[data-task-code="arena"][data-task-group="solo"]');
     if(!arena.checked)arena.click();
+    click('[data-action="select-task"][data-task-code="arena"]');
     click('input[data-config="arenaTargetMode"][value="wins"]');
     change('[data-config="arenaWins"]',desired.arena_wins);
     click('input[data-config="arenaTargetMode"][value="'+desired.arena_target_mode+'"]');
@@ -84,8 +94,8 @@ def _request_script(request):
     }
     for(let index=0;index<desired.tasks.length;index++) {
         const code=desired.tasks[index];
-        for(let move=0;move<desired.tasks.length;move++) {
-            const rows=[...document.querySelectorAll('[data-action="task-up"][data-task-group="solo"]')];
+        for(let move=0;move<window.HYOL_DEMO.SOLO_TASKS.length;move++) {
+            const rows=[...document.querySelectorAll('[data-action="task-up"][data-task-group="solo"]')].filter(node=>desired.tasks.includes(node.dataset.taskCode));
             const position=rows.findIndex(node=>node.dataset.taskCode===code);
             if(position<=index)break;
             click('[data-action="task-up"][data-task-group="solo"][data-task-code="'+code+'"]');
@@ -99,6 +109,28 @@ def _request_script(request):
     } else {
         click('[data-section="independent"]');click('[data-independent="'+desired.mode+'"]');
     }
+    if(desired.mode==='solo' && !(desired.tasks.length===1 && desired.tasks[0]==='training_record')) {
+        for(const task of window.HYOL_DEMO.CURRENT_TASKS) {
+            toggle('input[data-task-code="'+task.code+'"][data-task-group="current"]',desired.tasks.includes(task.code));
+        }
+        for(let index=0;index<desired.tasks.length;index++) {
+            const code=desired.tasks[index];
+            if(code==='arena_3v3')continue;
+            for(let move=0;move<window.HYOL_DEMO.CURRENT_TASKS.length;move++) {
+                const rows=[...document.querySelectorAll('[data-action="task-up"][data-task-group="current"]')].filter(node=>desired.tasks.includes(node.dataset.taskCode));
+                const position=rows.findIndex(node=>node.dataset.taskCode===code);
+                if(position<=index)break;
+                click('[data-action="task-up"][data-task-group="current"][data-task-code="'+code+'"]');
+            }
+        }
+        if(desired.tasks.includes('bond')) {
+            click('[data-action="select-task"][data-task-code="bond"]');
+            change('[data-config="bondTargetMode"]',desired.bond_target_mode);
+            const key=desired.bond_target_mode==='kills'?'bondKillTarget':desired.bond_target_mode==='score'?'bondScoreTarget':'bondCount';
+            change('[data-config="'+key+'"]',desired.bond_target_mode==='kills'?desired.bond_kill_target:desired.bond_target_mode==='score'?desired.bond_score_target:desired.bond_count);
+        }
+    }
+        if(desired.tasks.includes('grocery')){click('[data-action="select-task"][data-task-code="grocery"]');for(const el of document.querySelectorAll('[data-grocery-item]'))toggle('[data-grocery-item="'+el.dataset.groceryItem+'"]',desired.grocery_items.includes(el.dataset.groceryItem));}
     click('[data-action="show-request"]');
     '''
 
@@ -193,7 +225,7 @@ def main(argv=None):
             try:
                 deadline=time.monotonic()+25
                 while time.monotonic()<deadline:
-                    if window.evaluate_js('!!window.HYOL_NATIVE?.ready'):
+                    if window.evaluate_js(PLAN_CONTROLS_READY):
                         break
                     time.sleep(.1)
                 else:
@@ -258,6 +290,7 @@ def main(argv=None):
                     time.sleep(.2)
                 result['ui']=json.loads(result['ui'])
                 result['backend']=api.get_state() if api else None
+                result['onboarding']=api.get_onboarding() if api else None
                 result['success']=args.demo or (result['ui']['native'] and result['ui']['ready']
                                                and result['backend']['status']=='idle' and not result['backend']['busy'])
             except Exception as exc:
@@ -283,5 +316,20 @@ if __name__=='__main__':
     except Exception as exc:
         if getattr(sys,'frozen',False):
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None,'客户端启动失败：'+str(exc)+'\n请确认WebView2运行库已安装，并重新获取完整客户端。','火影OL 客户端',0x10)
+            import tempfile
+            import traceback
+            import uuid
+            from hyol_log_messages import error_message
+            message, suggestion = error_message(exc, '客户端未能正常启动。')
+            diagnostic = Path(tempfile.gettempdir()) / ('HYOL_startup_'+uuid.uuid4().hex+'.log')
+            try:
+                diagnostic.write_text(traceback.format_exc(),encoding='utf-8')
+                suggestion += '\n启动诊断文件：'+str(diagnostic)
+            except OSError:
+                suggestion += '\n启动诊断未能保存，请检查临时目录权限和磁盘空间。'
+            ctypes.windll.user32.MessageBoxW(None,
+                '客户端启动失败：'+message+'\n'+suggestion+
+                '\n若界面无法打开，请确认网页显示运行库已安装，并使用完整客户端。',
+                '火影OL 客户端',0x10)
+            raise SystemExit(1) from None
         raise

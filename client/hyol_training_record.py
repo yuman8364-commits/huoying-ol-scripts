@@ -348,11 +348,86 @@ def planned_tasks(rows, order=None):
 
 
 def goal_summary(rows):
-    return dict(total=len(rows),completed=sum(row.get('completed') is True for row in rows),
-                remaining=sum(not row.get('completed') for row in rows),
+    return dict(total=len(rows),completed=sum(goal_complete(row) for row in rows),
+                remaining=sum(not goal_complete(row) for row in rows),
                 claimable=sum(row.get('claimable') is True for row in rows),
                 unreadable=sum(not row.get('progress_known') and not row.get('completed') for row in rows),
                 unsupported=sum(not row.get('task') and not row.get('completed') for row in rows))
+
+
+def terminal_gray(frame, roi):
+    """The completed task's grey paper, independently of its claimed stamp."""
+    import numpy as np
+    if not roi or roi[2]-roi[0] < 20 or roi[3]-roi[1] < 6:
+        return False
+    rgb = np.asarray(frame.crop(roi).convert('RGB'), dtype=np.int16)
+    neutral = (rgb.max(axis=2)-rgb.min(axis=2) <= 12) & (rgb.min(axis=2) >= 85)
+    return float(neutral.mean()) >= .95
+
+
+def row_terminal(row):
+    # Legacy snapshots may be read for planning, but never supply new terminal
+    # proof. Actual observations always carry a series_state.
+    return (row.get('series_state') == 'terminal_claimed'
+            and row.get('terminal_gray_verified') is True
+            and len(row.get('terminal_samples', ())) >= 2)
+
+
+def goal_complete(row):
+    return row_terminal(row) if 'series_state' in row else row.get('completed') is True
+
+
+def series_summary(rows):
+    """Keep tier receipts separate from a visually proved terminal series."""
+    from hyol_training_policy import goal_unit
+    groups = {}
+    for row in rows:
+        task = row.get('task')
+        unit = goal_unit(task, row.get('description',''))
+        key = task+':'+unit if task else 'unsupported:'+row.get('key','unknown')
+        groups.setdefault(key, []).append(row)
+    result = {}
+    for key, goals in groups.items():
+        ambiguous = any(row.get('identity_ambiguous') for row in goals)
+        terminal = not ambiguous and all(row_terminal(row) for row in goals)
+        claimable = any(row.get('claimable') for row in goals)
+        active = any(row.get('progress_known') and not row.get('claimed') and not row.get('tier_claimed')
+                     and not row.get('claimable') and row.get('current',0) < row.get('target',0)
+                     for row in goals)
+        targets = [row['target'] for row in goals if type(row.get('target')) is int
+                   and row.get('progress_known')]
+        result[key] = dict(task=goals[0].get('task'), unit=goal_unit(goals[0].get('task'),goals[0].get('description','')),
+                           state='unknown' if ambiguous else 'terminal_claimed' if terminal else
+                                 'claimable' if claimable else 'in_progress' if active else 'unknown',
+                           highest_observed_target=max(targets,default=None),
+                           final_target=max(targets,default=None) if terminal else None,
+                           terminal_evidence=[path for row in goals for path in row.get('terminal_samples',())]
+                                             if terminal else [],
+                           goal_keys=[row.get('key') for row in goals])
+    return result
+
+
+def verify_terminal_rows(r, rows, frame, evidence):
+    candidates = [row for row in rows if row.get('terminal_gray_candidate')
+                  and not row.get('identity_ambiguous')]
+    if not candidates:
+        return
+    s = r.scheduler
+    s.wait_interruptible(.2)
+    fresh = s.content_guard(r.account, ['training_record_task_tab.bmp'], anchor_threshold=.95)
+    if not layout(r, fresh) or not s.verify_identity(r.account, fresh)[0]:
+        raise TrainingPending('修行录最终灰态复核时账号或页面变化')
+    verified = []
+    for row in candidates:
+        if (frame.crop(row['proof_box']).tobytes() == fresh.crop(row['proof_box']).tobytes()
+                and terminal_gray(fresh, row['terminal_gray_roi'])
+                and s.template('training_record_claimed.bmp', row['status_roi'], fresh, threshold=.98)[0]):
+            verified.append(row)
+    if verified:
+        second = str(s.save_raw_evidence(fresh, r.account, 'training_terminal_gray', 'verified'))
+        for row in verified:
+            row.update(series_state='terminal_claimed', terminal_gray_verified=True,
+                       terminal_samples=[evidence, second], completed=True, reason='最终灰态及已领取标记已核实')
 
 
 def observe_page(r, body, frame):
@@ -385,7 +460,12 @@ def observe_page(r, body, frame):
         claimed=r.scheduler.template('training_record_claimed.bmp',roi,frame,threshold=.98)[0]
         claim=r.scheduler.template('training_record_claim.bmp',roi,frame,threshold=.98)
         achieved=row['progress_known'] and row['current']==row['target']
-        row.update(claimed=claimed,claimable=claim[0] and not claimed,completed=claimed,status_roi=roi)
+        gray_roi=(body[0]+200,max(body[1],int(y+20)),body[0]+280,min(body[3],int(y+32)))
+        gray=claimed and terminal_gray(frame,gray_roi)
+        row.update(claimed=claimed,claimable=claim[0] and not claimed,completed=False,status_roi=roi,
+                   terminal_gray_roi=gray_roi,terminal_gray_candidate=gray,terminal_gray_verified=False,
+                   series_state='claimable' if claim[0] and not claimed else
+                                'unknown' if claimed or not row.get('progress_known') else 'in_progress')
         if claim[0]:
             row['claim_roi']=(claim[2]-2,claim[3]-2,claim[2]+101,claim[3]+33)
         row['proof_box']=(body[0]+25,max(body[1],int(y-5)),body[0]+350,min(body[3],int(y+27)))
@@ -396,13 +476,14 @@ def observe_page(r, body, frame):
             'training_record_points_'+str(value)+'.bmp',point_roi,frame,threshold=.98)[0]]
         row['reward_points']=visual_points[0] if len(visual_points)==1 else next(iter(points)) if len(points)==1 else None
         row['xp_roi']=(body[0]-130,body[1]-28,body[0]-22,body[1]+6)
-        if claimed:row['reason']=''
+        if claimed:row['reason']='当前档已领取，最终灰态等待独立画面复核'
         elif claim[0]:row['reason']='目标已达成，准备领取修行录奖励' if achieved else '领奖前目标计数仍待核实'
         elif achieved:row['reason']='目标已达成，领奖状态尚未核实'
         receipt=reward_receipt(r,row) or {}
         if (receipt.get('status')=='done' and receipt.get('method') in (
                 'claimed_stamp','immediate_week_xp_delta','recorded_immediate_week_xp_delta')):
-            row.update(completed=True,claimable=False,reason='本轮领奖结果已核实')
+            row.update(tier_claimed=True,completed=True,claimable=False,
+                       reason='本轮当前档领奖已核实，继续核对后续档位或最终灰态')
         if claim[0] and len(receipt.get('attempts',[]))>=2:
             row['reason']='退出重进并尝试两次后，领奖结果仍待核实'
     return data,rows
@@ -416,7 +497,12 @@ def reconcile_claimed_rows(r, rows):
         if (receipt.get('status')=='done' and receipt.get('method') in (
                 'claimed_stamp','immediate_week_xp_delta','recorded_immediate_week_xp_delta')
                 and receipt.get('evidence')):
-            row.update(completed=True,claimable=False,claimed=True,reason='本轮领奖结果已核实')
+            if 'series_state' in row:
+                row.update(tier_claimed=True,completed=True,claimable=False)
+                if not row_terminal(row):
+                    row.update(reason='当前档已领取，后续档位或最终灰态尚未核实')
+            else:
+                row.update(completed=True,claimable=False,claimed=True,reason='本轮领奖结果已核实')
     return rows
 
 
@@ -650,7 +736,7 @@ def scroll(r,body,delta,*,steps=1):
     s.wait_interruptible(.35)
 
 
-def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
+def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0,keep_open_after_claims=False):
     s=r.scheduler
     visit=uuid.uuid4().hex
     prior=prior_goal_proofs(r)
@@ -666,6 +752,7 @@ def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
         scroll(r,body,120,steps=8)
         yield
     pages=[];rows={};previous_rows=[];last=None;repeated=0;at_end=False;counter_recheck=False
+    claims_sent=0
     for index in range(72):
         yield
         s.check_input_pause()
@@ -676,12 +763,16 @@ def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
         if not current:raise TrainingPending('修行录当前页未识别到完整任务，不能视为空列表')
         masks=[row_visual_mask(frame,body,row) for row in current]
         recover_visual_rows(current,masks,prior,evidence)
+        verify_terminal_rows(r,current,frame,evidence)
         signature=tuple((int(row.get('y',0)),hashlib.sha256(mask.tobytes()).hexdigest() if mask is not None else row['text'])
                         for row,mask in zip(current,masks))
         repeated=repeated+1 if signature==last else 0
         last=signature
         previous_rows=merge_scan_page(rows,previous_rows,current,masks,evidence)
         pages.append(dict(index=index,evidence=evidence,ocr=data,rows=current))
+        phase_label='检查可领奖目标' if collect_rewards else '复核目标列表'
+        r.event('training_scan_progress',task='training_record',observation=index+1,goals=len(rows),
+                detail=f'{phase_label}：第{index+1}次页面观察，已识别{len(rows)}项目标')
         if (not counter_recheck and any(row.get('counter_candidate') and not row.get('progress_known')
                                        and not row.get('completed') for row in current)):
             counter_recheck=True
@@ -689,6 +780,7 @@ def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
         if collect_rewards:
             for row in current:
                 if claim_visible(r,row,frame,visit):
+                    claims_sent+=1
                     repeated=0;last=None;counter_recheck=False
                     break
             else:row=None
@@ -701,10 +793,16 @@ def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
     if not at_end:raise TrainingPending('修行录72次观察内未确认列表末尾或领取结果，保留未扫描目标')
     frame=s.capture()
     if not layout(r,frame):raise TrainingPending('修行录退出前页面未确认')
-    r.click('training_record_close.bmp',close,14,14,'training_close_record',
-            ['training_record_task_tab.bmp'],threshold=.95)
-    if not s.wait_until_main(8):raise TrainingPending('修行录退出后尚未核实木叶主界面')
     claims=r.record('training_record').get('claims',{}) if collect_rewards else {}
+    keep_open=(keep_open_after_claims and collect_rewards and claims_sent>0
+               and not any(claim.get('status')!='done' for claim in claims.values()))
+    if keep_open:
+        r.event('training_scan_panel_reused',task='training_record',
+                detail='本次领奖均已核实，沿当前任务页复核新档位，省略关闭再打开')
+    else:
+        r.click('training_record_close.bmp',close,14,14,'training_close_record',
+                ['training_record_task_tab.bmp'],threshold=.95)
+        if not s.wait_until_main(8):raise TrainingPending('修行录退出后尚未核实木叶主界面')
     retry=False
     for rec in claims.values():
         attempts=rec.get('attempts',[])
@@ -716,8 +814,10 @@ def scan_steps(r,label,*,collect_rewards=False,_reward_pass=0):
         r.event('training_reward_reenter',detail='领奖未确认；已退出并确认主界面，重新进入后核实同一目标再重试')
         following=yield from scan_steps(r,label+'_reenter',collect_rewards=True,_reward_pass=1)
         following['pages']=pages+following['pages']
+        following['claims_sent']=claims_sent+following.get('claims_sent',0)
         return following
-    return dict(rows=reconcile_claimed_rows(r,list(rows.values())),pages=pages,scan_complete=True,at=hs.now_iso())
+    return dict(rows=reconcile_claimed_rows(r,list(rows.values())),pages=pages,scan_complete=True,
+                scan_version=2,claims_sent=claims_sent,panel_open=keep_open,scope='full',at=hs.now_iso())
 
 
 def drain_steps(iterator):
@@ -726,8 +826,9 @@ def drain_steps(iterator):
         except StopIteration as result:return result.value
 
 
-def scan(r,label,*,collect_rewards=False,_reward_pass=0):
-    return drain_steps(scan_steps(r,label,collect_rewards=collect_rewards,_reward_pass=_reward_pass))
+def scan(r,label,*,collect_rewards=False,_reward_pass=0,keep_open_after_claims=False):
+    return drain_steps(scan_steps(r,label,collect_rewards=collect_rewards,_reward_pass=_reward_pass,
+                                 keep_open_after_claims=keep_open_after_claims))
 
 
 def _legacy_scan_steps(*args,**kwargs):
@@ -754,18 +855,26 @@ def refresh_goal_steps(r,label,*,scanner=scan_steps):
         collection=dict(label=label,sweep=sweep,status='collecting')
         rec['reward_collection']=collection
         r.save()
-        collected=yield from scanner(r,f'{label}_claim_{sweep}',collect_rewards=True)
+        options=({'keep_open_after_claims':True} if scanner in (scan_steps,_legacy_scan_steps) else {})
+        collected=yield from scanner(r,f'{label}_claim_{sweep}',collect_rewards=True,**options)
         if collected.get('scan_complete') is not True:
             raise TrainingPending('修行录领奖列表尚未完整遍历，未生成日常计划')
-        collection.update(status='rescanning',claim_scan_at=collected['at'])
-        rec['phase']='scanning_after_rewards';r.save()
-        fresh=yield from scanner(r,f'{label}_fresh_{sweep}')
+        pending=[key for key,claim in rec.get('claims',{}).items() if claim.get('status')!='done']
+        unchanged=(collected.get('scan_version')==2 and collected.get('claims_sent')==0
+                   and not pending and not any(row.get('claimable') for row in collected['rows']))
+        collection.update(status='verified' if unchanged else 'rescanning',claim_scan_at=collected['at'],
+                          reused_complete_scan=unchanged)
+        if unchanged:
+            fresh=collected
+        else:
+            rec['phase']='scanning_after_rewards';r.save()
+            fresh=yield from scanner(r,f'{label}_fresh_{sweep}')
         if fresh.get('scan_complete') is not True:
             raise TrainingPending('修行录领奖后的独立复扫未完成，未生成日常计划')
         pending=[key for key,claim in rec.get('claims',{}).items() if claim.get('status')!='done']
         claimable=[row for row in fresh['rows'] if row.get('claimable') and not row.get('completed')]
         collection.update(scan_at=fresh['at'],claimable=len(claimable),pending_claims=pending)
-        rec.update(latest=fresh,remaining=[row for row in fresh['rows'] if not row.get('completed')])
+        rec.update(latest=fresh,remaining=[row for row in fresh['rows'] if not goal_complete(row)])
         if pending:
             collection['status']='pending'
             for key in pending:
@@ -788,11 +897,144 @@ def refresh_goal_steps(r,label,*,scanner=scan_steps):
         fresh['rewards_complete']=True
         rec['rewards_complete']=True;r.save()
         r.event('training_rewards_cleared',sweeps=sweep,summary=goal_summary(fresh['rows']),
-                detail='全页领奖后已独立复扫，当前无可领取奖励及未决领奖凭据')
+                detail=('完整扫描未发生领奖且无未决凭据，直接复用目标，省略重复全扫' if unchanged else
+                        '全页领奖后已独立复扫，当前无可领取奖励及未决领奖凭据'))
         return fresh
     rec.update(status='pending',phase='claim_pending',task_completed=False)
     collection['status']='pending';r.save()
     raise TrainingPending('修行录连续出现可领取目标，尚未确认领完，未生成日常计划')
+
+
+def task_scan_hint(snapshot, task):
+    pages = snapshot.get('pages', ())
+    matches = [page.get('index', 0) for page in pages
+               if page.get('scope', 'full') == 'full'
+               and any(row.get('task') == task and not row.get('completed')
+                       for row in page.get('rows', ()))]
+    return min(matches, default=0)
+
+
+def _seek_record_top(r, body):
+    previous = None
+    strip = (body[0]+25, body[1], body[0]+350, body[3])
+    for _ in range(10):
+        current = hs.image_hash(r.scheduler.capture().crop(strip))
+        if current == previous:
+            return
+        previous = current
+        scroll(r, body, 120, steps=8)
+        yield
+    raise TrainingPending('修行录定向检查未确认列表顶部，未猜测目标行')
+
+
+def scan_task_steps(r, task, label, snapshot):
+    """Inspect one series at its unlock boundary; a moved row is searched once.
+
+    The previous full snapshot remains evidence for other series. A final full
+    scan, owned by the coordinator, is mandatory before all-goals completion.
+    """
+    s = r.scheduler
+    body, close = open_record(r)
+    yield from _seek_record_top(r, body)
+    hint = task_scan_hint(snapshot, task)
+    for _ in range(min(hint, 70)):
+        scroll(r, body, -120, steps=8)
+        yield
+    prior = prior_goal_proofs(r)
+    visit = uuid.uuid4().hex
+    pages, rows, previous_rows = [], {}, []
+    searched_from_top = hint == 0
+    last = None
+    repeated = 0
+    claims_sent = 0
+    claim_changed_page = False
+    result = None
+    for index in range(72):
+        yield
+        frame = s.content_guard(r.account, ['training_record_task_tab.bmp'], anchor_threshold=.95)
+        if not layout(r, frame):
+            raise TrainingPending('修行录定向检查期间页面发生变化')
+        evidence = str(s.save_raw_evidence(frame, r.account, f'training_{label}_focused_{index}', 'observed'))
+        data, current = observe_page(r, body, frame)
+        if not current:
+            raise TrainingPending('修行录定向检查未识别到完整任务行')
+        masks = [row_visual_mask(frame, body, row) for row in current]
+        recover_visual_rows(current, masks, prior, evidence)
+        verify_terminal_rows(r, current, frame, evidence)
+        previous_rows = merge_scan_page(rows, previous_rows, current, masks, evidence)
+        selected = [row for row in current if row.get('task') == task and not row.get('identity_ambiguous')]
+        pages.append(dict(index=index, scope='task', task=task, evidence=evidence, ocr=data, rows=current))
+        if any(row.get('counter_candidate') and not row.get('progress_known') for row in selected):
+            continue
+        sent = False
+        for row in selected:
+            if claim_visible(r, row, frame, visit):
+                claims_sent += 1
+                if claims_sent > MAX_REWARD_SWEEPS:
+                    raise TrainingPending('修行录连续解锁档位超过本次观察边界，保留原领奖凭据')
+                sent = claim_changed_page = True
+                break
+        if sent:
+            last = None
+            repeated = 0
+            continue
+        pending = [key for key, claim in r.record('training_record').get('claims', {}).items()
+                   if claim.get('status') != 'done']
+        usable = [row for row in selected if row_terminal(row)
+                  or row.get('progress_known') and row['current'] < row['target']
+                  and not row.get('claimed') and not row.get('claimable')]
+        if selected and len(usable) == len(selected) and not pending:
+            # A claim replaces a tier asynchronously. One unchanged fresh frame
+            # proves the newly observed row, never a speculative higher target.
+            s.wait_interruptible(.2)
+            fresh = s.content_guard(r.account, ['training_record_task_tab.bmp'], anchor_threshold=.95)
+            if not layout(r, fresh):
+                raise TrainingPending('修行录目标行复核时页面变化')
+            if all(frame.crop(row['proof_box']).tobytes() == fresh.crop(row['proof_box']).tobytes()
+                   and not s.template('training_record_claim.bmp', row['status_roi'], fresh, threshold=.98)[0]
+                   for row in usable):
+                second = str(s.save_raw_evidence(fresh, r.account, 'training_focused_target_stable', 'verified'))
+                for row in usable:
+                    row['boundary_samples'] = [evidence, second]
+                result = usable
+                break
+        if selected and any(row.get('claimed') or row.get('claimable') for row in selected):
+            # Never keep clicking the same unresolved reward on the same page.
+            if pending:
+                raise TrainingPending('本任务原领奖结果仍待核实，未继续操作或重建目标')
+        if (not selected and (claim_changed_page or not searched_from_top)):
+            yield from _seek_record_top(r, body)
+            searched_from_top = True
+            claim_changed_page = False
+            rows, previous_rows, last, repeated = {}, [], None, 0
+            continue
+        signature = tuple((row.get('text'), int(row.get('y', 0))) for row in current)
+        repeated = repeated+1 if signature == last else 0
+        last = signature
+        if repeated >= 2:
+            break
+        scroll(r, body, -120, steps=8)
+    if result is None:
+        raise TrainingPending('修行录本任务的新档位或最终灰态未确认，保留目标，不重复执行')
+    r.click('training_record_close.bmp', close, 14, 14, 'training_close_record',
+            ['training_record_task_tab.bmp'], threshold=.95)
+    if not s.wait_until_main(8):
+        raise TrainingPending('修行录定向检查后尚未核实木叶主界面')
+    combined = deepcopy(snapshot)
+    combined['rows'] = [row for row in combined.get('rows', ()) if row.get('task') != task]+result
+    combined.update(at=hs.now_iso(), scope='task', focused_task=task, rewards_complete=True,
+                    full_scan_at=snapshot.get('full_scan_at', snapshot.get('at')),
+                    scan_complete=True, scan_version=2)
+    combined['pages'] = [*snapshot.get('pages', ())[-72:], *pages]
+    combined.setdefault('task_scans', {})[task] = dict(at=combined['at'], claims_sent=claims_sent,
+                                                      pages=len(pages), evidence=pages[-1]['evidence'])
+    parent = r.record('training_record')
+    parent.update(latest=combined, rewards_complete=True,
+                  remaining=[row for row in combined['rows'] if not goal_complete(row)])
+    r.save()
+    r.event('training_series_boundary_verified', task=task, claims_sent=claims_sent,
+            detail='仅复核当前任务的新档位或最终灰态，其他任务沿用原完整扫描')
+    return combined
 
 
 def daily_plan(r,snapshot,order,day,attempted,errors):
@@ -813,8 +1055,9 @@ def daily_plan(r,snapshot,order,day,attempted,errors):
         extend=task=='arena' and task in attempted and additional_arena_goal(snapshot,record) is not None
         status=('not_open' if task in calendar['calendar_skipped'] else 'pending' if task in errors
                 else 'checked' if task in attempted and not extend else 'ready')
-        from hyol_training_policy import quantity_plan, local_day
-        item=dict(task=task,status=status,goals=goals,**quantity_plan(task,goals,day or local_day()))
+        from hyol_training_policy import quantity_plan, local_day, selected_arena_policy
+        item=dict(task=task,status=status,goals=goals,**quantity_plan(
+            task,goals,day or local_day(),selected_arena_policy(r)))
         wins=[goal['remaining'] for goal in goals if '获胜' in goal['description']]
         if task=='arena' and wins:item['required_wins']=max(wins)
         if task=='arena':
@@ -966,7 +1209,7 @@ def run_legacy(r):
     order=load_order(hs.ROOT)['order']['solo']
     day=getattr(getattr(getattr(r,'scheduler',None),'state',None),'day',None)
     day=day if isinstance(day,str) else None
-    rec.update(before=before,before_summary=goal_summary(before['rows']),remaining=[row for row in before['rows'] if not row['completed']],
+    rec.update(before=before,before_summary=goal_summary(before['rows']),remaining=[row for row in before['rows'] if not goal_complete(row)],
                planned_tasks=[],errors={},current_task='')
     errors={};snapshot=before
     # Daily handlers keep their original journal. Arena alone can advance to
@@ -1008,7 +1251,7 @@ def run_legacy(r):
         elif (row.get('task') in attempted and not row.get('completed')
                 and not row.get('claimable') and row.get('task') not in errors):
             row['reason']='本轮对应任务已执行，修行录目标仍未达成'
-    remaining=[row for row in after['rows'] if not row['completed']]
+    remaining=[row for row in after['rows'] if not goal_complete(row)]
     for key,claim in rec.get('claims',{}).items():
         if claim.get('status')!='done' and not any(row['key']==key for row in remaining):
             remaining.append(dict(key=key,description=claim['description'],task=None,completed=False,

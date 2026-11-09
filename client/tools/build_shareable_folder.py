@@ -17,7 +17,7 @@ sys.path.insert(0,str(ROOT))
 from tools.build_shareable_exe import (stage_release,save_json,sha,known_labels,
     text_issues,code_strings,CONFIGS,PUZZLE_NAME,PUZZLE_SHA256)
 from tools.verify_packaged_source import verify_package
-from hyol_runtime import VERSION
+from hyol_runtime import VERSION, RELEASE_DATE
 
 
 def copy_folder_resources(bundle, package):
@@ -35,8 +35,20 @@ def copy_folder_resources(bundle, package):
             lambda _:r'SharedStateDirectory=%LOCALAPPDATA%\HYOLFolderClient\state',content,flags=re.M)
         path.write_text(content,encoding='utf-8')
     (package/'使用说明.txt').write_text(
-        '火影OL 最终目录版 '+VERSION+'\n\n'
+        '火影OL 标准版 '+VERSION+'\n\n'
         '双击“火影OL.exe”运行，打开后保持空闲，选择任务再开始。F12或停止按钮停止。\n'
+        '点击“检查并回木叶村”或“开始本轮”后，逐号先回木叶村，再检查其他忍者显示。\n'
+        '同一次开始复用回村凭据并重新观察核实，不重复进行整轮回村。\n'
+        '左侧勾选、拖拽任务，中间设置参数，右侧常驻日志；运行中固定本轮顺序。\n'
+        '当前账号页可自选组队活动；组队副本、强者默认不选，只控制本号。\n'
+        '当前账号羁绊和3v3完成后保留队伍及准备页，只核实本号结果。\n'
+        '修行录连续完成已核实目标，最终灰态及领奖才算系列完成，必要解锁边界定向复核。\n'
+        '修行录竞技场可选完成最终目标或战令用完；自动设置下周日默认完成最终目标。\n'
+        '日志及报错以中文说明原因和处理建议，重复观察合并显示，原始诊断单独保存。\n'
+        '生存按实际免费重置继续，原来已完成与本轮战斗、领奖分别统计。\n'
+        '已有三人队可选择限时竞技场3v3；先完成其他组队任务，3v3固定最后。\n'
+        '三人的六项任务奖励和三个宝箱分别核实，全部领取后退出、核实解散并回村。\n'
+        '已在3v3时保留活动页面；黑屏、未知战斗或领取结果保留原动作，恢复后继续。\n'
         '文件夹内的配套文件必须保留。可以改名、移动或压缩整个原始文件夹发给其他人。\n'
         '无需安装Python；Windows 10/11 64位，需系统WebView2 Runtime与.NET Framework 4.8。\n\n'
         '在任务计划选择独立的“周年庆活动”板块，设置处理前1～6个账号，当前支持薪火签到。\n'
@@ -110,7 +122,7 @@ def audit_folder(root, package, bundle):
                 modules_checked=source['modules_checked'],source=source,files=manifest)
 
 
-def build(output):
+def build(output, *, make_zip=True):
     output=Path(output).resolve()
     if output.exists():raise ValueError('Use a new output directory; existing versions are preserved')
     output.mkdir(parents=True)
@@ -141,9 +153,10 @@ def build(output):
     package=output/'dist/火影OL最终版'
     copy_folder_resources(bundle,package)
     save_json(package/'PACKAGE_INFO.json',dict(version=VERSION,edition='OpenCV',packaging='onedir',
-        release_date='2026-11-05',startup_resource_extraction=False,
+        release_date=RELEASE_DATE,startup_resource_extraction=False,
         personal_material=False,runtime_data_included=False,
         limited_rewards='Dedicated anniversary section; Xinhuo 10-day sign-in only when detected',
+        team_activity='Limited arena_3v3; preformed trio; six task rewards and three milestone chests per account',
         shared_state='per Windows user; HYOLFolderClient/state',
         requires='Windows x64, Microsoft Edge WebView2 Runtime, .NET Framework 4.8'))
     changed=[name for name,digest in inputs.items() if sha((ROOT/name).read_bytes())!=digest]
@@ -152,13 +165,15 @@ def build(output):
     save_json(output/'folder-audit.json',report)
     save_json(output/'embedded-source-report.json',report['source'])
     if report['result']!='PASS':raise ValueError('Folder audit failed; see folder-audit.json')
-    archive=output/'火影OL最终目录版.zip'
-    with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as target:
-        for row in report['files']:target.write(package/row['path'],Path(package.name)/row['path'])
-    with zipfile.ZipFile(archive) as target:
-        if target.testzip():raise ValueError('Folder ZIP CRC failed')
-    save_json(output/'delivery-manifest.json',dict(version=VERSION,files=report['files'],
-        zip_crc='PASS',archive_sha256=sha(archive.read_bytes())))
+    delivery=dict(version=VERSION,files=report['files'],archive_created=False)
+    if make_zip:
+        archive=output/'火影OL标准版.zip'
+        with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as target:
+            for row in report['files']:target.write(package/row['path'],Path(package.name)/row['path'])
+        with zipfile.ZipFile(archive) as target:
+            if target.testzip():raise ValueError('Folder ZIP CRC failed')
+        delivery.update(archive_created=True,zip_crc='PASS',archive_sha256=sha(archive.read_bytes()))
+    save_json(output/'delivery-manifest.json',delivery)
     print(json.dumps({key:report[key] for key in ('result','version','packaging','file_count',
         'unpacked_bytes','resources_checked','modules_checked')},ensure_ascii=False))
     return package
@@ -167,4 +182,6 @@ def build(output):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',required=True,type=Path)
-    build(parser.parse_args().output)
+    parser.add_argument('--no-zip',action='store_true',help='仅构建并审计最终目录，不创建ZIP')
+    args=parser.parse_args()
+    build(args.output,make_zip=not args.no_zip)

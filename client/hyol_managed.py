@@ -20,6 +20,49 @@ CARD_CONFIRM_ROI = (800,565,950,625)
 CARD_ACTION = 'start_managed_card_confirm'
 
 
+def task_settled_for_managed(runner, task):
+    """Allow a proven quota stop while keeping its unearned rewards pending."""
+    from pathlib import Path
+    rec = runner.record(task)
+    if not rec.get('home_returned') or rec.get('followup_check_due'):
+        return False
+    if rec.get('status') == 'done' and rec.get('task_completed'):
+        if task == 'daruma':
+            from hyol_daruma_task import verified
+            return verified(rec)
+        if task == 'escort':
+            from hyol_escort import verified
+            return verified(rec)
+        return task != 'training_record' or rec.get('all_goals_complete') is True
+    if (task != 'arena' or rec.get('status') != 'pending'
+            or rec.get('outcome') != 'quota_exhausted' or rec.get('task_completed') is not False
+            or type(rec.get('tickets_remaining')) is not int or rec['tickets_remaining'] != 0):
+        return False
+    from hyol_arena_outcome import exhausted_record
+    observed = exhausted_record(runner.scheduler, runner.account)
+    if not observed:
+        return False
+    # Recheck the original scheduler receipts, not just the UI task record.
+    # Missing files, a different day or an unknown battle/claim remain blockers.
+    return all(rec.get(key) == observed.get(key) and bool(rec.get(key))
+               and Path(rec[key]).is_file() for key in ('quota_evidence', 'home_evidence'))
+
+
+def blocking_tasks(runner, tasks):
+    return [task for task in tasks if not task_settled_for_managed(runner, task)]
+
+
+def active_observation(s, frame):
+    """Use the toolbar or the complete status panel as positive active proof."""
+    score=s.managed_active_score(frame)
+    def matched(name,roi):
+        result=s.template(name,roi,frame,threshold=.98)
+        return isinstance(result,(tuple,list)) and bool(result[0])
+    panel=(score<.70 and matched('managed_status_title_current.bmp',(40,600,180,665))
+           and matched('managed_status_exit_current.bmp',(100,675,215,740)))
+    return dict(active=score>=.70 or bool(panel),badge_score=score,status_panel=bool(panel))
+
+
 def first_card_prompt_visible(s, frame):
     """The complete first-day card text and its own button must agree."""
     return all(s.template(name, roi, frame, threshold=.98)[0] for name,roi in (
@@ -169,7 +212,7 @@ def exit_visible_status(s, account, frame):
     action='managed_status_exit'
     if not pending:
         for sample in range(3):
-            checks=dict(panel=visible(frame),active=s.managed_active_score(frame)>=.70,
+            checks=dict(panel=visible(frame),active=active_observation(s,frame)['active'],
                         tab=s._generic_active_tab_x(frame)==account.tab_x,
                         identity=s.verify_identity(account,frame)[0],
                         world=s.main_ready(frame) or hot_spring_visible(s,frame) or home_visible(s,frame))

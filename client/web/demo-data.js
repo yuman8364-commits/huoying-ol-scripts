@@ -1,5 +1,6 @@
 (() => {
   const SOLO_TASKS = [
+    { code: 'grocery', label: '杂货屋', description: '二级设置选择商品，使用月之印买完所选库存', default: false },
     { code: 'mail', label: '邮件', description: '领取邮件附件，背包满时明确提示清理', default: true },
     { code: 'escort', label: '押镖', description: '按本日剩余次数，优先免费SS；无SS先免费刷新，额度耗尽后铜币；11–14点、18–21点', default: true },
     { code: 'welfare', label: '领取奖励', description: '领取当前可领取的在线福利', default: true },
@@ -23,6 +24,13 @@
   ];
   const PIPELINE_TASKS = [...TEAM_TASKS.filter((task) => ['group_instance', 'wanted', 'strong_approach'].includes(task.code)),
     { code: 'bond', label: '羁绊（多人完成后）', description: '仅二人小队；每场核实成员、结算与返回', default: false }];
+  PIPELINE_TASKS.push({code:'arena_3v3',label:'竞技场3v3（限时）',description:'已有三人队；六项任务和三个宝箱全部领取，退出即解散，固定最后执行',default:false});
+  const CURRENT_TEAM_TASKS = [...TEAM_TASKS.map(task=>({...task,
+    default:false,
+    description:(['group_instance','strong_approach','wanted'].includes(task.code)?'支持单人，无需提前组队。':'已有队伍，仅操作当前账号。')+task.description})),
+    {code:'bond',label:'羁绊',description:'已有队伍，仅操作当前账号，结束保留队伍和准备页',default:false},
+    {code:'arena_3v3',label:'竞技场三对三',description:'已有三人队，仅操作当前账号；结束保留队伍，固定最后执行',default:false}];
+  const CURRENT_TASKS = [...SOLO_TASKS,...CURRENT_TEAM_TASKS];
   const INDEPENDENT_TASKS = [
     { code: 'arena', label: '竞技场', description: '按实际战令或所选目标结束', icon: 'arena' },
     { code: 'bond', label: '羁绊', description: '一直打、打5次或5场胜利', icon: 'bond' },
@@ -34,7 +42,7 @@
   const ANNIVERSARY_TASKS = [
     { code: 'anniversary', label: '薪火签到', description: '按已解锁进度领取10天奖励；本期未检测到时静默略过' },
   ];
-  const TASK_MAP = Object.fromEntries([...SOLO_TASKS, ...TEAM_TASKS, ...ANNIVERSARY_TASKS].map((task) => [task.code, task]));
+  const TASK_MAP = Object.fromEntries([...SOLO_TASKS, ...TEAM_TASKS, ...PIPELINE_TASKS, ...ANNIVERSARY_TASKS].map((task) => [task.code, task]));
   TASK_MAP.managed = { code: 'managed', label: '最后托管', description: '按游戏当前设置进入并确认托管' };
   TASK_MAP.bond = { code: 'bond', label: '羁绊', description: '完成已核实战斗后，按原轮次收尾' };
   const STATUS = {
@@ -61,6 +69,11 @@
     scope: 'current',
     accountCount: 6,
     tasks: SOLO_TASKS.filter((task) => task.default).map((task) => task.code),
+    currentTeamTasks: [],
+    arenaSecondSkill: false,
+    groceryItems: [],
+    currentTaskOrder: [],
+    trainingArenaStopPolicy: 'auto',
     teamMode: 'auto',
     leader: 1,
     members: [2, 3],
@@ -69,6 +82,7 @@
     pipelineTasks: ['group_instance', 'wanted', 'strong_approach'],
     pipelineAuto: true,
     preformedDuos: false,
+    preformedTrio: [1,2,3],
     preformedPairs: [],
     pipelineLeaders: [1, 3, null],
     independent: 'arena',
@@ -88,21 +102,32 @@
   };
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const freshConfig = () => clone(DEFAULT_CONFIG);
-  const taskLabel = (code) => TASK_MAP[code]?.label || code;
+  const taskLabel = (code) => TASK_MAP[code]?.label || '当前任务';
   const defaultOrders = () => ({
-    solo: [...['mail','escort','ranking','survival','quiz','arena'], ...SOLO_TASKS.map(t => t.code).filter(t => !['mail','escort','ranking','survival','quiz','arena','welfare'].includes(t)), 'welfare'],
+    solo: [...['mail','escort','ranking','survival','quiz','arena'], ...SOLO_TASKS.map(t => t.code).filter(t => !['mail','escort','ranking','survival','quiz','arena','welfare','grocery'].includes(t)), 'grocery', 'welfare'],
     team: TEAM_TASKS.map(t => t.code), pipeline: PIPELINE_TASKS.map(t => t.code),
   });
   const orderedCatalog = (config, group, source) => {
     const allowed = source.map(t => t.code);
-    const order = config.taskOrder?.[group] || defaultOrders()[group];
-    return [...new Set([...order, ...allowed])].filter(code => allowed.includes(code));
+    const order = group==='current' ? (config.currentTaskOrder?.length ? config.currentTaskOrder : [...(config.taskOrder?.solo||defaultOrders().solo),...CURRENT_TEAM_TASKS.map(t=>t.code)])
+      : config.taskOrder?.[group] || defaultOrders()[group] || allowed;
+    let codes=[...new Set([...order,...allowed])].filter(code=>allowed.includes(code));
+    if(allowed.includes('grocery')&&!order.includes('grocery')&&codes.includes('welfare')){
+      codes=codes.filter(code=>code!=='grocery');codes.splice(codes.indexOf('welfare'),0,'grocery');
+    }
+    if(group==='current' && !config.currentTaskOrder?.length){
+      codes=codes.filter(code=>!['group_instance','strong_approach'].includes(code));
+      codes.splice(Math.max(0,codes.indexOf('arena')),0,'group_instance','strong_approach');
+    }
+    return [...codes.filter(code=>code!=='arena_3v3'),...codes.filter(code=>code==='arena_3v3')];
   };
   const selectedOrdered = (selected, source, config, group) => {
     const chosen = orderedCatalog(config, group, source).filter(code => selected.includes(code));
     return group === 'pipeline' ? [...chosen.filter(code => code !== 'bond'), ...chosen.filter(code => code === 'bond')] : chosen;
   };
-  const selectedSoloTasks = (config) => selectedOrdered(config.tasks, SOLO_TASKS, config, 'solo');
+  const selectedSoloTasks = (config) => config.section==='daily' && config.scope==='current'
+    ? selectedOrdered([...config.tasks,...(config.currentTeamTasks||[])],CURRENT_TASKS,config,'current')
+    : selectedOrdered(config.tasks, SOLO_TASKS, config, 'solo');
 
   function requestFor(config) {
     const mode = config.section === 'daily'
@@ -110,18 +135,21 @@
       : config.section === 'team'
         ? (config.teamMode === 'pipeline' ? 'team_then_multi' : 'team')
         : config.section === 'anniversary' ? 'anniversary' : config.independent;
+    const hasCurrentTeam = mode==='solo' && config.dailyMode!=='training_record'
+      && selectedSoloTasks(config).some(code=>CURRENT_TEAM_TASKS.some(task=>task.code===code));
     return {
       mode,
       tasks: config.section === 'anniversary' ? ['anniversary'] : config.section === 'daily' && config.dailyMode === 'training_record' ? ['training_record'] : selectedSoloTasks(config),
-      account_count: config.section === 'independent' ? 1 : mode === 'team_then_multi' ? 6 : Number(config.accountCount),
+      account_count: config.section === 'independent' || hasCurrentTeam ? 1 : mode === 'team_then_multi' ? 6 : Number(config.accountCount),
       arena_wins: Number(config.arenaWins),
-      formation: config.section === 'anniversary' ? 'keep' : config.formation,
+      formation: config.section === 'anniversary'||mode==='team_then_multi'&&config.pipelineTasks.includes('arena_3v3') ? 'keep' : config.formation,
       leader: Number(config.leader),
-      leaders: mode === 'team_then_multi' && !config.pipelineAuto
+      leaders: mode==='team_then_multi'&&config.pipelineTasks.includes('arena_3v3') ? [config.preformedTrio[0]] : mode === 'team_then_multi' && !config.pipelineAuto
         ? config.pipelineLeaders.filter(Boolean).map(Number)
         : [],
       members: config.members.map(Number).sort((a, b) => a - b),
       friend_shortcut: Boolean(config.friendShortcut),
+      preformed_trio: mode==='team_then_multi'&&config.pipelineTasks.includes('arena_3v3')?(config.preformedTrio||[1,2,3]):[],
       preformed_duos: mode === 'team_then_multi' && Boolean(config.preformedDuos),
       preformed_pairs: mode === 'team_then_multi' && config.preformedDuos ? config.preformedPairs.map(row => [...row]) : [],
       team_tasks: mode === 'team_then_multi'
@@ -129,20 +157,32 @@
         : selectedOrdered(config.teamTasks, TEAM_TASKS, config, 'team'),
       bond_count: mode === 'bond' ? 5 : Number(config.bondCount),
       bond_stop_mode: mode === 'bond' ? config.bondStopMode : 'battles',
-      bond_target_mode: mode === 'team_then_multi' ? config.bondTargetMode : 'battles',
+      bond_target_mode: mode === 'team_then_multi' || hasCurrentTeam&&config.currentTeamTasks.includes('bond') ? config.bondTargetMode : 'battles',
       bond_kill_target: Number(config.bondKillTarget),
       bond_score_target: Number(config.bondScoreTarget),
       bond_team_goals: mode === 'team_then_multi' ? config.bondTeamGoals.map(row => [...row]) : [],
       new_bond_round: mode === 'bond' && Boolean(config.newBondRound),
-      final_managed: mode !== 'bond' && mode !== 'anniversary' && Boolean(config.finalManaged),
+      final_managed: mode !== 'bond' && mode !== 'anniversary'
+        && !(mode==='solo' && config.dailyMode!=='training_record' && selectedSoloTasks(config).some(code=>['bond','arena_3v3'].includes(code))) && Boolean(config.finalManaged),
       arena_target_mode: config.arenaTargetMode,
+      training_arena_stop_policy: config.trainingArenaStopPolicy || 'auto',
+      arena_second_skill: Boolean(config.arenaSecondSkill),
+      grocery_items: selectedSoloTasks(config).includes('grocery') ? [...(config.groceryItems||[])] : [],
+      team_control: hasCurrentTeam ? 'current_account' : 'all_members',
       escort_remaining: Number(config.escortRemaining),
       escort_prior_settled: Boolean(config.escortRemaining) && Boolean(config.escortPriorSettled),
     };
   }
 
   function validate(config) {
+    if(config.section==='team'&&config.teamMode==='pipeline'&&config.pipelineTasks.includes('arena_3v3')){
+      const trio=config.preformedTrio||[];
+      if(trio.length!==3||new Set(trio).size!==3||trio.some(v=>!Number.isInteger(v)||v<1||v>6))return '请选择队长和两名不同的队员标签。';
+      if(config.preformedDuos||config.pipelineTasks.includes('bond'))return '三人3v3不能与二人队或二人羁绊混选。';
+    }
     const request = requestFor(config);
+    if(request.tasks.includes('grocery')&&!request.grocery_items.length)return '请打开杂货屋二级设置，选择至少一种商品。';
+    if(!['auto','final_goal','tickets'].includes(request.training_arena_stop_policy))return '请选择有效的修行录竞技场结束条件。';
     if (request.mode === 'bond' && !['endless','battles','wins'].includes(request.bond_stop_mode)) return '请选择羁绊目标：一直打、打5次或5场胜利。';
     if (['solo', 'multi'].includes(request.mode) && !request.tasks.length) {
       return '请至少选择一项单人任务。';
@@ -223,8 +263,8 @@
       title = request.friend_shortcut ? `自动建队 · 标签 ${request.leader} 为队长 · 好友邀请 2 人` : `自动建队 · 队长 ${request.leader} / 队员 ${request.members.join('、')}`;
       phases = [{ label: '建队并完成组队活动', tasks: request.team_tasks }];
     } else if (request.mode === 'team_then_multi') {
-      title = config.pipelineAuto ? '已有队伍 · 自动发现队长 · 最多 6 个标签' : `已有队伍 · 队长标签 ${request.leaders.join('、')}`;
-      accounts = Array.from({ length: 6 }, (_, index) => ({ slot: index + 1, label: `标签 ${index + 1}`, identity: `演示身份 ${String(index + 1).padStart(2, '0')}` }));
+      title = request.preformed_trio?.length ? `已有三人队 · 队长标签 ${request.preformed_trio[0]} · 3v3最后执行` : config.pipelineAuto ? '已有队伍 · 自动发现队长 · 最多 6 个标签' : `已有队伍 · 队长标签 ${request.leaders.join('、')}`;
+      accounts = request.preformed_trio?.length ? request.preformed_trio.map(slot=>({slot,label:`标签 ${slot}`,identity:'本轮核实身份'})) : Array.from({ length: 6 }, (_, index) => ({ slot: index + 1, label: `标签 ${index + 1}`, identity: `演示身份 ${String(index + 1).padStart(2, '0')}` }));
       phases = [
         { label: '阶段 1 · 已核实队伍', tasks: request.team_tasks },
         ...(request.tasks.length ? [{ label: '阶段 2 · 解散后单人任务', tasks: request.tasks }] : []),
@@ -423,6 +463,8 @@
 
   window.HYOL_DEMO = {
     SOLO_TASKS,
+    CURRENT_TEAM_TASKS,
+    CURRENT_TASKS,
     TEAM_TASKS,
     PIPELINE_TASKS,
     INDEPENDENT_TASKS,

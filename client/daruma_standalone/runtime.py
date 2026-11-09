@@ -18,7 +18,46 @@ from hyol_accounts import game_session_token
 
 from .journal import atomic_json
 from .paths import RUNTIME
-from .vision import (ASSETS, IDENTITY, Pending, Stopped, Vision, f1, identity_mask)
+from .vision import (ASSETS, BAR, IDENTITY, Pending, Stopped, Vision, f1, identity_mask)
+
+
+class WinRTBarCapture:
+    """Fresh compositor frames with their capture timestamps, for timing only."""
+    def __init__(self, bounds):
+        import dxcam
+        import dxcam.processor._numpy_kernels
+        # Explicit imports also make these dynamically loaded projections part
+        # of the portable executable. General identity captures still use GDI.
+        import winrt.windows.graphics.capture
+        import winrt.windows.graphics.capture.interop
+        import winrt.windows.graphics.directx
+        import winrt.windows.graphics.directx.direct3d11
+        import winrt.windows.graphics.directx.direct3d11.interop
+        self.bounds=tuple(bounds)
+        self.camera=dxcam.create(backend='winrt',output_color='RGB',processor_backend='numpy')
+        self.last_timestamp=0.0
+
+    def grab(self, check_stop):
+        deadline=time.perf_counter()+1.5
+        while time.perf_counter()<deadline:
+            check_stop()
+            began=time.perf_counter()
+            pixels=self.camera.grab(region=self.bounds,new_frame_only=True)
+            now=time.perf_counter()
+            if pixels is not None:
+                # dxcam is pinned; the WinRT duplicator exposes the native QPC
+                # timestamp. Never relabel a cached or stale frame as fresh.
+                at=float(self.camera._duplicator.latest_frame_time)
+                age=now-at
+                if self.last_timestamp<at and -.01<=age<=.05:
+                    self.last_timestamp=at
+                    uncertainty=max(.002,now-began+abs(age))
+                    return pixels,min(at,now),uncertainty
+            time.sleep(.001)
+        raise Pending('达摩高速采样未取得新画面，切回普通截图')
+
+    def close(self):
+        self.camera.release()
 
 
 class GDICapture:
@@ -134,6 +173,8 @@ class Desktop:
         self.last_frame = None
         self.content_clicks = 0
         self.captures = {}
+        self.fast_bar_capture = None
+        self.fast_bar_attempted = False
         self._mouse_down = False
         self._monitor_end = threading.Event()
 
@@ -187,6 +228,9 @@ class Desktop:
             for capture in self.captures.values():
                 capture.close()
             self.captures.clear()
+            if self.fast_bar_capture is not None:
+                self.fast_bar_capture.close()
+                self.fast_bar_capture = None
         finally:
             self.lease.release()
             self.acquired = False
@@ -241,19 +285,52 @@ class Desktop:
         if p.std() < 8:
             raise Pending('当前游戏画面尚未加载完成')
         if check_binding and self.binding:
-            x = self.binding['tab_x']
-            if not tab_is_selected(frame.crop((x-12, 12, x+13, 28))):
-                raise Stopped('选中的游戏账号标签发生变化')
-            if f1(identity_mask(frame.crop(IDENTITY)), np.asarray(self.binding['identity'], bool)) < .94:
-                raise Stopped('角色特征发生变化或无法核实')
+            frame = self._verify_bound_frame(frame)
         self.last_capture_seconds = time.perf_counter()-began
         return frame
+
+    def _verify_bound_frame(self, frame):
+        x=self.binding['tab_x']
+        for attempt in range(4):
+            if not tab_is_selected(frame.crop((x-12,12,x+13,28))):
+                raise Stopped('选中的游戏账号标签发生变化')
+            if f1(identity_mask(frame.crop(IDENTITY)),np.asarray(self.binding['identity'],bool))>=.94:
+                return frame
+            if attempt<3:
+                # A reward animation briefly covers HUD glyphs. Only observe;
+                # no input is authorized until the original role matches again.
+                self.wait(.08)
+                frame=self.capture(check_binding=False)
+        raise Stopped('角色特征发生变化或无法核实')
 
     def roi(self, roi):
         self.guard_window()
         a = self.geometry.point(roi[0], roi[1])
         b = self.geometry.point(roi[2]-1, roi[3]-1)
         bounds = (a[0], a[1], b[0]+1, b[1]+1)
+        if roi == BAR:
+            if not self.fast_bar_attempted:
+                self.fast_bar_attempted=True
+                try:
+                    self.fast_bar_capture=WinRTBarCapture(bounds)
+                except Exception:
+                    self.fast_bar_capture=None
+            if self.fast_bar_capture is not None:
+                try:
+                    p,at,elapsed=self.fast_bar_capture.grab(self.check_stop)
+                except Stopped:
+                    raise
+                except Exception:
+                    self.fast_bar_capture.close()
+                    self.fast_bar_capture=None
+                else:
+                    size=(roi[2]-roi[0],roi[3]-roi[1])
+                    if (p.shape[1],p.shape[0])!=size:
+                        began=time.perf_counter()
+                        p=np.asarray(Image.fromarray(p).resize(size,Image.Resampling.BILINEAR))
+                        elapsed+=time.perf_counter()-began
+                    self.guard_window()
+                    return p,at,elapsed
         if roi not in self.captures:
             self.captures[roi] = GDICapture(bounds)
         p, at, elapsed = self.captures[roi].grab()
@@ -267,11 +344,17 @@ class Desktop:
 
     def guard_fast(self):
         self.guard_window()
-        role, _, _ = self.roi(IDENTITY)
+        # Read identity and selected-tab chrome from one fresh frame. Two GDI
+        # captures each wait for composition on some desktops and used up the
+        # narrow strike window despite an already reliable motion prediction.
+        x = self.binding['tab_x']
+        bounds=(min(IDENTITY[0],x-12),12,max(IDENTITY[2],x+13),IDENTITY[3])
+        pixels, _, _ = self.roi(bounds)
+        role=pixels[IDENTITY[1]-bounds[1]:IDENTITY[3]-bounds[1],
+                    IDENTITY[0]-bounds[0]:IDENTITY[2]-bounds[0]]
         if f1(identity_mask(Image.fromarray(role)), np.asarray(self.binding['identity'], bool)) < .94:
             raise Stopped('敲击前角色特征不符')
-        x = self.binding['tab_x']
-        tab, _, _ = self.roi((x-12, 12, x+13, 28))
+        tab=pixels[:16,x-12-bounds[0]:x+13-bounds[0]]
         if not tab_is_selected(tab):
             raise Stopped('敲击前当前标签不再选中')
 

@@ -41,9 +41,29 @@ def ensure_hidden(s, account, *, timeout=4,require_leaf=True):
     row = s.state.accounts[account.name].setdefault('player_display', {})
     clicks_before = s.content_click_count
     frame = None
+    context = getattr(s, 'run_context', None)
+    cache_owner = context if context is not None else s
+    cache = getattr(cache_owner, '_player_display_receipts', None)
+    if not isinstance(cache, dict):
+        cache = {}
+        cache_owner._player_display_receipts = cache
     try:
         frame = s.capture()
         _guard(s, account, frame,require_leaf=require_leaf)
+        proof = cache.get(account.name)
+        current = observe(s, frame)
+        if (isinstance(proof, dict) and proof.get('hwnd') == getattr(s, 'hwnd', None)
+                and proof.get('tab_x') == account.tab_x and proof.get('evidence')
+                and len(proof.get('samples', [])) == 3 and current is not None
+                and current[0] == 'closed'):
+            # A receipt belongs only to this live scheduler/Start. Identity,
+            # page and the actual toggle are still verified on a fresh frame.
+            row.update(status='done', phase='hidden_verified', hidden=True,
+                       evidence=proof['evidence'], samples=proof['samples'],
+                       last_check_clicks=0, last_error='')
+            return dict(hidden=True, evidence=proof['evidence'], samples=proof['samples'],
+                        clicks=0, reused=True)
+        cache.pop(account.name, None)
         move_cursor_clear(s)
         original = None
         samples = []
@@ -103,10 +123,13 @@ def ensure_hidden(s, account, *, timeout=4,require_leaf=True):
                    evidence=samples[-1], samples=samples, verified_at=hs.now_iso(),
                    last_check_clicks=clicks, last_error='')
         s.state.save_account(account.name)
+        cache[account.name] = dict(hwnd=getattr(s, 'hwnd', None), tab_x=account.tab_x,
+                                   evidence=samples[-1], samples=list(samples))
         s.event('other_players_hidden_verified', account, evidence=samples[-1],
                 samples=samples, clicks=clicks, already_hidden=original[0] == 'closed')
         return dict(hidden=True, evidence=samples[-1], samples=samples, clicks=clicks)
     except (Exception, KeyboardInterrupt) as exc:
+        cache.pop(account.name, None)
         row.update(status='pending', hidden=False, last_error=str(exc), updated_at=hs.now_iso())
         if frame is not None:
             row['pending_evidence'] = str(s.save_raw_evidence(

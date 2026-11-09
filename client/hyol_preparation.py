@@ -21,7 +21,9 @@ def validate_scope(value=None):
 
 def scope_for_request(request):
     mode = request.mode
-    if mode == 'team_then_multi':
+    if mode == 'team_then_multi' and getattr(request,'preformed_trio',()):
+        slots=list(request.preformed_trio)
+    elif mode == 'team_then_multi':
         slots = list(range(1,7))
     elif mode in ('multi','anniversary'):
         slots = list(range(1,request.account_count+1))
@@ -93,10 +95,10 @@ def hide_first_world(s,account,frame,row):
 def prepare_home_startup(s,account,frame,row):
     """A bound home/spring role must stop managed movement before leaving."""
     import hyol_scheduler as hs
-    from hyol_managed import exit_visible_status
+    from hyol_managed import exit_visible_status,active_observation
     from hyol_navigation import hot_spring_visible,home_visible,leave_hot_spring,return_to_leaf
     if not (hot_spring_visible(s,frame) or home_visible(s,frame)):return frame
-    if s.managed_active_score(frame)>=.70:
+    if active_observation(s,frame)['active']:
         if not exit_visible_status(s,account,frame):
             raise hs.PendingError('家园/温泉仍在托管，但退出托管控件未确认，未先关闭温泉')
         row['managed_stopped_before_home_exit']=True
@@ -152,12 +154,15 @@ def prepare_accounts(s, scope):
         slots = scope['slots']
     rows, observations, frames = {}, {}, {}
     s._preparation_rows = rows
-    for slot in slots:
+    def prepare_slot(slot):
         s.check_stop()
-        row = rows[slot] = dict(tab_index=slot,status='pending',leaf_verified=False,navigation_clicks=0)
+        row = rows.setdefault(slot,dict(tab_index=slot,status='pending',leaf_verified=False,navigation_clicks=0))
+        row['preparation_attempts'] = row.get('preparation_attempts',0)+1
+        row.update(status='pending',leaf_verified=False)
+        row.pop('reason',None)
         if slot > len(centers):
             row['reason'] = '所选标签未打开'
-            continue
+            return
         a = hs.Account(slot,f'当前窗口标签{slot}',centers[slot-1])
         before = s.content_click_count
         try:
@@ -176,6 +181,17 @@ def prepare_accounts(s, scope):
                 raise hs.AccountOffline(a,'当前标签已确认掉线')
             row['before_evidence'] = str(s.save_raw_evidence(frame,a,'prepare_before','pending'))
             s.by_name[a.name] = a
+            from hyol_arena_3v3 import TASK, page_visible
+            request=getattr(getattr(s,'run_context',None),'pipeline_request',None)
+            if request and TASK in request.team_tasks and page_visible(frame,s.templates):
+                observations[slot],frames[slot]=collect_current_identity(s,a,frame)
+                mapping,refs,accounts=bind_observed(s,centers,observations)
+                if slot not in mapping:raise hs.PendingError('3v3活动内身份尚未唯一核实')
+                proof=str(s.save_raw_evidence(frame,a,'prepare_arena3v3_preserved','verified'))
+                row.update(status='ready',activity_ready=TASK,account=mapping[slot],evidence=proof)
+                s.event('preparation_activity_preserved',tab_index=slot,
+                        detail='已在3v3准备页，保留现有队伍与活动页面')
+                return
             from hyol_navigation import hot_spring_visible,home_visible
             if hot_spring_visible(s,frame) or home_visible(s,frame):
                 # Spring leaves the role strip visible. Bind its three fresh
@@ -189,27 +205,56 @@ def prepare_accounts(s, scope):
                 frame=prepare_home_startup(s,a,s.capture(),row)
             frame = expose_identity(s,a,frame)
             observations[slot], frames[slot] = collect_current_identity(s,a,frame)
-            # Do not scan five more roles or return to Leaf before hiding the
-            # players on the role whose first usable world is already here.
+            # Normalize this role immediately. The user must not wait for a
+            # full discovery pass before the first return-to-village request.
             mapping,refs,accounts=bind_observed(s,centers,observations)
             if slot not in mapping:
                 raise hs.PendingError(getattr(s,'_identity_unavailable_reasons',{}).get(slot,'当前账号身份尚未唯一确认'))
             observed=next(bound for bound in accounts if bound.index==slot)
             row['account']=observed.name
             s.active=observed;s._capture_binding_probe=False
+            relogin_proof=getattr(s,'_recovered_offline_proofs',{}).get(observed.name)
+            if relogin_proof:
+                from hyol_navigation import restart_return_after_offline
+                restart_return_after_offline(s,observed,relogin_proof)
+            s.event('preparation_return_started',observed,detail='先确认返回木叶村，再进行其他检查')
+            if return_to_leaf(s,observed,allow_pending_navigation=True) is not True:
+                raise hs.PendingError('回村尚未核实')
+            proof=s.state.accounts[observed.name]['navigation']['return_leaf']
+            row.update(status='ready',leaf_verified=True,evidence=proof['evidence'],
+                       samples=list(proof.get('samples',())))
+            fresh=s.capture()
+            if s.main_ready(fresh) and not preparation_blocked(s,fresh):
+                s.clear_transient_notifications(observed,fresh)
             hide_first_world(s,observed,s.capture(),row)
+            s.event('preparation_account_result',observed,
+                    **{k:v for k,v in row.items() if k not in ('account','tab_index')})
         except hs.AccountOffline as exc:
             row.update(status='offline',reason=str(exc))
         except hs.SafetyError:
             raise  # Lost foreground/changed geometry ends all preparation.
         except hs.PendingError as exc:
-            row['reason'] = str(exc)
+            row.update(status='pending',reason=str(exc))
         finally:
             row['navigation_clicks'] += s.content_click_count-before
             s.generic_current_tab_x = None
             s.current_account_only = None
             s.active = None
             s._capture_binding_probe = True
+    for slot in slots:
+        prepare_slot(slot)
+    # A role hidden by loading/a finished result may become recoverable while
+    # the other selected roles return. Reobserve every pending open tab once;
+    # successful roles are not navigated again, and original UI receipts guard
+    # against repeating any close whose outcome is still unknown.
+    retry_slots=[slot for slot in slots if slot<=len(centers) and rows[slot]['status']=='pending']
+    for slot in retry_slots:
+        s.check_stop()
+        s.event('preparation_account_retry',tab_index=slot,attempt=2,
+                previous_reason=rows[slot].get('reason',''),
+                detail='首轮检查未恢复，重新观察当前标签并沿原凭据尝试回到主界面')
+        s.wait_interruptible(.5)
+        prepare_slot(slot)
     if observations:
         mapping,refs,accounts=bind_observed(s,centers,observations)
         rejected = getattr(s,'_identity_unavailable_reasons',{})
@@ -227,6 +272,9 @@ def prepare_accounts(s, scope):
             s.check_stop()
             row = rows[a.index]
             row['account'] = a.name
+            if row.get('leaf_verified') or row.get('activity_ready'):
+                if row.get('status')=='ready':last_ready=a
+                continue
             before = s.content_click_count
             try:
                 if scope['scope'] == 'current':
@@ -245,7 +293,6 @@ def prepare_accounts(s, scope):
                 else:
                     s.switch_account(a)
                 fresh = s.capture()
-                hide_first_world(s,a,fresh,row)
                 relogin_proof=getattr(s,'_recovered_offline_proofs',{}).get(a.name)
                 if relogin_proof:
                     from hyol_navigation import restart_return_after_offline
@@ -257,6 +304,7 @@ def prepare_accounts(s, scope):
                 proof = s.state.accounts[a.name]['navigation']['return_leaf']
                 row.update(status='ready',account=a.name,leaf_verified=True,evidence=proof['evidence'],
                            samples=list(proof.get('samples',())))
+                hide_first_world(s,a,s.capture(),row)
                 if s.config.get('HideOtherPlayers', '0') == '1':
                     row['player_display'] = dict(s.state.accounts[a.name]['player_display'])
                 last_ready = a
@@ -272,12 +320,22 @@ def prepare_accounts(s, scope):
                 row['navigation_clicks'] += s.content_click_count-before
                 s.event('preparation_account_result',a,**{k:v for k,v in row.items() if k not in ('account','tab_index')})
         if last_ready is not None and s.active != last_ready:
-            s.switch_account(last_ready)
+            fresh=s.capture()
+            if (s._generic_active_tab_x(fresh)==last_ready.tab_x
+                    and s.verify_identity(last_ready,fresh)[0]):
+                s.active=last_ready
+            else:s.switch_account(last_ready)
         if s.run_context is not None:
-            ready_mapping={i:name for i,name in mapping.items() if rows[i]['leaf_verified']}
+            ready_mapping={i:name for i,name in mapping.items() if
+                           (rows[i]['leaf_verified'] or rows[i].get('activity_ready')) and rows[i]['status']=='ready'}
             s.run_context.remember(centers,ready_mapping,{i:observations[i] for i in ready_mapping},frames,refs,
                                    {i:r.get('reason','准备未完成') for i,r in rows.items() if r['status']!='ready'})
             s.run_context.binding['prepared_leaf_verified'] = bool(ready_mapping)
+            s.run_context.binding['prepared_accounts'] = {
+                name:dict(evidence=rows[i].get('evidence',''),samples=rows[i].get('samples',[]))
+                for i,name in ready_mapping.items() if rows[i]['leaf_verified']}
+            s.run_context.binding['prepared_activity_accounts']={name:rows[i].get('activity_ready')
+                for i,name in ready_mapping.items() if rows[i].get('activity_ready')}
     return list(rows.values())
 
 
@@ -379,8 +437,8 @@ def run(root, scope=None, *, stop_event=None, event_sink=None, on_scheduler=None
             s.bind_window(wait=True,timeout_seconds=10)
         s._capture_binding_probe = True
         rows = prepare_accounts(s,scope)
-        ready = bool(rows) and all(r['status']=='ready' and r['leaf_verified'] for r in rows)
-        result.update(status='ready' if ready else 'pending',accounts=rows,main_ready=ready,
+        ready = bool(rows) and all(r['status']=='ready' and (r['leaf_verified'] or r.get('activity_ready')) for r in rows)
+        result.update(status='ready' if ready else 'pending',accounts=rows,main_ready=all(r['leaf_verified'] for r in rows),
                       healthy=any(r['status']=='ready' for r in rows))
     except KeyboardInterrupt:
         result.update(status='stopped',reason='检查回村已停止，未处理剩余账号')
@@ -391,7 +449,10 @@ def run(root, scope=None, *, stop_event=None, event_sink=None, on_scheduler=None
             result['accounts'] = list(getattr(s,'_preparation_rows',{}).values())
         result.update(content_clicks=s.content_click_count,navigation_clicks=s.content_click_count)
         hs.atomic_json(hs.LOGS/f'preparation_{s.diagnostics.identifier}.json',result)
-        if not s.run_context:
+        # A native check passes its caller's cancellation Event as s.stop.
+        # Successful cleanup must not turn that shared signal into "用户停止".
+        # release_resources disposes the local F12 monitor independently.
+        if not s.run_context and stop_event is None:
             s.stop.set()
         lease.release()
         s.release_resources()

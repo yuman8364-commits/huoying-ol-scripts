@@ -236,6 +236,9 @@ class SixTabScheduler(hs.Scheduler):
         return active and title_score >= .70 and role_ok, {**role_scores, "tab_title": title_score}
 
     def _bound_role_verified(self, account: hs.Account, frame) -> tuple[bool, dict[str, float], bool]:
+        from hyol_arena_3v3 import alias_verified
+        activity=alias_verified(self,account,frame)
+        if activity is not None:return activity
         names = getattr(self, "_bound_identity_names", {})
         if account.index not in names:
             return True, {}, False  # Initial tab observation has no content authorization.
@@ -536,7 +539,7 @@ class SixTabScheduler(hs.Scheduler):
         self.bind_window(wait=True, timeout_seconds=15)
         context=getattr(self,'run_context',None)
         shared=context.binding if context else None
-        if (isinstance(shared,dict) and shared.get('prepared_leaf_verified') is True
+        if (isinstance(shared,dict) and (shared.get('prepared_leaf_verified') is True or shared.get('prepared_activity_accounts'))
                 and isinstance(shared.get('observations'),dict)
                 and shared['observations'] and context.layout_matches(self.capture())):
             from hyol_accounts import is_captain

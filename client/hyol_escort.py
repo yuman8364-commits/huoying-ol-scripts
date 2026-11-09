@@ -17,6 +17,8 @@ TARGETS = ('coupon','coupon','coin')
 TASK_LIMIT_SECONDS = 30 * 60
 DEADLINE_WARNING_SECONDS = 5 * 60
 DELIVERY_RESERVE_SECONDS = 2 * 60
+TRAVEL_FIRST_CHECK_SECONDS = 30
+TRAVEL_POLL_SECONDS = 20
 
 
 class EscortNotOpen(hs.PendingError):
@@ -54,7 +56,7 @@ def poll_seconds(record):
         return .5
     try:
         remaining=seconds_remaining(active)
-        return .5 if remaining <= DELIVERY_RESERVE_SECONDS else 1 if remaining <= DEADLINE_WARNING_SECONDS else 3
+        return .5 if remaining <= DELIVERY_RESERVE_SECONDS else 1 if remaining <= DEADLINE_WARNING_SECONDS else TRAVEL_POLL_SECONDS
     except hs.PendingError:
         return 1
 
@@ -67,6 +69,20 @@ def priority_key(driver):
         return (0, deadline_at(active))
     except hs.PendingError:
         return (0, -math.inf)
+
+
+def current_identity_frame(scheduler, account, frame, active):
+    """Observe at most three redraw frames; every later input still rechecks identity."""
+    samples=3 if active and isinstance(getattr(getattr(scheduler,'run_context',None),'binding',None),dict) else 1
+    for index in range(samples):
+        selected=scheduler._generic_active_tab_x(frame)==account.tab_x
+        valid,scores=scheduler.verify_identity(account,frame)
+        if not selected or valid or index==samples-1:
+            return frame,selected,valid,scores
+        scheduler.event('escort_identity_resampling',account,sample=index+1,
+                        content_authorized=False,detail='原押送切图或交付后身份重绘，先观察新帧，尚未授权输入')
+        scheduler.wait_interruptible(.35)
+        frame=scheduler.capture()
 
 
 def legs_verified(record):
@@ -158,28 +174,36 @@ def pixel_proof(frame, box):
     return dict(box=box, sha256=hashlib.sha256(frame.crop(box).convert('RGB').tobytes()).hexdigest())
 
 
-def fresh_proof(frame, proof):
+def dispatch_text_proof(frame, box):
+    """Keep opaque white/yellow glyphs; the translucent panel background moves."""
+    import numpy as np
+    rgb=np.asarray(frame.crop(box).convert('RGB'),dtype=np.int16)
+    masks=[(rgb.min(axis=2)>=170)&(rgb.max(axis=2)-rgb.min(axis=2)<=35)]
+    masks.extend((rgb[:,:,0]>=floor)&(rgb[:,:,1]>=floor-60)&(rgb[:,:,2]<120)
+                 for floor in (180,210))
+    return dict(kind='dispatch_text_mask',box=box,
+                sha256=hashlib.sha256(b''.join(mask.tobytes() for mask in masks)).hexdigest())
+
+
+def fresh_proof(frame, proof, scheduler=None):
+    if proof and proof.get('kind')=='dispatch_text_mask':
+        return dispatch_text_proof(frame,tuple(proof['box']))['sha256']==proof['sha256']
+    if proof and proof.get('kind')=='dispatch_currency_template':
+        if scheduler is None:return False
+        box=tuple(proof['box'])
+        found,_,x,y=scheduler.templates.match(frame,hs.ASSETS/proof['asset'],box,threshold=.97)
+        return found and (x,y)==box[:2]
     if proof and proof.get('kind')=='delivery_amount_mask':
         return delivery_amount_proof(frame,tuple(proof['box']))['sha256']==proof['sha256']
     return bool(proof) and pixel_proof(frame,proof['box'])['sha256']==proof['sha256']
 
 
 def offer_reward_amount(s, frame, box, ocr_base=None):
-    """Reuse plain row OCR; read doubled base digits and green marker twice."""
+    """Read the complete base digits and any green multiplier twice."""
     import numpy as np
     from PIL import Image, ImageOps
     rgb=np.asarray(frame.crop(box).convert('RGB'),dtype=np.int16)
     green=((rgb[:,:,1]>=170)&(rgb[:,:,1]-rgb[:,:,0]>=70)&(rgb[:,:,1]-rgb[:,:,2]>=70))
-    if not green.any():
-        base=ocr_base
-        if type(base) is not int or base<=0:
-            cell=frame.crop(box)
-            value=compact(recognize(cell.resize((cell.width*3,cell.height*3))).get('text','')).replace(',','')
-            if not re.fullmatch(r'\d{1,8}',value):return None
-            base=int(value)
-        if base<=0:return None
-        return dict(amount=base,base_amount=base,reward_multiplier=1,
-                    amount_readings=[[base,1]],proof=pixel_proof(frame,box))
     readings=[]
     for floor in (170,180):
         white=(rgb.min(axis=2)>=floor)&(rgb.max(axis=2)-rgb.min(axis=2)<=35)
@@ -469,8 +493,10 @@ def delivery_reward_amount(s, frame, delivery, currency=None):
         pattern=Image.fromarray(np.where(ink,0,255).astype('uint8')).crop(
             (int(xs.min()),int(ys.min()),int(xs.max())+1,int(ys.max())+1)).convert('RGB')
         enrolled=set()
-        for path in hs.ASSETS.glob('escort_delivery_amount_*_white*.bmp'):
-            match=re.fullmatch(r'escort_delivery_amount_(\d{1,8})_white(?:_(?:170|180))?\.bmp',path.name)
+        amount_assets=(*hs.ASSETS.glob('escort_delivery_amount_*_white*.bmp'),
+                      *hs.ASSETS.glob('escort_offer_amount_*_white_*.bmp'))
+        for path in amount_assets:
+            match=re.fullmatch(r'escort_(?:delivery|offer)_amount_(\d{1,8})_white(?:_(?:170|180))?\.bmp',path.name)
             if not match:continue
             with Image.open(path) as reference:
                 if reference.size!=pattern.size:continue
@@ -480,11 +506,19 @@ def delivery_reward_amount(s, frame, delivery, currency=None):
             readings.append(next(iter(enrolled)));continue
         if len(enrolled)>1:return None
         mask=Image.fromarray(np.where(ink,0,255).astype('uint8')).convert('RGB')
-        mask=mask.resize((mask.width*3,mask.height*3),Image.Resampling.NEAREST)
-        value=compact(recognize(ImageOps.expand(mask,border=12,fill='white')).get('text',''))
-        if not re.fullmatch(r'\d{1,8}',value):
+        values=[]
+        for scale in (3,4,5):
+            enlarged=mask.resize((mask.width*scale,mask.height*scale),Image.Resampling.NEAREST)
+            value=compact(recognize(ImageOps.expand(enlarged,border=12,fill='white')).get('text',''))
+            if not re.fullmatch(r'\d{1,8}',value):
+                if values:return None
+                continue
+            if values and int(value)!=values[0]:return None
+            values.append(int(value))
+            if len(values)==2:break
+        if len(values)<2 or len(set(values))!=1:
             return None
-        readings.append(int(value))
+        readings.append(values[0])
     if readings[0]!=readings[1]:
         return None
     number_box=box if currency else (max(delivery['body'][0],x+16),box[1],box[2],box[3])
@@ -557,7 +591,7 @@ def layout(s,frame):
     return ox,oy
 
 
-def panel(s,frame):
+def panel(s,frame, *, counters_only=False):
     origin=layout(s,frame)
     if origin is None:
         raise hs.PendingError('押镖标题和关闭按钮未同时确认')
@@ -582,6 +616,9 @@ def panel(s,frame):
     ss_roi=(ox+803,oy+107,ox+837,oy+134)
     ss_label=s.template('escort_free_ss_label.bmp',(ox+650,oy+100,ox+837,oy+137),frame,threshold=.97)[0]
     free_ss=read_ss_fraction(s,frame.crop((ox+810,oy+113,ox+833,oy+129))) if ss_label else None
+    if counters_only or remaining==0:
+        return dict(offers=[],remaining=remaining,free_refresh=free,free_ss=free_ss,origin=origin,
+                    rows_complete=remaining==0,text=data.get('text',''))
     roi=(ox+125,oy+135,ox+810,oy+480)
     buttons=s.templates.find_all(frame,hs.ASSETS/'escort_dispatch.bmp',roi,.97)
     insured=s.templates.find_all(frame,hs.ASSETS/'escort_insured_dispatch.bmp',roi,.97)
@@ -603,16 +640,18 @@ def panel(s,frame):
                     with hs.Image.open(hs.ASSETS/('escort_'+kind+'_currency.bmp')) as icon:
                         width,height=icon.size
                     offer=dict(kind=kind,**number,x=x,y=y,
-                               currency_proof=pixel_proof(frame,(ix,iy,ix+width,iy+height)))
+                               currency_proof=dict(**pixel_proof(frame,(ix,iy,ix+width,iy+height)),
+                                   kind='dispatch_currency_template',asset='escort_'+kind+'_currency.bmp'))
+                    offer['proof']=delivery_amount_proof(frame,tuple(offer['proof']['box']))
                     if offer not in offers:
                         offers.append(offer)
     signature=hashlib.sha256(repr([(o['kind'],o['amount'],o['y']) for o in offers]).encode()).hexdigest()
     normal_buttons={(x,y) for _,x,y in buttons if not any(ix-2<=x<=ix+88 and iy-2<=y<=iy+30 for _,ix,iy in insured)}
     return dict(offers=offers,remaining=remaining,free_refresh=free,free_ss=free_ss,origin=origin,signature=signature,
                 rows_complete=len({(o['x'],o['y']) for o in offers})==len(normal_buttons),
-                counter_proof=pixel_proof(frame,(ox+770,oy+79,ox+813,oy+105)),
-                ss_proof=pixel_proof(frame,ss_roi),
-                refresh_proof=pixel_proof(frame,(ox+670,oy+497,ox+790,oy+529)),
+                counter_proof=dispatch_text_proof(frame,(ox+770,oy+79,ox+813,oy+105)),
+                ss_proof=dispatch_text_proof(frame,ss_roi),
+                refresh_proof=dispatch_text_proof(frame,(ox+670,oy+497,ox+790,oy+529)),
                 text=data.get('text',''))
 
 
@@ -633,19 +672,27 @@ def daily_row_snapshot(s,frame):
     x,y=matches[0];roi=(x+300,y+8,min(1080,x+355),min(710,y+40))
     readings=[]
     for count in range(4):
-        name=f'escort_daily_remaining_{count}of3_20261029.bmp'
-        if not (hs.ASSETS/name).is_file():continue
-        ok,score,nx,ny=s.template(name,roi,frame,threshold=.995)
-        if ok:
-            with hs.Image.open(hs.ASSETS/name) as image:width,height=image.size
-            readings.append(dict(remaining=count,score=score,
-                proof=pixel_proof(frame,(nx,ny,nx+width,ny+height))))
+        for stamp in ('20261029','20261109'):
+            name=f'escort_daily_remaining_{count}of3_{stamp}.bmp'
+            if not (hs.ASSETS/name).is_file():continue
+            ok,score,nx,ny=s.template(name,roi,frame,threshold=.995)
+            if ok:
+                with hs.Image.open(hs.ASSETS/name) as image:width,height=image.size
+                readings.append(dict(remaining=count,score=score,
+                    proof=pixel_proof(frame,(nx,ny,nx+width,ny+height))))
+                break
     if len(readings)>1:raise hs.PendingError('押镖日常剩余次数模板冲突，未按零放行')
+    if not readings:
+        data=recognize(frame.crop(roi))
+        value=compact(data.get('text') or ''.join(line.get('text','') for line in data.get('lines',[])))
+        match=re.fullmatch(r'([0-3])/3',value)
+        if match:
+            readings.append(dict(remaining=int(match[1]),proof=pixel_proof(frame,roi)))
     return dict(origin=(x,y),remaining=readings[0]['remaining'] if readings else None,
                 counter_proof=readings[0]['proof'] if readings else None)
 
 
-def inspect_daily_remaining(r):
+def inspect_daily_remaining(r, *, leave_open=False):
     """Read this role's escort row three times; no Go or acceptance input."""
     s=r.scheduler;frame=s.capture()
     if not daily_visible(s,frame):
@@ -660,9 +707,9 @@ def inspect_daily_remaining(r):
             found,_,x,y=s.template(name,(480,280,1080,700),frame,threshold=.95)
             if found:row=(name,x,y);break
         if row:break
-        if not s.template('daily_scroll_down_current.bmp',(1060,660,1095,720),frame)[0]:
+        from hyol_daily_observation import scroll_once
+        if not scroll_once(r,'down',frame,'escort_count_scroll'):
             raise hs.PendingError('日常活动押镖行未确认，未读取其他活动次数')
-        r.click('daily_scroll_down_current.bmp',(1060,660,1095,720),10,10,'escort_count_scroll',['daily_practice_anchor.bmp'])
     else:raise hs.PendingError('日常活动押镖行未确认')
     name,x,y=row
     r.click(name,(x-2,y-2,x+100,y+35),20,10,'escort_count_select_row',['daily_practice_anchor.bmp'],threshold=.95)
@@ -687,13 +734,15 @@ def inspect_daily_remaining(r):
             raise hs.PendingError('日常押镖次数在12秒内未稳定三帧')
     if readings[0]!=readings[1] or readings[1]!=readings[2]:
         raise hs.PendingError('日常押镖剩余次数三帧变化，未按零处理')
-    r.click('daily_practice_close.bmp',(1370,200,1460,280),17,17,'escort_count_close_daily',['daily_practice_anchor.bmp'])
-    result=dict(remaining=readings[0],samples=samples,source='daily_escort_row',observed_at=hs.now_iso())
+    if not leave_open:
+        r.click('daily_practice_close.bmp',(1370,200,1460,280),17,17,'escort_count_close_daily',['daily_practice_anchor.bmp'])
+    result=dict(remaining=readings[0],samples=samples,source='daily_escort_row',observed_at=hs.now_iso(),
+                selected_row=list(snapshot['origin']),counter_proof=snapshot.get('counter_proof'))
     s.event('escort_daily_remaining_observed',r.account,**result)
     return result
 
 
-def open_page(r):
+def open_page(r, *, selected_daily=None):
     s=r.scheduler;frame=s.capture()
     if s.template('escort_bonus_title_20261028.bmp',(800,460,1130,540),frame,threshold=.98)[0]:
         raise hs.PendingError('原押镖额外奖励弹窗尚未处理，未打开其他入口')
@@ -720,7 +769,16 @@ def open_page(r):
             return open_organization(r)
         r.click('daily_practice_toolbar.bmp',(651,69,851,169),20,20,'escort_open_daily',['anchor_top_menu.bmp'])
         r.wait('daily_practice_anchor.bmp',(951,119,1501,369))
-    if s.template('daily_limited_tab_current.bmp',(510,250,800,310))[0]:
+    reuse_daily=False
+    if selected_daily is not None:
+        current=daily_row_snapshot(s,s.capture())
+        reuse_daily=(current is not None and list(current['origin'])==selected_daily.get('selected_row')
+                     and current['remaining']==selected_daily.get('remaining')
+                     and (not selected_daily.get('counter_proof')
+                          or fresh_proof(s.capture(),selected_daily['counter_proof'])))
+        if not reuse_daily:
+            raise hs.PendingError('已核实的押镖日常行发生变化，未重复导航或前往')
+    if not reuse_daily and s.template('daily_limited_tab_current.bmp',(510,250,800,310))[0]:
         r.click('daily_limited_tab_current.bmp',(510,250,800,310),40,15,'escort_limited_tab',['daily_practice_anchor.bmp'])
     for _ in range(15):
         frame=s.capture()
@@ -729,7 +787,8 @@ def open_page(r):
             if not found:continue
             # Select the positively matched row; the existing detail's Go or
             # Participate control must then be observed independently.
-            r.click(asset,(x-2,y-2,x+100,y+35),20,10,'escort_select_row',['daily_practice_anchor.bmp'],threshold=.95)
+            if not reuse_daily:
+                r.click(asset,(x-2,y-2,x+100,y+35),20,10,'escort_select_row',['daily_practice_anchor.bmp'],threshold=.95)
             fresh=s.capture()
             for button in ('escort_go_button.bmp','daily_participate.bmp'):
                 ok,_,bx,by=s.template(button,(600,300,1500,900),fresh,threshold=.95)
@@ -741,10 +800,8 @@ def open_page(r):
                         s.wait_interruptible(.5)
                     raise hs.PendingError('押镖前往已发送，等待任务页；不重复前往')
             raise hs.PendingError('押镖入口已选中，前往按钮未核实')
-        arrow='daily_scroll_down_current.bmp';roi=(1060,660,1095,720)
-        if not s.template(arrow,roi,frame)[0]:break
-        r.click(arrow,roi,10,10,'escort_scroll',['daily_practice_anchor.bmp'])
-        s.wait_interruptible(.25)
+        from hyol_daily_observation import scroll_once
+        if not scroll_once(r,'down',frame,'escort_scroll'):break
     r.click('daily_practice_close.bmp',(1370,200,1460,280),17,17,'escort_daily_close',['daily_practice_anchor.bmp'])
     if not s.wait_until_main(8):raise hs.PendingError('日常窗口关闭后尚未核实主界面，未尝试另一入口')
     return open_organization(r)
@@ -862,9 +919,12 @@ class Driver:
         started = time.monotonic()
         snapshot = panel(self.s, frame)
         self.s.check_stop()
+        missing=[label for key,label in (('remaining','剩余次数'),('free_ss','免费SS次数'),('free_refresh','免费刷新次数'))
+                 if snapshot.get(key) is None]
         self.s.event('escort_progress', self.r.account, task='escort', phase='panel_ready',
                      seconds=round(time.monotonic()-started, 3),
-                     detail='押镖面板已读清，准备按当前奖励核验下一步')
+                     detail=('押镖面板已读取，'+ '、'.join(missing)+'尚未核实，未接取'
+                             if missing else '押镖面板已读清，准备按当前奖励核验下一步'))
         return snapshot
 
     def require_live_deadline(self, active):
@@ -954,8 +1014,20 @@ class Driver:
         active=rec.get('active')
         if getattr(s, 'current_account_only', None) == r.account.name:
             frame = s.capture()
-            if (s._generic_active_tab_x(frame) != r.account.tab_x
-                    or not s.verify_identity(r.account, frame)[0]):
+            frame,selected,identity_ok,scores=current_identity_frame(s,r.account,frame,active)
+            if not selected or not identity_ok:
+                context = getattr(s, 'run_context', None)
+                if (selected and active and active.get('departure_sent')
+                        and isinstance(getattr(context, 'binding', None), dict)
+                        and context.hidden_identity_observation(s, r.account, frame)
+                        and context.loading_scene_visible(s, frame)):
+                    evidence = str(s.save_raw_evidence(frame, r.account, 'escort_map_loading', 'observed'))
+                    s.event('escort_transition_wait', r.account, evidence=evidence,
+                            content_authorized=False, detail='原押送切图加载中，仅观察；身份恢复后再核验交付')
+                    return False
+                evidence = str(s.save_raw_evidence(frame, r.account, 'escort_identity_changed', 'pending'))
+                s.event('escort_identity_pending', r.account, evidence=evidence, scores=scores,
+                        selected_tab=selected, content_authorized=False)
                 raise hs.PendingError('当前押镖账号身份或标签变化，保留原押送')
         else:
             context=getattr(s,'run_context',None)
@@ -1046,6 +1118,9 @@ class Driver:
                 active['delivery_currency_proof']=currency
                 number=delivery_reward_amount(s,frame,delivery,currency=currency)
                 if number is None or number['amount']<=0:
+                    active['delivery_unreadable_evidence']=str(s.save_raw_evidence(
+                        frame,r.account,'escort_delivery_amount_unreadable','pending'))
+                    self.save()
                     raise hs.PendingError('终点押镖奖励数字未确认，未点击完成任务')
                 if number['amount']!=active['amount']:
                     # Robbery can reduce the delivered reward, and the offer
@@ -1089,19 +1164,20 @@ class Driver:
                         seconds_remaining=round(remaining),deadline_at=active['deadline_at'],
                         detail='等待原押镖完成；接取后30分钟内须交付，经过时间不作为完成证据')
                 return False
-            snapshot=panel(s,open_page(r))
+            snapshot=panel(s,open_page(r),counters_only=True)
             expected=active['before_remaining']-1
             if snapshot['remaining']!=expected:
                 raise hs.PendingError('押镖完成提示与剩余次数未同时核实，保留原场')
             # The explicit completion and fresh completion counter must agree
             # twice; no waiting-duration or disappearing button credit.
-            second=panel(s,s.capture())
+            second=panel(s,s.capture(),counters_only=True)
             if second['remaining']!=expected:
                 raise hs.PendingError('押镖完成次数复查变化，保留原场')
             if active.get('delivery_sent') and not active.get('completion_observed'):
                 active.update(completion_observed=True,
                     completion_evidence=str(s.save_raw_evidence(s.capture(),r.account,'escort_delivered_counter','verified')))
                 self.save()
+            active.update(free_ss_after=second.get('free_ss'),free_refresh_after=second.get('free_refresh'))
             self.commit_original(active)
             if active.get('departure_action'):
                 self.commit_original({**active,'action':active['departure_action'],
@@ -1217,7 +1293,7 @@ class Driver:
                     and seconds_remaining(rec['active'])>0
                     and fresh_proof(fresh,snapshot.get('counter_proof'))
                     and (requested!='coupon' or fresh_proof(fresh,snapshot.get('ss_proof')))
-                    and fresh_proof(fresh,offer.get('currency_proof'))
+                    and fresh_proof(fresh,offer.get('currency_proof'),s)
                     and fresh_proof(fresh,offer.get('proof')))
         x,y=offer['x'],offer['y']
         s.event('escort_progress',r.account,task='escort',phase='dispatch',
@@ -1270,8 +1346,9 @@ class RemainingPriorityDriver(Driver):
                 raise hs.PendingError('读取剩余押镖次数前账号或标签未确认')
         else:
             s.switch_account(r.account)
+        daily=None
         if self.rec.get('daily_counter_required') and layout(s,s.capture()) is None:
-            daily=inspect_daily_remaining(r)
+            daily=inspect_daily_remaining(r,leave_open=True)
             self.rec['last_daily_remaining']=daily;self.save()
             if daily['remaining']==0:
                 if self.rec.get('refresh_pending'):raise hs.PendingError('日常为0但原免费刷新未决，保留原凭据')
@@ -1288,12 +1365,15 @@ class RemainingPriorityDriver(Driver):
                     self.rec.update(policy_leg_start=len(self.rec.get('legs',())),policy_baseline_remaining=0,
                         previous_outcome_pending=True,observed_remaining_scope_only=True)
                 self.rec['daily_remaining_after']=0;self.rec['daily_remaining_zero_samples']=daily['samples']
+                r.click('daily_practice_close.bmp',(1370,200,1460,280),17,17,
+                    'escort_count_close_daily',['daily_practice_anchor.bmp'])
                 from hyol_navigation import return_to_leaf
                 return_to_leaf(s,r.account,allow_pending_navigation=True)
                 return self.finish_zero([daily['samples'][0],daily['samples'][-1]])
         if not opened() and layout(s,s.capture()) is None:
             raise EscortNotOpen('押镖未开放，剩余任务保留待处理')
-        frame=open_page(r);snapshot=self.read_panel(frame)
+        frame=open_page(r,selected_daily=daily) if daily is not None else open_page(r)
+        snapshot=self.read_panel(frame)
         if not opened() and snapshot.get('remaining')!=0:
             raise EscortNotOpen('押镖未开放，未接新任务；原次数保留')
         if snapshot.get('remaining') is None:
@@ -1459,12 +1539,15 @@ def run(r):
 
 
 def tick_through_departure(driver, scheduler):
-    """Keep custody of an accepted cart until its guarded departure is sent."""
+    """Settle this cart and send the next departure before releasing its tab."""
     active=driver.rec.get('active')
     limit=time.monotonic()+45 if active and not active.get('departure_sent') else None
     last_pending=None
     for _ in range(90):
         scheduler.check_stop()
+        previous_legs=len(driver.rec.get('legs',()))
+        previous_refresh=driver.rec.get('refreshes',0)
+        previous_delivery=bool((driver.rec.get('active') or {}).get('delivery_sent'))
         try:
             done=driver.tick()
             last_pending=None
@@ -1477,8 +1560,22 @@ def tick_through_departure(driver, scheduler):
             last_pending=exc
             done=False
         active=driver.rec.get('active')
-        if done or not active or active.get('departure_sent'):
+        if done:
             return done
+        # Once this visit has positively settled a leg, reuse the open vendor
+        # immediately for the next leg (or its zero-count finish). A free
+        # refresh is likewise completed on the same tab, not a later sweep.
+        if not active:
+            if (len(driver.rec.get('legs',()))>previous_legs
+                    or driver.rec.get('refreshes',0)>previous_refresh):
+                scheduler.wait_interruptible(.3)
+                continue
+            return False
+        if active.get('departure_sent'):
+            if active.get('delivery_sent') and not previous_delivery:
+                scheduler.wait_interruptible(.5)
+                continue
+            return False
         if limit is None:limit=time.monotonic()+45
         if time.monotonic()>=limit:
             break
@@ -1503,11 +1600,32 @@ def run_multi(coordinator):
         except hs.PendingError as exc:
             r.record('escort').update(status='pending',task_completed=False,home_returned=False,last_error=str(exc));r.save()
             coordinator.event('multi_solo_task_pending',account,task='escort',detail=str(exc))
+    next_checks={}
+    restored_active={id(d) for d in drivers if d.rec.get('active')}
     while drivers:
-        # An accepted leg always precedes another acceptance. Sort again each
-        # round, using its original deadline rather than its current tab slot.
-        for driver in sorted(tuple(drivers),key=priority_key):
+        # Normal visits retain physical tab order. Only an unstarted accepted
+        # cart or a genuinely near deadline can pre-empt that sweep.
+        def visit_order(driver):
+            active=driver.rec.get('active')
+            if active:
+                try:urgent=(id(driver) in restored_active or getattr(driver,'pending_checks',0)>0
+                            or not active.get('departure_sent') or seconds_remaining(active)<=DEADLINE_WARNING_SECONDS)
+                except hs.PendingError:urgent=True
+                if urgent:return (*priority_key(driver),driver.r.account.index)
+            return (1,driver.r.account.index,driver.r.account.index)
+        for driver in sorted(tuple(drivers),key=visit_order):
             s.check_stop()
+            active=driver.rec.get('active')
+            if active and active.get('departure_sent') and not active.get('delivery_sent'):
+                try:urgent=seconds_remaining(active)<=DEADLINE_WARNING_SECONDS
+                except hs.PendingError:urgent=True
+                departure=active.get('departure_sent_at')
+                if not urgent and type(departure) in (int,float):
+                    initial=max(0,departure+TRAVEL_FIRST_CHECK_SECONDS-time.time())
+                    due=max(next_checks.get(id(driver),0),time.monotonic()+initial)
+                    if due>time.monotonic():
+                        next_checks[id(driver)]=due
+                        continue
             if not driver.rec.get('active'):
                 active_drivers=[d for d in drivers if d.rec.get('active')]
                 blocked=False
@@ -1524,6 +1642,7 @@ def run_multi(coordinator):
                 done=tick_through_departure(driver,s)
                 if done:drivers.remove(driver)
                 driver.pending_checks=0
+                restored_active.discard(id(driver))
             except hs.AccountOffline as exc:
                 coordinator.skip_disconnected(exc.account,'escort');drivers.remove(driver)
             except hs.SafetyError:
@@ -1537,6 +1656,30 @@ def run_multi(coordinator):
                     driver.last_pending_event=time.monotonic()
                 driver.last_pending_reason=str(exc)
                 active=driver.rec.get('active')
+                if isinstance(exc,EscortNotOpen) and not active:
+                    driver.rec['availability']=dict(status='not_open',reason=str(exc))
+                    driver.save()
+                    # The daily counter is intentionally left open until the
+                    # escort decision. A closed time window must close that
+                    # proven panel before the next task uses the toolbar.
+                    if driver.r.return_to_main() is not True:
+                        raise hs.LeaseBlocked('押镖未开放，活动面板关闭及回村仍待核实') from exc
+                    driver.rec['home_returned']=True
+                    driver.save()
+                    coordinator.event('multi_solo_task_unavailable',driver.r.account,task='escort',
+                        detail=str(exc),task_completed=False,home_returned=True)
+                    drivers.remove(driver)
+                    continue
+                if (active and active.get('departure_sent') and not active.get('delivery_sent')
+                        and str(exc).startswith('终点押镖奖励数字未确认') and driver.pending_checks>=3):
+                    driver.rec['observation_blocked']=dict(reason=str(exc),checks=driver.pending_checks,
+                        evidence=active.get('delivery_unreadable_evidence'),original_outcome='unknown')
+                    driver.save();drivers.remove(driver)
+                    coordinator.deferred[driver.r.account.name]='escort'
+                    coordinator.deferred_at[driver.r.account.name]=time.monotonic()
+                    coordinator.event('multi_solo_task_pending',driver.r.account,task='escort',
+                        detail='终点金额连续三次未核实，本号保留原交付待处理；继续其他账号，不长时间反复检查')
+                    continue
                 try:remaining=seconds_remaining(active) if active else 0
                 except hs.PendingError:remaining=0
                 if active and not isinstance(exc,EscortDeadlineExceeded) and (remaining>0 or driver.pending_checks<3):
@@ -1551,5 +1694,12 @@ def run_multi(coordinator):
                     coordinator.deferred[driver.r.account.name]='escort'
                     coordinator.deferred_at[driver.r.account.name]=time.monotonic()
             finally:s.navigator=None
+            if driver in drivers:
+                active=driver.rec.get('active')
+                if active and type(active.get('departure_sent_at')) in (int,float):
+                    next_checks[id(driver)]=time.monotonic()+poll_seconds(driver.rec)
         coordinator.save_progress('escort')
-        if drivers:s.wait_interruptible(min(poll_seconds(d.rec) for d in drivers))
+        if drivers:
+            now=time.monotonic()
+            delays=[max(.5,next_checks.get(id(d),now)-now) for d in drivers]
+            s.wait_interruptible(min(delays))

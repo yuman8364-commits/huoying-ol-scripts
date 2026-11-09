@@ -18,6 +18,8 @@ STATUSES = dict(new='未执行', running='执行中', done='已完成', pending=
 TASK_LABELS.update(puzzle='拼图',training_record='修行录')
 TASK_LABELS['escort'] = '押镖'
 TASK_LABELS['anniversary'] = '周年庆签到'
+TASK_LABELS['arena_3v3'] = '竞技场3v3'
+TASK_LABELS['grocery'] = '杂货屋'
 
 
 def mail_cleanup_required(record):
@@ -28,6 +30,8 @@ def mail_cleanup_required(record):
 def task_status_text(task, record):
     if task == 'mail' and mail_cleanup_required(record):
         return '背包满需清理'
+    if task == 'arena' and record.get('outcome') == 'quota_exhausted':
+        return '战令已用尽'
     return STATUSES.get(record.get('status'), '待核实')
 
 
@@ -129,6 +133,32 @@ def survival_battle_counts(events, account, day, actions=None):
     first = sum(archived)
     return dict(verified_battles=first+current, verified_first_round_battles=first,
                 verified_current_round_battles=current)
+
+
+def survival_execution_counts(ledger):
+    """Separate this run's audited work from already-settled game state."""
+    observations = ledger.get('survival_reward_observations', {})
+    actions = ledger.get('actions', {})
+    second = actions.get('survival_second_run_started', {}).get('status') == 'done'
+    by_round = {2 if second else 1: actions}
+    archives = ledger.get('survival_round_archives', {})
+    archived = [row.get('actions', {}) for row in archives.values() if isinstance(row, dict)]
+    def battles(records):
+        return {key for key,row in records.items() if re.fullmatch(r'survival_battle_step_\d+',key)
+                and isinstance(row,dict) and row.get('status')=='done'
+                and records.get(key+'_start',{}).get('status')=='done'
+                and records.get('survival_result_confirm_'+key.rsplit('_',1)[-1],{}).get('status')=='done'}
+    counts = {index:len(battles(rows)) for index,rows in by_round.items()}
+    if archived:
+        counts[1] = max([counts.get(1,0), *(len(battles(rows)) for rows in archived)])
+    claimed = {int(key.removeprefix('run_')):row for key,row in observations.items()
+               if key in ('run_1','run_2') and isinstance(row,dict) and row.get('claimed') is True}
+    return dict(completed=sum(counts.get(index,0)>0 for index in claimed),
+                verified_battles=sum(counts.values()),
+                actual_reward_claims=sum(row.get('origin')=='actual' for row in claimed.values()),
+                reconciled_reward_claims=sum(row.get('origin')=='reconciled' for row in claimed.values()),
+                preexisting_reward_rounds=sum(row.get('origin')=='preexisting' for row in claimed.values()),
+                observed_complete_rounds=len(claimed))
 
 
 def discover_log_roots(root, state=None):
@@ -276,12 +306,15 @@ class ProgressReader:
         return dict(day=day, run_id=run_id, updated_at='', rows=[], runs=[], warnings=warnings)
 
     def _load_with_index(self, progress_index, scope, day, run_id):
+        if run_id and not (self.state/'runs'/run_id).resolve().is_relative_to((self.state/'runs').resolve()):
+            raise ValueError('本轮状态目录无效')
         pattern = ('HYOL_Scheduler_' + run_id + '.jsonl' if run_id else
                    'HYOL_Scheduler_' + day.replace('-', '') + '_*.jsonl')
         paths = [path for root in self.log_roots for path in root.glob(pattern)]
         observed_summary = progress_index.sync(paths, scope, self.warnings)
         runs = observed_summary.runs
         global_state = self._read(self.state / (day + '.json')) if not run_id else {}
+        run_global = self._read(self.state/'runs'/run_id/(day+'.json')) if run_id else global_state
         latest = self._read(self.state / 'multi_solo_latest.json') if not run_id else {}
         if not str(latest.get('updated_at', '')).startswith(day):
             latest = {}
@@ -336,6 +369,7 @@ class ProgressReader:
             actions = ledger.get('actions', {})
             activity_records = {}
             activity_actions = {}
+            activity_ledger = {}
             if run_id and name:
                 run_root = (self.state/'runs'/run_id).resolve()
                 if not run_root.is_relative_to((self.state/'runs').resolve()):
@@ -346,7 +380,8 @@ class ProgressReader:
                 for stem in stems:
                     activity_records = self._read(run_root/day/(stem+'_tasks.json'))
                     if activity_records:
-                        activity_actions = self._read(run_root/day/(stem+'.json')).get('actions', {})
+                        activity_ledger = self._read(run_root/day/(stem+'.json'))
+                        activity_actions = activity_ledger.get('actions', {})
                         break
             task_rows = {}
             for task in TASK_LABELS:
@@ -359,8 +394,16 @@ class ProgressReader:
                     if rec.get('status') == 'done' and not complete(task, rec):
                         rec['status'] = 'pending'
                 task_actions = activity_actions if run_id else actions
+                if task == 'arena':
+                    from hyol_arena_outcome import exhausted_evidence
+                    known = exhausted_evidence(day,run_global.get('arena_requests',{}).get(name,{}),
+                                               activity_ledger if run_id else ledger)
+                    if known:
+                        rec.update(known)
                 rec['events'] = observed.get('events', [])
                 paths = list(observed.get('evidence_paths', []))
+                if rec.get('daily_observation',{}).get('evidence'):
+                    paths.append(rec['daily_observation']['evidence'])
                 if task == 'escort':
                     legs=rec.get('legs',[])
                     for leg in (*legs,rec.get('active',{})):
@@ -398,7 +441,7 @@ class ProgressReader:
                         status = 'pending'
                         error = error or '运行已停止，完成条件尚未核实'
                 if name in health and status in ('new', 'running', 'skipped', 'pending'):
-                    status = 'offline'
+                    status = observed_summary.health_status.get(name,'pending')
                 rec.update(status=status, pending_actions=pending_actions,
                            evidence_paths=list(dict.fromkeys(paths)), last_error=error)
                 if pending_actions:
@@ -411,13 +454,16 @@ class ProgressReader:
                                           and action_task(key) == task and ('victory' in key or 'defeat' in key or 'result_confirm' in key)]
                 if task == 'survival':
                     rec.update(survival_battle_counts(progress_index.survival_events(name), name, day, None if run_id else actions))
+                    source_ledger = activity_ledger if run_id else ledger
+                    if 'survival_reward_observations' in source_ledger:
+                        rec.update(survival_execution_counts(source_ledger))
                 if task == 'arena' and not run_id:
                     request = global_state.get('arena_requests', {}).get(name, {})
                     wins = sum(isinstance(v, dict) and v.get('status') == 'done'
                                for k, v in actions.items() if re.fullmatch(r'arena_attempt_victory_\d+', k))
                     rec['verified_wins'] = max(0, wins - request.get('base_wins', 0))
                     rec['requested_wins'] = request.get('requested_wins')
-                if run_id and task == 'arena':
+                if run_id and task == 'arena' and rec.get('outcome') != 'quota_exhausted':
                     rec['verified_wins'] = progress_index.arena_wins(name)
                 task_rows[task] = rec
             rows.append(dict(label=f'标签{index}', index=index, account=name,

@@ -26,6 +26,7 @@ TASK_LABELS = {
     "escort": "押镖（两次点券＋一次铜币）",
     "treasure": "挖宝（每号5分钟）",
     "anniversary": "周年庆签到",
+    "grocery": "杂货屋（请在新版桌面设置）",
 }
 
 
@@ -96,7 +97,7 @@ class MultiSoloApp(tk.Tk):
         task_line = ttk.Frame(frame)
         task_line.pack(anchor="w")
         for index, task in enumerate(SOLO_OPTIONS):
-            ttk.Checkbutton(task_line, text=TASK_LABELS[task], variable=self.task_vars[task]).grid(
+            ttk.Checkbutton(task_line, text=TASK_LABELS[task], variable=self.task_vars[task],state='disabled' if task=='grocery' else 'normal').grid(
                 row=index//4, column=index%4, sticky='w', padx=(0, 16), pady=3)
         arena_line = ttk.Frame(frame)
         arena_line.pack(anchor="w", pady=(12, 0))

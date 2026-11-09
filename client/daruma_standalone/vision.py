@@ -154,7 +154,11 @@ def estimate_motion(samples: list[tuple[float, int, float]]) -> Motion | None:
             recent = recent[i:]
             break
     if recent:
-        recent = [row for row in recent if row[0] >= recent[-1][0]-.65]
+        # Keep up to forty distinct positions from this same sweep. At 30 Hz,
+        # 0.65s supplied too few points to resolve the final seven-pixel band;
+        # 1.3s averages Flash's quantized positions without weakening any fit,
+        # direction, prediction-horizon or uncertainty gate.
+        recent = [row for row in recent if row[0] >= recent[-1][0]-1.3]
     if len(recent) < 6 or recent[-1][0]-recent[0][0] < .18:
         return None
     ts = np.asarray([x[0]-recent[0][0] for x in recent])
@@ -249,6 +253,10 @@ class Vision:
     def visible(self, frame, name, roi, threshold=.93):
         return self.match(frame, name, roi, threshold)[0]
 
+    def catalogue(self, frame):
+        return (self.visible(frame,'anniversary_shell_20261105.bmp',(540,270,620,330),.98)
+                and self.visible(frame,'anniversary_close_20261105.bmp',(1325,280,1370,325),.98))
+
     def page(self, frame: Image.Image) -> str:
         if self.offline(frame):
             return 'offline'
@@ -259,7 +267,8 @@ class Vision:
             return 'ready' if self.visible(frame, 'daruma_start.bmp', START) else 'playing'
         if self.visible(frame, 'daruma_weekend_page.bmp', WEEKEND_PAGE):
             return 'weekend'
-        if self.visible(frame, 'daruma_weekend_menu.bmp', (475, 240, 705, 755)):
+        if (self.catalogue(frame)
+                or self.visible(frame, 'daruma_weekend_menu.bmp', (475, 240, 705, 755))):
             return 'menu'
         if self.visible(frame, 'daruma_hotspot.bmp', (450, 69, 550, 145)):
             return 'home' if self.visible(frame, 'home_leave.bmp', (1800, 930, 1920, 1032)) else 'field'

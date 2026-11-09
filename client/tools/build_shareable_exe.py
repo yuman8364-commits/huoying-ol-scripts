@@ -16,10 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.prepare_generic_release import clean_config, personal_asset
 from tools.verify_packaged_source import verify_package
+from hyol_runtime import VERSION, RELEASE_DATE
 
 CONFIGS = ('HYOL_Daily.ini', 'DAILY_Client.ini', 'TEAM_Client.ini', 'ARENA_Client.ini')
 DIGITS = ('bond_kill_digits_20261030.json', 'bond_score_digits_20261030.json',
-          'survival_counter_glyphs.json')
+          'survival_counter_glyphs.json', 'arena3v3_counter_glyphs.json', 'grocery_number_glyphs.json')
 WEB_FILES = ('index.html', 'styles.css', 'app.js', 'demo-data.js', 'native-adapter.js',
              'assets/favicon.svg', 'assets/demo-evidence.svg')
 PUZZLE_NAME = '拼图 忍术训练V2.1.exe'
@@ -141,14 +142,17 @@ def stage_release(root, output, name):
     for path in sorted((root/'daruma_standalone/samples').glob('*.bmp')):
         (samples/path.name).write_bytes(original(path))
     (bundle/'使用说明.txt').write_text(
-        '火影OL 单文件分享版（2026-11-05，包含当前v7修复）\n\n'
+        '火影OL 单文件分享版 '+VERSION+'\n\n'
         '只需转发这一个EXE，不需要安装Python。Windows 10/11 64位，需系统WebView2和.NET Framework 4.8。\n'
         '先登录自己的游戏并打开所需账号标签，再双击EXE；选择任务、账号范围后点击开始。F12或停止按钮停止本轮。\n'
         '打开程序保持空闲，不自动启动游戏任务。首次使用按当前标签自动识别账号。\n'
+        '标签按游戏窗口从左到右编号；选择四个账号只操作前四个标签，不用修改角色名为数字。\n'
+        '单人页的组队任务只控制当前账号，使用现有队伍；新增组队项目默认只选组队副本和强者。\n'
+        '修行录按最终灰色已完成状态核实；竞技场可手动选择最终目标或战令用完。\n'
         '分享包不携带制作者账号素材、日志、运行断点、浏览器登录数据或个人配置。\n'
-        '设置、日志和断点保存在当前Windows用户的%LOCALAPPDATA%\\HYOLShareClient，退出后保留。\n'
+        '个人设置和断点保存在当前Windows用户的%LOCALAPPDATA%\\HYOLShareClient；完整中文日志在桌面“火影OL日志”，原始记录同时保留。\n'
         '再次分享时只转发原始EXE；不要附带自己的运行数据目录。\n', encoding='utf-8')
-    manifest = dict(format=1, edition='shareable-onefile', build='2026-11-05-v7',
+    manifest = dict(format=1, edition='shareable-onefile', build=VERSION,
                     files=[dict(path=p.relative_to(bundle).as_posix(), sha256=sha(p.read_bytes()))
                            for p in sorted(bundle.rglob('*')) if p.is_file()])
     save_json(bundle/'manifest.json', manifest)
@@ -356,6 +360,6 @@ def build(output, name):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--name', default='火影OL_分享版_2026-11-05')
+    parser.add_argument('--name', default='火影OL_分享版_'+RELEASE_DATE)
     arguments = parser.parse_args()
     build(arguments.output, arguments.name)

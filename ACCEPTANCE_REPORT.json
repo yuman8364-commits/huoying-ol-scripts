@@ -1,0 +1,77 @@
+{
+  "version": "2026.11.09.24-opencv",
+  "compared_with": "2026.11.05.1-opencv",
+  "original_final_source_regression": {
+    "stages": 19,
+    "test_executions": 2539,
+    "failures": 0,
+    "existing_skips": 2,
+    "rerun_for_publication": false,
+    "baseline_files_checked": 1224,
+    "baseline_drift": []
+  },
+  "public_source_regression": {
+    "tests": 72,
+    "failures": 0,
+    "errors": 0,
+    "private_fixtures_required": false,
+    "checkout_passed": true,
+    "zip_source_passed": true
+  },
+  "source": {
+    "standard": {
+      "modules": 82,
+      "matches": true
+    },
+    "exe": {
+      "modules": 82,
+      "matches": true
+    }
+  },
+  "native": {
+    "standard": {
+      "first_launch": true,
+      "restart": true,
+      "mode": "native",
+      "game_input_count": 0,
+      "game_task_started": false,
+      "idle": true,
+      "first_onboarding_required": true,
+      "restart_onboarding_required": true
+    },
+    "exe": {
+      "first_launch": true,
+      "restart": true,
+      "mode": "native",
+      "game_input_count": 0,
+      "game_task_started": false,
+      "idle": true,
+      "first_onboarding_required": true,
+      "restart_onboarding_required": true
+    }
+  },
+  "standard_zip_crc": "PASS",
+  "standard_includes_editable_source": true,
+  "privacy_findings": [],
+  "private_account_material_included": false,
+  "personal_config_included": false,
+  "runtime_data_included": false,
+  "game_input_count": 0,
+  "purchase": "paused",
+  "live_acceptance": "partial; not rerun for publication",
+  "all_accounts_full_live_verified": false,
+  "original_puzzle_audit": "Exact SHA256 and known identifier checks; encrypted internal script not recovered",
+  "artifacts": [
+    {
+      "file": "huoying-ol-standard-2026.11.09.24-opencv.zip",
+      "bytes": 111632151,
+      "sha256": "a5207cb0cb9324b30197f3add0ce04fcb2a85d5ae034abc0b1e9e9395ec6152a"
+    },
+    {
+      "file": "huoying-ol-2026.11.09.24-opencv.exe",
+      "bytes": 93968157,
+      "sha256": "6322bacd49c6caf38a58c4687cdbb6747d4b535d8153c077a446e51770b8a6ec"
+    }
+  ],
+  "at": "2026-11-10T00:08:13.902154+08:00"
+}

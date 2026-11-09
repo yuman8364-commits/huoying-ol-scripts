@@ -30,6 +30,7 @@ class BattleWatchdog:
     last_observed_at: float | None = None
     reference: np.ndarray | None = field(default=None, repr=False)
     mode: str = "battle"
+    sampling_phase: str = "battle"
 
     @classmethod
     def from_config(cls, config, *, started_at=None):
@@ -47,6 +48,36 @@ class BattleWatchdog:
         if not isinstance(frame, Image.Image):
             return None
         w, h = frame.size
+        if mode == 'anniversary':
+            # Date selection and reward cards change independently of the
+            # mostly static sign-in decoration and the village behind it.
+            pieces = []
+            for roi in ((815,680,1253,759),(790,395,1005,625)):
+                box = tuple(round(v*(w/1920 if index%2==0 else h/1032))
+                            for index,v in enumerate(roi))
+                pieces.append(np.asarray(frame.crop(box).convert('L').resize(
+                    (96,24),Image.Resampling.BILINEAR),dtype=np.int16).ravel())
+            return np.concatenate(pieces)
+        if mode == 'arena_loading':
+            # The opponent-load countdown is too small for the battlefield
+            # thumbnail. Observe only its digits and the loading bar, without
+            # letting the animated village behind the overlay extend a stall.
+            pieces = []
+            for roi in ((746, 529, 1174, 550), (1070, 553, 1103, 575)):
+                box = tuple(round(v*(w/1920 if index%2==0 else h/1032))
+                            for index,v in enumerate(roi))
+                pieces.append(np.asarray(frame.crop(box).convert('L').resize(
+                    (96,24),Image.Resampling.BILINEAR),dtype=np.int16).ravel())
+            return np.concatenate(pieces)
+        if mode == 'arena_matching':
+            # Matching is a static modal except for its elapsed-seconds label.
+            # The broad battlefield thumbnail removes those small digits;
+            # sample the proven timer region without counting roster/chat motion.
+            roi = (918, 540, 982, 573)
+            box = tuple(round(v*(w/1920 if index%2==0 else h/1032))
+                        for index,v in enumerate(roi))
+            return np.asarray(frame.crop(box).convert('L').resize(
+                (96,48),Image.Resampling.BILINEAR),dtype=np.int16).ravel().copy()
         if mode=='training_record':
             # The document occupies the center. World/chat animation cannot
             # mask a frozen document, and real scrolling/reward changes count.
@@ -78,7 +109,9 @@ class BattleWatchdog:
         if self.started_at is None:
             self.started_at = now
         elapsed = max(0.0, now - self.started_at)
-        sample = self.sample(frame, self.mode)
+        sample_mode = {'matching': 'arena_matching', 'loading': 'arena_loading'}.get(
+            self.sampling_phase, self.mode)
+        sample = self.sample(frame, sample_mode)
         # A background tab can run for over 30 seconds without being sampled.
         # Unobserved time is not evidence of a frozen frame: resume observation
         # from a fresh baseline instead of declaring a stall immediately.

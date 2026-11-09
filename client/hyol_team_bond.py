@@ -384,7 +384,7 @@ class TeamBondDriver(BondRunner):
         if (rec.get('scroll_down', 0) >= 24 or signature == rec.get('scroll_down_signature')
                 or not s.template('daily_scroll_down_current.bmp',(1060,650,1095,725),frame)[0]):
             raise hs.PendingError('限时活动已到列表末端，羁绊对决活动行尚未确认，未发送匹配')
-        if s.click_template(self.account,'daily_scroll_down_current.bmp',(1060,650,1095,725),10,10,
+        if s.click_template(self.account,'daily_scroll_down_current.bmp',(1060,650,1095,725),10,26,
                 'pipeline_bond_scroll_down',['daily_scroll_down_current.bmp']):
             rec['scroll_down'] = rec.get('scroll_down', 0)+1
             rec['scroll_down_signature'] = signature

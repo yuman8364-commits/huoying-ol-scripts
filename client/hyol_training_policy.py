@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 UNIT_LABELS = {'count': '次', 'wins': '胜', 'points': '积分', 'layers': '层', 'claims': '项'}
 
 
@@ -12,15 +12,30 @@ def local_day():
     return datetime.now(timezone(timedelta(hours=8))).date().isoformat()
 
 
-def arena_policy(day):
+def arena_policy(day, selection='auto'):
     parsed = date.fromisoformat(day)
     if parsed.isoformat() != day:
         raise ValueError('竞技场执行日期必须为YYYY-MM-DD')
+    if selection not in ('auto', 'final_goal', 'tickets'):
+        raise ValueError('修行录竞技场结束条件须为自动、完成最终目标或战令用完')
     sunday = parsed.weekday() == 6
+    resolved = ('final_goal' if sunday else 'tickets') if selection == 'auto' else selection
     return dict(version=POLICY_VERSION, execution_day=day, weekday=parsed.weekday(),
-                mode='wins' if sunday else 'tickets',
-                label='周日补足修行录目标' if sunday else '平日打到实际战令归零',
+                selection=selection, stop_policy=resolved,
+                mode='wins' if resolved == 'final_goal' else 'tickets',
+                label=('周日补足修行录最终目标' if selection == 'auto' and sunday else
+                       '平日打到实际战令归零' if selection == 'auto' else
+                       '完成修行录最终目标' if resolved == 'final_goal' else '打到实际战令归零'),
                 fixed_battle_cap=None)
+
+
+def selected_arena_policy(runner):
+    value = getattr(runner, 'training_arena_stop_policy', None)
+    if value is None:
+        value = getattr(getattr(runner, 'scheduler', None), 'training_arena_stop_policy', 'auto')
+    if value not in ('auto', 'final_goal', 'tickets'):
+        raise ValueError('修行录竞技场结束条件无效')
+    return value
 
 
 def goal_unit(task, description):
@@ -33,7 +48,7 @@ def goal_unit(task, description):
     return 'count'
 
 
-def quantity_plan(task, goals, day):
+def quantity_plan(task, goals, day, arena_stop_policy='auto'):
     """Overlapping goals share work; incompatible units never share a number."""
     deficits = {}
     for goal in goals:
@@ -48,7 +63,8 @@ def quantity_plan(task, goals, day):
                   started=0, settled=0, completion_scope='training_goal',
                   quantity_state='awaiting_observation', stop_reason='')
     if task == 'arena':
-        result['date_policy'] = arena_policy(day)
+        result['date_policy'] = arena_policy(day, arena_stop_policy)
+        result['stop_policy'] = result['date_policy']['stop_policy']
         result['stop_condition'] = 'goal' if result['date_policy']['mode'] == 'wins' else 'tickets_zero'
     else:
         result['stop_condition'] = 'goal_or_quota'

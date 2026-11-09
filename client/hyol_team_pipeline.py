@@ -20,8 +20,8 @@ from hyol_multi_solo import tab_close_positions, active_tab_centers
 from hyol_team_six import SixTabScheduler, room_member_assignment
 
 TEAM_TASKS = ('group_instance', 'wanted')
-SUPPORTED_TEAM_TASKS = (*TEAM_TASKS, 'strong_approach', 'bond')
-TASK_KEYS = {'group_instance': 'group', 'wanted': 'wanted', 'strong_approach': 'strong', 'bond': 'bond'}
+SUPPORTED_TEAM_TASKS = (*TEAM_TASKS, 'strong_approach', 'bond', 'arena_3v3')
+TASK_KEYS = {'group_instance': 'group', 'wanted': 'wanted', 'strong_approach': 'strong', 'bond': 'bond', 'arena_3v3':'arena_3v3'}
 ROOM = (1200, 260, 1280, 340)
 PUBLIC_ROOM = (1360, 250, 1450, 340)
 CREATE = (951, 650, 1301, 850)
@@ -1484,7 +1484,7 @@ class TeamPipelineRunner:
     def __init__(self, leaders=(), tasks=TEAM_TASKS, solo_tasks=DEFAULT_SOLO_OPTIONS,
                  *, arena_wins=5, arena_target_mode='tickets', formation='keep', managed_enabled=True, event_sink=None, root=hs.ROOT,
                  run_context=None, bond_count=5, preformed_duos=False,
-                 bond_target_mode='battles', bond_kill_target=160, bond_score_target=100, bond_team_goals=(), preformed_pairs=()):
+                 bond_target_mode='battles', bond_kill_target=160, bond_score_target=100, bond_team_goals=(), preformed_pairs=(), preformed_trio=()):
         from hyol_bond_goals import validate_options, validate_pairs
         validate_options(bond_target_mode, bond_kill_target, bond_score_target, bond_team_goals)
         validate_pairs(preformed_pairs, leaders)
@@ -1506,7 +1506,9 @@ class TeamPipelineRunner:
         if formation not in ('keep','main','fast') or type(managed_enabled) is not bool:
             raise ValueError('阵容或最后托管选项无效')
         self.leaders = tuple(leaders)
-        self.tasks = tuple(t for t in tasks if t != 'bond') + (('bond',) if 'bond' in tasks else ())
+        from hyol_arena_3v3 import normalize_tasks,validate_trio
+        self.tasks = normalize_tasks(tuple(t for t in tasks if t != 'bond') + (('bond',) if 'bond' in tasks else ()))
+        self.preformed_trio=validate_trio(preformed_trio) if 'arena_3v3' in tasks else ()
         self.bond_count = bond_count
         self.bond_target_mode, self.bond_kill_target = bond_target_mode, bond_kill_target
         self.bond_score_target, self.bond_team_goals = bond_score_target, tuple(tuple(row) for row in bond_team_goals)
@@ -1584,7 +1586,8 @@ class TeamPipelineRunner:
                     bond_count=self.bond_count, preformed_duos=self.preformed_duos,
                     bond_target_mode=getattr(self,'bond_target_mode','battles'), bond_kill_target=getattr(self,'bond_kill_target',0),
                     bond_score_target=getattr(self,'bond_score_target',100), bond_team_goals=list(getattr(self,'bond_team_goals',())),
-                    preformed_pairs=list(getattr(self,'preformed_pairs',())))
+                    preformed_pairs=list(getattr(self,'preformed_pairs',())),
+                    **({'preformed_trio':list(self.preformed_trio)} if getattr(self,'preformed_trio',()) else {}))
 
 
 
@@ -1605,6 +1608,8 @@ class TeamPipelineRunner:
             phase='teams', teams={str(i):dict(status='new',tasks={}) for i in self.leaders},
             required_account_count=len(s._bound_identity_names),
             expected_accounts=sorted(set(s._bound_identity_names.values())))
+        prior=getattr(self.run_context,'pipeline_previous_arena_scope',None)
+        if prior:self.record['previous_arena_scope']=prior
         self.save()
         from hyol_team_resume import checkpoint_started
         checkpoint_started(self.run_context)
@@ -1705,6 +1710,44 @@ class TeamPipelineRunner:
                         raise hs.AccountOffline(account,'该队长当前已掉线')
                     raise hs.PendingError('队长身份未唯一确认，本队暂缓')
                 slot['owner'] = s._bound_identity_names[index]
+                existing_arena=slot.get('tasks',{}).get('arena_3v3',{})
+                if existing_arena:
+                    slot['members']=[s.state.aliases.get(name,name) for name in slot.get('members',[])]
+                if (getattr(self.run_context,'pipeline_resume',False) and slot.get('members')
+                        and slot.get('team_evidence') and existing_arena.get('phase') in
+                        ('rewards','matching','battle','exiting','done')):
+                    slot['status']='running'
+                    self.drivers[index]=LeaderActivityRunner(self,account,slot)
+                    self.event('pipeline_original_team_resumed',account,
+                               detail='恢复原3v3匹配、战斗或领奖；保留队伍和原动作')
+                    continue
+                if self.preformed_trio:
+                    from hyol_arena_3v3 import page_visible,verify_party,enter_from_world,observed_account
+                    if any(i not in s._bound_identity_names for i in self.preformed_trio):
+                        raise hs.PendingError('三人队标签身份未全部核实')
+                    expected=[s._bound_identity_names[i] for i in self.preformed_trio]
+                    frame=observed_account(s,account)
+                    if self.tasks==('arena_3v3',) and not page_visible(frame,s.templates):
+                        # Entering is reversible. The activity itself gives
+                        # three independent own-role highlights and identical
+                        # party names; verify those before any match/reward.
+                        # This also avoids reinterpreting a preformed party
+                        # through the differently rendered invitation room.
+                        if not s.main_ready(frame) or not portrait_leader_present(s,frame):
+                            raise hs.PendingError('3v3进入前本号主界面及队长标记尚未核实')
+                        enter_from_world(s,account)
+                        for _ in range(40):
+                            s.wait_interruptible(.3);frame=s.capture()
+                            if page_visible(frame,s.templates):break
+                        else:raise hs.PendingError('3v3入口已点击，活动页尚未核实；不重新组队或匹配')
+                    if page_visible(frame,s.templates):
+                        if any(t!='arena_3v3' for t in self.tasks):
+                            raise hs.PendingError('已在3v3活动内，其他组队任务尚无本轮完成证据；保留页面，请先核对任务选择')
+                        evidence=verify_party(s,self.preformed_trio)
+                        slot.update(members=expected,team_evidence=evidence,status='running')
+                        self.drivers[index]=LeaderActivityRunner(self,account,slot)
+                        self.save()
+                        continue
                 if (getattr(self.run_context,'pipeline_resume',False) and slot.get('members')
                         and slot.get('team_evidence') and any(
                             isinstance(rec,dict) and rec.get('status')!='done'
@@ -1729,6 +1772,8 @@ class TeamPipelineRunner:
                     if return_to_leaf(s,account) is not True:
                         raise hs.PendingError('当前页面未确认回到木叶，本队暂缓')
                 members,evidence = self.snapshot(account)
+                if self.preformed_trio and set(members)!=set(expected):
+                    raise hs.PendingError('现有队伍与指定三人标签不一致，未开始3v3或其他组队任务')
                 slot.update(members=list(members),team_evidence=evidence,status='running')
                 self.drivers[index] = LeaderActivityRunner(self,account,slot)
                 self.save()
@@ -1835,6 +1880,15 @@ class TeamPipelineRunner:
     def _finish_pipeline_team(self, index, slot):
         """Dissolve promptly; a slow team must not hold another team's turn."""
         try:
+            if 'arena_3v3' in self.tasks:
+                from hyol_arena_3v3 import verified
+                rec=slot.get('tasks',{}).get('arena_3v3',{})
+                if not verified(rec,slot.get('members',())):
+                    raise hs.PendingError('3v3奖励、退出解散或逐号回村证据未齐全')
+                slot.update(status='done',phase='done',dissolve_evidence=rec['evidence'],
+                            home_returned=True,release_kind='arena3v3_exit_to_solo')
+                self.save()
+                return
             self.dissolve(index, slot)
         except hs.AccountOffline as exc:
             self.block(slot, exc, True)
@@ -1954,7 +2008,13 @@ class TeamPipelineRunner:
                         self.defer_navigation(index, max(0, clock() - entered))
                     continue
                 task = self._next_pipeline_task(index)
-                if task == 'bond':
+                if task == 'arena_3v3':
+                    from hyol_arena_3v3 import Arena3v3Driver
+                    if not hasattr(self,'arena3v3_drivers'):self.arena3v3_drivers={}
+                    if index not in self.arena3v3_drivers:
+                        self.arena3v3_drivers[index]=Arena3v3Driver(self,self.drivers[index].account,slot)
+                    driver=self.arena3v3_drivers[index]
+                elif task == 'bond':
                     from hyol_team_bond import TeamBondDriver
                     if index not in self.bond_drivers:
                         self.bond_drivers[index] = TeamBondDriver(self, self.drivers[index].account, slot)
@@ -2164,9 +2224,10 @@ class TeamPipelineRunner:
                             and slot['tasks'][TASK_KEYS[t]].get('task_completed') is True
                             and slot['tasks'][TASK_KEYS[t]].get('home_returned') is True
                             and slot['tasks'][TASK_KEYS[t]].get('evidence')
-                            and (t == 'bond' or slot['tasks'][TASK_KEYS[t]].get('empty_evidence' if t == 'wanted' else 'zero_evidence')
+                            and (t in ('bond','arena_3v3') or slot['tasks'][TASK_KEYS[t]].get('empty_evidence' if t == 'wanted' else 'zero_evidence')
                                  or t == 'strong_approach' and slot['tasks'][TASK_KEYS[t]].get('stamina_evidence'))
                             and (t != 'bond' or self._bond_verified(slot))
+                            and (t != 'arena_3v3' or __import__('hyol_arena_3v3').verified(slot['tasks'][TASK_KEYS[t]],slot['members']))
                             and (t != 'group_instance' or group_reward_zero_confirmed(slot['tasks'][TASK_KEYS[t]]))
                             and (t != 'strong_approach' or strong_stop_confirmed(
                                 slot['tasks'][TASK_KEYS[t]], slot.get('owner')))
@@ -2325,6 +2386,9 @@ class TeamPipelineRunner:
             if self.solo.scheduler.state.day != self.record['execution_day']:
                 raise hs.PendingError('运行期间日期改变，本轮结束；请重新开始')
             self.scheduler = self.solo.scheduler
+            self.scheduler.arena_second_skill = getattr(self,'arena_second_skill',False)
+            self.scheduler.grocery_items = getattr(self,'grocery_items',())
+            self.scheduler.daily_observation_enabled = True
             result = self._timed_call('solo_tasks', self.solo.run, manage_lease=False,
                 before_prepare=lambda solo: self._timed_call('handoff', self.handoff, solo))
             selected = (*self.solo_tasks, 'managed')

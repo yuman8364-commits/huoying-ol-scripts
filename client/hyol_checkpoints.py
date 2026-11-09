@@ -409,12 +409,21 @@ def _identity_layout(frame, templates=None):
                     and matches('managed_first_card_confirm_current.bmp', (800,565,950,625)))
     welfare = (matches('welfare_title_current.bmp', (1120,230,1320,380))
                and matches('welfare_close_current.bmp', (1320,250,1450,350)))
+    # Mail dims the role strip to the same 77/255 white peak as the daily
+    # panel. Require the known title and its own X before compensating; an
+    # arbitrary dark dialog must still fail the original identity gates.
+    mail = ((matches('mail_ready_anchor.bmp', (801,199,1101,369))
+             and matches('mail_close.bmp', (1300,230,1420,350)))
+            or (matches('mail_warehouse_anchor.bmp', (801,199,1101,389))
+                and matches('mail_warehouse_close.bmp', (1174,259,1275,359))))
     anniversary = (matches('anniversary_deadline_20261105.bmp', (735,325,940,355))
                    and (matches('anniversary_title_20261105.bmp', (880,210,1180,310))
                         or matches('anniversary_catalogue_title_20261105.bmp', (880,210,1180,310)))
                    and matches('anniversary_close_20261105.bmp', (1325,280,1370,325)))
-    weekend = (matches('daruma_weekend_page.bmp', (850,230,1180,360))
-               and matches('daruma_weekend_close.bmp', (1290,260,1420,370)))
+    weekend = ((matches('daruma_weekend_page.bmp', (850,230,1180,360))
+                and matches('daruma_weekend_close.bmp', (1290,260,1420,370)))
+               or (matches('daruma_game_page.bmp', (920,220,1300,325))
+                   and matches('daruma_game_close_core_20261109.bmp',(1340,300,1380,340))))
     puzzle = ((matches('puzzle_select_title.bmp', hs.VIEW)
                and matches('puzzle_select_close.bmp', hs.VIEW))
               or (matches('puzzle_game_anchor.bmp', hs.VIEW)
@@ -446,6 +455,8 @@ def _identity_layout(frame, templates=None):
                            and matches('treasure_reward_left_corner_20261030.bmp',(760,450,1170,510))
                            and matches('treasure_reward_right_corner_20261030.bmp',(760,450,1170,510))
                            and matches('treasure_result_confirm.bmp',(880,570,1040,650))))
+    from hyol_treasure_recognition import trap_layout
+    treasure_trap = trap_layout(frame, templates) is not None
     training_record = (matches('training_record_title.bmp',(390,120,770,280))
                        and matches('training_record_close.bmp',(1350,215,1420,290),.95))
     escort = (matches('escort_page_title.bmp',hs.VIEW,.97)
@@ -462,7 +473,7 @@ def _identity_layout(frame, templates=None):
     if any(matches(name, (106,75,139,105)) for name in (
             'identity_team_badge_core_current.bmp', 'identity_team_badge_core_forest_current.bmp')):
         roi = (roi[0]+15, roi[1], roi[2]+15, roi[3])
-    return roi, 25 if managed_card or escort_support else 56 if welfare or anniversary or weekend or puzzle or group or wanted or strong or daily or public_room or recharge or quiz or treasure or treasure_result or training_record or escort or escort_delivery or invitation else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
+    return roi, 25 if managed_card or escort_support else 56 if welfare or mail or anniversary or weekend or puzzle or group or wanted or strong or daily or public_room or recharge or quiz or treasure or treasure_result or treasure_trap or training_record or escort or escort_delivery or invitation else 50 if spring or managed or transformation else 145 if canyon else hs.IDENTITY_TEXT_THRESHOLD
 
 
 def current_identity_crop(frame, templates=None):
@@ -510,6 +521,10 @@ def _bright_identity_mask(frame, templates=None):
 def current_identity_mask(frame, templates=None):
     import hyol_scheduler as hs
     import numpy as np
+    if templates is not None:
+        from hyol_arena_3v3 import identity_mask
+        activity_mask=identity_mask(frame,templates)
+        if activity_mask is not None:return activity_mask
     bright = _bright_identity_mask(frame,templates)
     if bright is not None:
         return bright

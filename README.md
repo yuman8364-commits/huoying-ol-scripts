@@ -1,25 +1,64 @@
-# 火影ol全自动客户端
+# 火影OL 全自动客户端
 
-Windows 桌面自动化客户端 · OpenCV 标准版
+Windows 10/11 64 位 · OpenCV · 当前版本 **2026.11.09.24-opencv**
 
-[下载客户端](https://github.com/yuman8364-commits/huoying-ol-scripts/releases/latest) · [版本说明](docs/archive/ACCEPTANCE_REPORT.json)
+## 下载
 
-下载发布页的 desktop-folder ZIP（88.4MiB），完整解压后双击“火影OL.exe”。无需安装 Python；需要 Windows 10/11 64 位、WebView2 Runtime 和 .NET Framework 4.8。打开后选择任务再开始，F12 或停止按钮结束。
+| 版本 | 适合谁 | 使用方式 |
+| --- | --- | --- |
+| [标准版（含源码）](https://github.com/yuman8364-commits/huoying-ol-scripts/releases/download/2026.11.09.24-opencv/huoying-ol-standard-2026.11.09.24-opencv.zip) | 日常使用、查看资源、修改脚本与重新打包 | 完整解压，双击 `火影OL.exe`；`source/` 包含可编辑源码 |
+| [EXE版](https://github.com/yuman8364-commits/huoying-ol-scripts/releases/download/2026.11.09.24-opencv/huoying-ol-2026.11.09.24-opencv.exe) | 希望只下载一个文件直接运行 | 下载后双击 EXE |
 
-支持日常、竞技场、生存、修行录、组队、独立羁绊、拼图、达摩及周年庆薪火签到。未知操作保留凭据，不自动重发。
+两版无需安装 Python，均需系统 Microsoft Edge WebView2 Runtime 与 .NET Framework 4.8。首次打开保持空闲；登录自己的游戏、选择账号和任务后开始，按 F12 或“停止本轮”结束。完整下载与 SHA256 见[发布页](https://github.com/yuman8364-commits/huoying-ol-scripts/releases/tag/2026.11.09.24-opencv)。
 
-| 目录 | 内容 |
+## 相比上一发布版的改进
+
+对比 GitHub 上一版 **2026.11.05.1-opencv**，详见[更新记录](CHANGELOG.md)。
+
+- 任务、设置和日志采用三栏工作台；任务名称可直接勾选，独立设置按钮展开参数，支持拖拽排序和保存设置。
+- 新用户增加六组设置引导；中断可续看，老用户保留已有选择。运行计时只累计实际运行时间，结束后冻结。
+- 日志及报错统一使用中文，重复观察合并显示，可筛选、复制和导出，完整记录整理到桌面“火影OL日志”。
+- 当前账号入口补齐八项多人活动，只操作当前账号；副本、强者、通缉支持单人执行，副本和强者默认不选。
+- 修行录按系列最终完成及领奖状态规划缺项，连续执行可靠目标，必要时定向复核；竞技场结束条件可选最终目标或战令用完。
+- 减少日常列表无效翻页，修复押镖交付身份误判，补齐完整金额、免费 SS 与刷新次数核验。
+- 副本结算更快返回游戏；副本优先速刷、其次主力，强者优先主力，未识别则保持阵容；切换后核实四名忍者。强者支持轮换标题与自动二倍速核验。
+- 已核实战令用尽、原场结算并回村时可继续所选最后托管，未达成奖励保留待处理；未知战斗、领奖和未结束押镖仍保留原动作。
+- 新增可直接分享的独立 EXE，并提供同版源码、构建工具与修改指南。
+
+**购买功能在本版暂停**：杂货屋购买入口和商品选择禁用，不自动下单，不展示固定价格。竞技场第二技能默认关闭，可保存设置。未开放活动及缺少执行器的任务会说明原因，不记作完成。
+
+## 使用与记录
+
+1. 游戏标签按从左到右的位置编号，无需把角色名改为数字。当前账号模式只控制当前标签；多账号范围只处理所选标签。
+2. 新用户查看并保存六组设置后开始；“检查并回木叶村”只检查，开始任务需点击“开始本轮”。保持游戏窗口可见，同一桌面只运行一个游戏控制脚本。
+3. 两版分别使用当前 Windows 用户的 `%LOCALAPPDATA%/HYOLFolderClient` 与 `%LOCALAPPDATA%/HYOLShareClient` 保存配置、账号素材和断点。两者不会自动互相迁移；升级时保留原数据。
+4. 下载包不含制作者账号、个人配置、登录缓存、实机截图、运行账本或日志。使用后生成的数据属于使用者；再次分享请使用原始下载包。
+
+## 从源码修改和运行
+
+可以 Fork 本仓库，也可以使用标准版的 `source/`。先读[开发与打包说明](DEVELOPMENT.md)。
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r client/requirements-build.txt -r client/requirements-desktop.txt
+.\.venv\Scripts\python.exe -B launch.py --demo
+```
+
+去掉 `--demo` 打开真实客户端，默认仍保持空闲，只有点击开始才运行任务。改动 `.py` 后用 `launch.py` 验证；要让 EXE 使用修改内容，须重新打包。
+
+| 路径 | 内容 |
 | --- | --- |
-| client/ | 客户端源码、运行配置、通用识别资源与界面 |
-| client/tools/ | 构建、校验和维护工具 |
-| tests/portable/ | 可独立运行的公开专项测试 |
-| tests/legacy/ | 历史测试，部分需要本机回放资料 |
-| docs/archive/ | 历史说明、验收与源码清单 |
+| `client/hyol_*.py` | 桌面桥接、调度、识别与各任务执行器 |
+| `client/web/` | 界面 HTML、CSS 和 JavaScript |
+| `client/assets/` | 通用识别模板及必要运行资源 |
+| `client/tools/` | 干净分享包构建、资源清理与成品源码核验 |
+| `tests/portable/` | 不依赖私人账号、实机截图的公开测试 |
+| `tests/legacy/`、`docs/archive/` | 保留的历史测试及历史文档，部分需要原回放资料 |
 
-源码启动：在 client 目录创建环境，安装 requirements-build.txt 和 requirements-desktop.txt，然后从仓库根目录执行 `python launch.py`。
+本项目自有脚本源码采用 [MIT 许可](LICENSE)，允许在保留许可声明的前提下修改和分发。游戏素材、原拼图二进制组件及依赖各适用自己的权利声明，见[第三方说明](THIRD_PARTY_NOTICES.md)。
 
-公开专项：在仓库根目录执行 `python check.py`（31项）。历史测试不作为独立可运行的验收集。
+## 验证范围
 
-构建：进入 client 目录，执行 `python tools/build_shareable_folder.py --output releases/my-folder-build`，使用新的输出目录。
+v24 原最终源码完成 19 阶段、2539 次离线测试执行，0 失败、2 项既有跳过；界面专项 33 项，两包内嵌项目模块各 82 个。发布前另在本次独立公开源码和实际下载包上验证，结果见 `ACCEPTANCE_REPORT.json`。
 
-本次整理仅移动仓库目录，现有下载包保持不变。原完整离线2158项包含2项既有跳过；实机仅有单账号首日签到验收，后续签到日未自然解锁，历史未知任务保留。目录包和独立源码包不含本机运行日志；旧提交历史中的游戏昵称和路径保留。
+实机只覆盖已有逐项验收，部分账号全流程与最终托管仍未验收；本次发布不启动游戏、不重发原未决动作。离线通过和启动成功不代表所有任务实机完成。Git 历史及历史文档继续保留旧版本昵称与本机路径；本次新源码快照和成品另行检查。

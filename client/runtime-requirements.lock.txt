@@ -1,3 +1,0 @@
-# Standard client runtime; build and diagnostic dependencies are separate.
-numpy==2.3.5
-pillow==12.3.0

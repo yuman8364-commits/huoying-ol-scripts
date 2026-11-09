@@ -16,9 +16,10 @@ import numpy as np
 from PIL import Image, ImageGrab
 
 import hyol_scheduler as hs
-from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, read_json, calendar_task_plan
+from hyol_daily_tasks import DailyRunner, DailyScheduler, DEFAULT_SOLO_OPTIONS, SOLO_OPTIONS, LABELS, read_json, calendar_task_plan
 from hyol_daruma_task import verified as daruma_verified
 from hyol_escort import verified as escort_verified
+from hyol_errors import TaskUnavailable
 
 TAB_MARKER_CORE = "microclient_tab_close_core.bmp"
 TAB_CHROME_ROI = (0, 0, 1800, 39)
@@ -209,11 +210,13 @@ class MultiSoloRunner:
             from hyol_accounts import discover_accounts
             centers, mapping, _frames, unavailable = discover_accounts(s)
             self.tab_count = len(centers)
-            s.accounts = sorted(s.accounts, key=lambda a:a.tab_x)[:self.requested_account_count]
+            s.accounts = sorted((a for a in s.accounts
+                                 if a.index <= self.requested_account_count), key=lambda a:a.index)
             s.by_name = {a.name:a for a in s.accounts}
             s.available_account_names = set(s.by_name)
             self.configured_names = tuple(s.by_name)
-            self.initial_unavailable = {f'标签{slot}' for slot in unavailable}
+            self.initial_unavailable = {f'标签{slot}' for slot in unavailable
+                                        if slot <= self.requested_account_count}
             self.stall_checks = {a.name:0 for a in s.accounts}
             self.event('multi_solo_accounts_bound',online=sorted(s.by_name),pending=sorted(self.initial_unavailable))
             return
@@ -462,7 +465,18 @@ class MultiSoloRunner:
                 self.startup_pending[account.name] = '账号身份或当前页面未核实'
                 continue
             try:
-                self.return_account_to_origin(account)
+                context=getattr(self,'run_context',None)
+                prepared=(getattr(context,'binding',None) or {}).get('prepared_accounts',{}).get(account.name)
+                frame=self.scheduler.capture() if prepared else None
+                if (prepared and context.layout_matches(frame)
+                        and self.scheduler.verify_identity(account,frame)[0]
+                        and self.scheduler.main_ready(frame)
+                        and self.scheduler.template('leaf_village_name_current.bmp',(1690,110,1920,148),
+                                                    frame,threshold=.92)[0]):
+                    self.event('multi_solo_prepared_return_reused',account,
+                               evidence=prepared['evidence'],detail='本次检查已回村；当前身份和木叶画面复核通过，直接执行任务')
+                else:
+                    self.return_account_to_origin(account)
                 self.startup_returned.add(account.name)
                 self.startup_pending.pop(account.name, None)
             except hs.AccountOffline as exc:
@@ -643,6 +657,30 @@ class MultiSoloRunner:
             self.save_progress("account_check")
             return False
 
+    def check_combat_account(self, account, mode):
+        """An original battle may hide the HUD identity; retain its bound tab."""
+        context = getattr(self, 'run_context', None)
+        binding = getattr(context, 'binding', None)
+        if not isinstance(binding,dict) or not binding.get('resumed_original_binding'):
+            return self.check_account(account)
+        original_task = self.unresolved_combat_task(account)
+        request = self.scheduler.state.global_state.get('arena_requests', {}).get(account.name, {})
+        owned = (original_task == mode or mode == 'arena' and isinstance(request,dict)
+                 and request.get('status') in ('running','pending','limited','quota_exhausted'))
+        if not owned:
+            return self.check_account(account)
+        try:
+            self.scheduler.switch_account_for_combat(account,mode,original_task == mode)
+        except hs.AccountOffline:
+            self.skip_disconnected(account,mode)
+            return False
+        except hs.PendingError as exc:
+            self.event('multi_solo_original_combat_pending',account,task=mode,detail=str(exc))
+            return False
+        self.event('multi_solo_original_combat_observed',account,task=mode,
+                   detail='原场当前页面已按原标签绑定核对，继续原动作；未重新发起')
+        return True
+
     def _run_task(self, runner, task):
         s, account = self.scheduler, runner.account
         if task in getattr(self, 'blocked_tasks', {}).get(account.name, ()):
@@ -651,7 +689,7 @@ class MultiSoloRunner:
             return
         started_at = time.monotonic()
         rec = runner.record(task)
-        if (rec.get("status") == "done" and rec.get("task_completed")
+        if (task != 'grocery' and rec.get("status") == "done" and rec.get("task_completed")
                 and rec.get("home_returned") and not rec.get('followup_check_due')
                 and (task != 'daruma' or daruma_verified(rec))
                 and (task != 'arena' or account.name in getattr(self,'arena_rewards_audited',set()))):
@@ -673,7 +711,7 @@ class MultiSoloRunner:
                 s.recheck_arena_rewards(account)
             if task == 'daruma' and rec.get('task_completed') and not daruma_verified(rec):
                 raise hs.PendingError('达摩完成标记缺少奖励归零证据，保留待处理')
-            if not rec.get('task_completed'):
+            if not rec.get('task_completed') or task == 'grocery':
                 if (task == 'survival' and runner.visible(
                         'survival_anchor.bmp', (201,69,601,419))
                         and s.state.action_status(account.name, 'survival_battle_step_1') == 'done'):
@@ -722,6 +760,23 @@ class MultiSoloRunner:
             runner.save()
             self.skip_stalled(account, task, exc)
             return
+        except TaskUnavailable as exc:
+            rec.update(status='pending', task_completed=False, last_error=str(exc))
+            runner.save()
+            frame = s.capture()
+            if not (s.main_ready(frame) and s.verify_identity(account, frame)[0]
+                    and s.template('leaf_village_name_current.bmp', (1690,110,1920,148), frame,
+                                   threshold=.92)[0]):
+                runner.return_to_main()
+                frame = s.capture()
+            if not (s.main_ready(frame) and s.verify_identity(account, frame)[0]
+                    and s.template('leaf_village_name_current.bmp', (1690,110,1920,148), frame,
+                                   threshold=.92)[0]):
+                raise hs.LeaseBlocked('当前活动不可执行，关闭活动页后仍未确认本号回村') from exc
+            rec['home_returned'] = True
+            runner.save()
+            self.event('multi_solo_task_unavailable', account, task=task, detail=str(exc),
+                       task_completed=False, home_returned=True)
         except (hs.PendingError, hs.SafetyError) as exc:
             rec.update(status="pending", last_error=str(exc))
             runner.save()
@@ -822,7 +877,7 @@ class MultiSoloRunner:
                         or 'survival' in getattr(self, 'blocked_tasks', {}).get(account.name, ())):
                     self.note_skipped(account, 'survival')
                     continue
-                if not self.check_account(account):
+                if not self.check_combat_account(account,'survival'):
                     self.note_skipped(account, 'survival')
                     continue
                 s.navigator = runner
@@ -888,18 +943,20 @@ class MultiSoloRunner:
                 runner = runners[account.name]
                 record = runner.record('survival')
                 if s._account_module_complete(account, 'survival'):
+                    from hyol_task_progress import survival_execution_counts
                     runner.survival_inline_complete = True
                     record.update(status='done', task_completed=True, home_returned=True,
                                   followup_check_due=False, finished_at=hs.now_iso(), last_error='',
-                                  completed=2 if s.state.action_status(
-                                      account.name, 'survival_second_run_started') == 'done' else 1)
+                                  **survival_execution_counts(s.state.accounts.get(account.name, {})))
                     runner.save()
                     self.deferred.pop(account.name, None)
                     self.deferred_at.pop(account.name, None)
                     self.event('multi_solo_task_complete', account, task='survival',
                                task_completed=True, home_returned=True, followup_check_due=False)
                 else:
-                    detail = pending_detail or '生存演习尚有战斗、积分、领奖或重置状态待核实'
+                    module = getattr(s.state,'accounts',{}).get(account.name, {}).get('modules', {}).get('survival', {})
+                    detail = (module.get('detail') if isinstance(module,dict) and module.get('status')=='pending' else '')
+                    detail = detail or pending_detail or '生存演习尚有战斗、积分、领奖或重置状态待核实'
                     record.update(status='pending', task_completed=False, home_returned=False,
                                   last_error=detail)
                     runner.save()
@@ -1104,6 +1161,17 @@ class MultiSoloRunner:
         try:
             for configured in tuple(original_accounts):
                 account = s.by_name.get(configured.name, configured)
+                context = getattr(self,'run_context',None)
+                binding = getattr(context,'binding',None)
+                if isinstance(binding,dict) and binding.get('resumed_original_binding'):
+                    old = self.runner_for(account).record('arena')
+                    request = s.state.global_state.get('arena_requests',{}).get(account.name,{})
+                    same_goal = (isinstance(request,dict) and request.get('status')=='done'
+                                 and request.get('target_mode','wins')==self.arena_target_mode
+                                 and (self.arena_target_mode=='tickets' or request.get('requested_wins')==self.arena_wins))
+                    if (same_goal and old.get('status')=='done' and old.get('task_completed')
+                            and old.get('home_returned') and s._account_module_complete(account,'arena')):
+                        self.arena_rewards_audited.add(account.name)
                 if account.name in getattr(self, 'arena_rewards_audited', set()):
                     self.event('multi_solo_task_skip_done', account, task='arena',
                                detail='本轮已核实战令归零和奖励领取，不重复开启')
@@ -1121,7 +1189,7 @@ class MultiSoloRunner:
                                       last_error='账号本轮暂缓，未执行竞技场')
                         runner.save()
                     continue
-                if self.check_account(account):
+                if self.check_combat_account(account,'arena'):
                     runner = self.runner_for(account)
                     runners[account.name] = runner
                     record = runner.record('arena')
@@ -1218,14 +1286,19 @@ class MultiSoloRunner:
                                target_mode=self.arena_target_mode,
                                completed=s._arena_victory_count(account))
                 else:
-                    detail = pending_detail or '竞技场目标、战令归零或奖励领取尚未全部核实'
+                    module = getattr(s.state,'accounts',{}).get(account.name, {}).get('modules', {}).get('arena', {})
+                    detail = (module.get('detail') if isinstance(module,dict) and module.get('status')=='pending' else '')
+                    detail = detail or pending_detail or '竞技场目标、战令归零或奖励领取尚未全部核实'
                     request = s.state.global_state.get('arena_requests', {}).get(account.name, {})
-                    limited = isinstance(request, dict) and request.get('status') == 'limited'
+                    limited = isinstance(request, dict) and request.get('status') in ('limited','quota_exhausted')
                     record.update(status='pending', task_completed=False,
                                   home_returned=limited and request.get('home_returned') is True,
                                   followup_check_due=False, last_error=detail,
                                   arena_requested_wins=self.arena_wins,
                                   arena_target_mode=self.arena_target_mode)
+                    from hyol_arena_outcome import exhausted_record
+                    known=exhausted_record(s,account)
+                    if known:record.update(known)
                     runner.save()
                     self.event('multi_solo_task_pending', account, task='arena', detail=detail,
                                target_mode=self.arena_target_mode)
@@ -1299,10 +1372,10 @@ class MultiSoloRunner:
                 if not s.main_ready(s.capture()):
                     raise hs.PendingError('原生存战斗对账后未确认回村')
                 runner.survival_inline_complete = True
-                completed = (2 if s.state.action_status(account.name, 'survival_second_run_started') == 'done'
-                             else max(1, rec.get('completed', 0)))
+                from hyol_task_progress import survival_execution_counts
                 rec.update(status='done', home_returned=True, followup_check_due=False,
-                           task_completed=True, completed=completed, finished_at=hs.now_iso(), last_error='')
+                           task_completed=True, finished_at=hs.now_iso(), last_error='',
+                           **survival_execution_counts(s.state.accounts.get(account.name, {})))
                 runner.save()
                 self.event('multi_solo_survival_second_run_complete', account)
                 return
@@ -1331,19 +1404,19 @@ class MultiSoloRunner:
                 self._queue_survival_second_run(account, '原重置剩余次数1→0及部分积分已核实；不推断战斗次数')
             if runner.visible("survival_score_0.bmp", score, frame):
                 if s.state.action_status(account.name, "survival_second_run_started") != "done":
-                    if not (rec.get('task_completed') and rec.get('completed', 0) >= 1):
+                    if not (rec.get('task_completed') and max(rec.get('observed_complete_rounds', 0), rec.get('completed', 0)) >= 1):
                         raise hs.PendingError('0/220可见，但生存首轮完成记录不足')
                     self._queue_survival_second_run(account, '首轮完成后页面已显示0/220')
                     self.event('multi_solo_survival_reset_observed', account)
             elif s._survival_score_twenty_visible(frame):
-                if not (rec.get('task_completed') and rec.get('completed', 0) >= 1):
+                if not (rec.get('task_completed') and max(rec.get('observed_complete_rounds', 0), rec.get('completed', 0)) >= 1):
                     raise hs.PendingError('20/220可见，但生存首轮完成记录不足')
                 if s.state.action_status(account.name, 'survival_second_run_started') != 'done':
                     self._queue_survival_second_run(account, '首轮后页面已显示20/220，重置后的首场待续')
                 self.event('multi_solo_survival_reset_observed', account, score=20)
             elif s._survival_partial_score(frame) in (20,80,140,160,200):
                 if s.state.action_status(account.name, 'survival_second_run_started') != 'done':
-                    if not (rec.get('task_completed') and rec.get('completed', 0) >= 1
+                    if not (rec.get('task_completed') and max(rec.get('observed_complete_rounds', 0), rec.get('completed', 0)) >= 1
                             and s.state.action_status(account.name, 'survival_reset') == 'done'):
                         raise hs.PendingError('部分积分已识别，但首轮完成或原重置证据不足；不补记战斗')
                     self._queue_survival_second_run(account, '原重置已核实，部分积分从原下一场续作')
@@ -1353,9 +1426,12 @@ class MultiSoloRunner:
                 reset_exhausted = (runner.visible("survival_reset_zero_text.bmp", reset, frame)
                                    or runner.visible("survival_reset_zero_digit.bmp", reset, frame))
                 if reset_exhausted and runner.visible("survival_final_claimed.bmp", (1151,769,1451,1031), frame):
+                    s.claim_survival_rewards(account)
                     runner.close_page("survival")
                     rec.update(status='done', task_completed=True, home_returned=True,
                                followup_check_due=False, last_error='')
+                    from hyol_task_progress import survival_execution_counts
+                    rec.update(survival_execution_counts(s.state.accounts.get(account.name, {})))
                     runner.save()
                     self.event("multi_solo_survival_no_reset_needed", account)
                     return
@@ -1363,14 +1439,7 @@ class MultiSoloRunner:
                     s._ensure_survival_reset(account)
                     self._queue_survival_second_run(account, '生存首轮已核实重置，后置补跑')
                 elif runner.visible("survival_final_claimed.bmp", (1151, 769, 1451, 1031), frame):
-                    runner.close_page("survival")
-                    if not s.main_ready(s.capture()):
-                        raise hs.PendingError("生存无重置后未确认回村")
-                    rec.update(status='done', task_completed=True, home_returned=True,
-                               followup_check_due=False, last_error='')
-                    runner.save()
-                    self.event("multi_solo_survival_no_reset_needed", account)
-                    return
+                    raise hs.PendingError('生存奖励已领取，但剩余免费重置次数尚未确认；不把按钮缺失当作次数归零')
                 else:
                     raise hs.PendingError("生存已满分，但重置/最终领取状态无法唯一识别")
             else:
@@ -1385,7 +1454,9 @@ class MultiSoloRunner:
             if not s.main_ready(s.capture()):
                 runner.return_to_main()
             rec.update(status="done", home_returned=True, followup_check_due=False,
-                       task_completed=True, completed=2, finished_at=hs.now_iso(), last_error="")
+                       task_completed=True, finished_at=hs.now_iso(), last_error="")
+            from hyol_task_progress import survival_execution_counts
+            rec.update(survival_execution_counts(s.state.accounts.get(account.name, {})))
             runner.save()
             self.event("multi_solo_survival_second_run_complete", account)
         except hs.AccountOffline as exc:
@@ -1528,8 +1599,9 @@ class MultiSoloRunner:
         return True
 
     def finish_managed_accounts(self):
+        """Start managed mode last for accounts whose selected tasks settled."""
+        from hyol_managed import blocking_tasks
         self.scheduler._performance_task = 'managed'
-        """Start managed mode last, only for accounts with a complete solo run."""
         if not getattr(self, 'managed_enabled', True):
             self.event('multi_solo_managed_disabled', detail='本轮最后进入托管未勾选')
             return True
@@ -1537,10 +1609,9 @@ class MultiSoloRunner:
         if 'escort' in self.tasks:
             expected=getattr(self,'requested_account_count',None) or len(s.accounts)
             if (len(s.accounts)!=expected or getattr(self,'initial_unavailable',set())
-                    or any(not escort_verified(self.runner_for(a).record('escort')) for a in s.accounts)):
+                    or any(self.runner_for(a).record('escort').get('active') for a in s.accounts)):
                 self.event('multi_solo_managed_waiting_for_all_escort',
-                    detail='先完成全部所选账号的押镖及日常0/3核实，再统一逐号进入托管')
-                return True
+                    detail='部分账号押镖未决；保留其原路线，逐号为已完成全部任务的账号开启托管')
         for configured in tuple(s.accounts):
             if s.check_pause_boundary():
                 return False
@@ -1550,20 +1621,14 @@ class MultiSoloRunner:
             if account.name in self.excluded or account.name in self.deferred:
                 continue
             runner = self.runners.get(account.name)
-            if runner is None or any(
-                runner.record(task).get('status') != 'done'
-                or not runner.record(task).get('task_completed')
-                or not runner.record(task).get('home_returned')
-                or runner.record(task).get('followup_check_due')
-                or task == 'daruma' and not daruma_verified(runner.record(task))
-                or task == 'escort' and not escort_verified(runner.record(task))
-                for task in self.tasks
-            ):
+            blockers = blocking_tasks(runner, self.tasks) if runner is not None else list(self.tasks)
+            if runner is None or blockers:
                 self.event('multi_solo_managed_pending', account,
-                           detail='所选任务未全部完成、回村或生存补跑未结束')
+                           detail='最后托管暂未执行，以下任务仍未核实结束或回村：' + '、'.join(LABELS[t] for t in blockers))
                 continue
             if not self.check_account(account):
                 continue
+            observation=None
             try:
                 s.navigator = runner
                 observation = s.begin_task_observation(account, 'managed')
@@ -1584,7 +1649,8 @@ class MultiSoloRunner:
                 if s.active == account and not s.ensure_account_main_before_release(account, 'managed'):
                     raise hs.LeaseBlocked(f'{account.name}托管状态未核实，不能切换下一账号') from exc
             finally:
-                s.end_task_observation(observation, complete=runner.record('managed').get('status') == 'done')
+                if observation is not None:
+                    s.end_task_observation(observation, complete=runner.record('managed').get('status') == 'done')
                 s.navigator = None
             self.save_progress('managed')
         return True
@@ -1615,8 +1681,10 @@ class MultiSoloRunner:
             if context and context.binding is not None:
                 context.adopt_solo(s)
                 self.tab_count = len(context.binding['centers'])
-                self.initial_unavailable = {f'标签{i}' for i in context.binding['unavailable']}
-                s.accounts = s.accounts[:self.requested_account_count]
+                self.initial_unavailable = {f'标签{i}' for i in context.binding['unavailable']
+                                            if i <= self.requested_account_count}
+                s.accounts = sorted((a for a in s.accounts
+                                     if a.index <= self.requested_account_count), key=lambda a:a.index)
                 s.by_name = {a.name:a for a in s.accounts}
                 self.configured_names = tuple(s.by_name)
                 self.stall_checks = {a.name:0 for a in s.accounts}
@@ -1639,6 +1707,12 @@ class MultiSoloRunner:
             if not self.prepare_account_origins():
                 self.save_progress('paused')
                 return 2
+            if getattr(s,'daily_observation_enabled',False) is True:
+                from hyol_daily_observation import before_tasks
+                for account in tuple(s.accounts):
+                    if account.name not in self.startup_returned:continue
+                    s.switch_account(account)
+                    before_tasks(self.runner_for(account))
             for task in self.tasks:
                 if s.check_pause_boundary():
                     self.save_progress("paused")
@@ -1770,6 +1844,18 @@ class MultiSoloRunner:
                     if runner and runner.record("survival").get("followup_check_due") and self.check_account(account):
                         self._survival_followup(runner)
                 self.save_progress("survival_followup")
+            if getattr(s,'daily_observation_enabled',False) is True:
+                from hyol_daily_observation import scan
+                for account in tuple(s.accounts):
+                    runner=self.runners.get(account.name)
+                    if not runner or account.name in self.deferred or account.name in self.disconnected:continue
+                    changed=[t for t in self.tasks if runner.record(t).get('home_returned')
+                             and not runner.record(t).get('preexisting_complete')
+                             and (runner.record(t).get('status')=='done' or runner.record(t).get('outcome')=='quota_exhausted')]
+                    if not changed:continue
+                    s.switch_account(account)
+                    try:scan(runner,changed,force=True)
+                    except hs.PendingError as exc:self.event('daily_inspection_unavailable',account,detail=str(exc))
             if not self.finish_managed_accounts():
                 self.save_progress('paused')
                 return 2

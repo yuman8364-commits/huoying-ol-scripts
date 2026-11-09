@@ -15,10 +15,21 @@ from hyol_bond import BondRunner, BOND_ACCOUNT, MAX_BATTLES, target_reached
 from hyol_diagnostics import manual_pause_status, mark_manual_pause, run_id
 from tools.preflight_live import run as preflight_live
 
-VERSION = '2026.11.05.1-opencv'
-RELEASE_DATE = '2026-11-05'
+VERSION = '2026.11.09.24-opencv'
+RELEASE_DATE = '2026-11-09'
 EDITION = 'OpenCV版'
 BASELINE_VERSION = '2026.10.25.4-opencv'
+# The YOLO fast edition is the same source with a vision-profile package; the
+# packaged client INI carries ClientEdition=YOLO极速版 so the UI can display
+# the edition without a diverging source tree.  Recognition logic never
+# branches on the display edition.
+try:
+    from hyol_app_paths import read_client_edition as _read_client_edition
+    _detected_edition = _read_client_edition()
+    if _detected_edition:
+        EDITION = _detected_edition
+except Exception:
+    pass
 MODES = ('solo', 'multi', 'team', 'team_then_multi', 'arena', 'bond', 'weekend', 'treasure', 'puzzle', 'training_record', 'anniversary')
 INDEPENDENT_MODES = ('arena', 'bond', 'weekend', 'treasure', 'puzzle', 'training_record')
 
@@ -37,6 +48,7 @@ class RunRequest:
     team_tasks: tuple[str, ...] = DEFAULT_TASKS
     preformed_duos: bool = False
     preformed_pairs: tuple[tuple[int, int], ...] = ()
+    preformed_trio: tuple[int, ...] = ()
     bond_count: int = 5
     bond_stop_mode: str = 'battles'
     bond_target_mode: str = 'battles'
@@ -48,14 +60,50 @@ class RunRequest:
     arena_target_mode: str = 'tickets'
     escort_remaining: int = 0
     escort_prior_settled: bool = False
+    team_control: str = 'all_members'
+    training_arena_stop_policy: str = 'auto'
+    arena_second_skill: bool = False
+    grocery_items: tuple[str, ...] = ()
 
     def __post_init__(self):
+        from hyol_grocery import validate_items
+        if type(self.arena_second_skill) is not bool:
+            raise ValueError('竞技场第二技能须为开关')
+        object.__setattr__(self, 'grocery_items', validate_items(self.grocery_items))
+        if 'grocery' in self.tasks and not self.grocery_items:
+            raise ValueError('请在杂货屋二级设置中选择至少一种商品')
+        from hyol_current_team import CURRENT_TEAM_TASKS
+        if self.team_control not in ('all_members', 'current_account'):
+            raise ValueError('组队活动控制范围无效')
+        if self.training_arena_stop_policy not in ('auto', 'final_goal', 'tickets'):
+            raise ValueError('修行录竞技场结束条件无效')
+        current_team = self.mode == 'solo' and any(t in CURRENT_TEAM_TASKS for t in self.tasks)
+        if current_team:
+            object.__setattr__(self, 'team_control', 'current_account')
+            object.__setattr__(self, 'account_count', 1)
+            object.__setattr__(self, 'tasks', tuple(t for t in self.tasks if t != 'arena_3v3')
+                               + (('arena_3v3',) if 'arena_3v3' in self.tasks else ()))
+            if set(self.tasks) & {'bond', 'arena_3v3'}:
+                object.__setattr__(self, 'final_managed', False)
+        elif self.team_control == 'current_account' and self.mode != 'solo':
+            raise ValueError('仅当前账号的组队活动请在单人入口执行')
+        from hyol_arena_3v3 import TASK, validate_trio, normalize_tasks
+        if TASK in self.team_tasks and self.mode=='team_then_multi':
+            trio=validate_trio(self.preformed_trio)
+            if self.preformed_duos or self.preformed_pairs or 'bond' in self.team_tasks:
+                raise ValueError('三人3v3不能与二人羁绊或二人队设置混用')
+            object.__setattr__(self,'preformed_trio',trio)
+            object.__setattr__(self,'leaders',(trio[0],))
+            object.__setattr__(self,'team_tasks',normalize_tasks(self.team_tasks))
+            object.__setattr__(self,'formation','keep')
+        elif self.preformed_trio:
+            raise ValueError('三人队标签仅用于已有队伍的竞技场3v3')
         from hyol_bond_goals import validate_options, validate_pairs
         validate_options(self.bond_target_mode, self.bond_kill_target, self.bond_score_target, self.bond_team_goals)
         validate_pairs(self.preformed_pairs, self.leaders)
         if self.preformed_pairs and (not self.preformed_duos or self.mode != 'team_then_multi'):
             raise ValueError('指定配对仅用于已有二人队')
-        if (self.bond_target_mode != 'battles' or self.bond_team_goals) and self.mode != 'team_then_multi':
+        if (self.bond_target_mode != 'battles' or self.bond_team_goals) and self.mode != 'team_then_multi' and not (current_team and 'bond' in self.tasks and not self.bond_team_goals):
             raise ValueError('击杀数和掉分目标请在已有队伍的二人羁绊中设置')
         if self.bond_team_goals and (any(row[0] not in self.leaders for row in self.bond_team_goals) if self.leaders else False):
             raise ValueError('羁绊单队目标须对应本轮选择的队长标签')
@@ -89,8 +137,9 @@ class RunRequest:
         if not self.escort_remaining and self.escort_prior_settled:
             raise ValueError('未选择剩余押镖续做时不能使用交付确认')
         if self.mode in ('solo', 'multi', 'team_then_multi'):
+            allowed = (*SOLO_OPTIONS, *CURRENT_TEAM_TASKS) if self.mode == 'solo' else SOLO_OPTIONS
             if ((not self.tasks and self.mode != 'team_then_multi') or len(set(self.tasks)) != len(self.tasks)
-                    or any(task not in SOLO_OPTIONS for task in self.tasks)):
+                    or any(task not in allowed for task in self.tasks)):
                 raise ValueError('请至少选择一项有效的日常任务')
         if self.mode == 'team':
             TeamSelection(self.leader, () if self.friend_shortcut else self.members,
@@ -200,6 +249,14 @@ def make_runner(request, event_sink, root=hs.ROOT, *, run_context=None):
 def _make_runner(request, event_sink, root, run_context):
     """Construct an existing runner, not its GUI and not another worker."""
     root = Path(root)
+    directory=getattr(run_context,'directory',None)
+    if isinstance(directory,Path):
+        options=dict(arena_second_skill=request.arena_second_skill,grocery_items=list(request.grocery_items))
+        option_file=directory/'desktop_options.json'
+        previous=read_record(option_file)
+        if previous and previous!=options:
+            raise hs.PendingError('原运行的第二技能或杂货屋设置不同，请沿用原设置接续')
+        if not previous:hs.atomic_json(option_file,options)
     if request.mode == 'team_then_multi':
         original = getattr(run_context, 'pipeline_original_request_key', None)
         solo_tasks = tuple(original['tasks']) if isinstance(original, dict) else request.tasks
@@ -210,6 +267,7 @@ def _make_runner(request, event_sink, root, run_context):
                                     run_context=run_context, bond_count=request.bond_count,
                                     preformed_duos=request.preformed_duos,
                                     preformed_pairs=request.preformed_pairs,
+                                    preformed_trio=request.preformed_trio,
                                     bond_target_mode=request.bond_target_mode, bond_kill_target=request.bond_kill_target,
                                     bond_score_target=request.bond_score_target, bond_team_goals=request.bond_team_goals)
     elif request.mode in ('multi','anniversary'):
@@ -230,15 +288,28 @@ def _make_runner(request, event_sink, root, run_context):
                             keep_ready=True, stop_mode=request.bond_stop_mode)
     else:
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
-        runner = DailyRunner('all', selected_tasks=tasks, config_path=root/'DAILY_Client.ini',
+        from hyol_current_team import CurrentAccountRunner, CURRENT_TEAM_TASKS
+        runner_class = (CurrentAccountRunner if request.mode == 'solo'
+                        and any(t in CURRENT_TEAM_TASKS for t in tasks) else DailyRunner)
+        runner = runner_class('all', selected_tasks=tasks, config_path=root/'DAILY_Client.ini',
                              generic_current_window=True, formation=request.formation,
                              arena_wins=request.arena_wins, arena_target_mode=request.arena_target_mode,
                              managed_enabled=request.final_managed,
                              event_sink=event_sink)
+        if isinstance(runner, CurrentAccountRunner):
+            runner.desktop_request = request
         if request.mode == 'solo' and request.escort_remaining:
             runner.escort_remaining_only = request.escort_remaining
             runner.escort_prior_settled = request.escort_prior_settled
     prohibit_purchase(runner.scheduler)
+    runner.training_arena_stop_policy = request.training_arena_stop_policy
+    runner.scheduler.training_arena_stop_policy = request.training_arena_stop_policy
+    runner.scheduler.arena_second_skill = request.arena_second_skill
+    runner.scheduler.grocery_items = request.grocery_items
+    runner.scheduler.daily_observation_enabled = True
+    # Nested pipeline runners own a second scheduler; carry explicit options.
+    runner.arena_second_skill = request.arena_second_skill
+    runner.grocery_items = request.grocery_items
     if request.mode in INDEPENDENT_MODES:
         runner.scheduler.config['CurrentWindowOnly'] = '1'
     if preserve_activity_notices(request):
@@ -273,7 +344,10 @@ def completion_verified(request, runner, result):
         from hyol_anniversary import request_satisfied
         tasks = request.tasks if request.mode == 'solo' else (request.mode,)
         records = runner.records
-        return all(request_satisfied(records.get(task,{})) if task=='anniversary' else
+        from hyol_current_team import CURRENT_TEAM_TASKS
+        return all(runner.current_task_complete(task, records.get(task, {}))
+                   if task in CURRENT_TEAM_TASKS and request.team_control == 'current_account' else
+                   request_satisfied(records.get(task,{})) if task=='anniversary' else
                    records.get(task, {}).get('status') == 'done'
                    and records[task].get('task_completed') is True
                    and records[task].get('home_returned') is True
@@ -484,7 +558,9 @@ class RuntimeController:
             pipeline = request.mode == 'team_then_multi'
             if pipeline:
                 from hyol_team_resume import read_candidate as read_pipeline_candidate
-                candidate = read_pipeline_candidate(shared_directory(self.root),request)
+                candidate = read_pipeline_candidate(shared_directory(self.root),request,execution_day=local_day())
+                prior_arena=candidate if candidate and candidate.get('observe_new_scope') else None
+                if prior_arena:candidate=None
             else:
                 candidate = read_candidate(shared_directory(self.root),request) if training else None
             if candidate:self.identifier=candidate['run_id']
@@ -492,9 +568,12 @@ class RuntimeController:
                 execution_day=candidate['execution_day'] if candidate else local_day() if training or pipeline else None,
                 session_token=candidate['session_token'] if candidate else '')
             self.run_context = context
+            if request.mode == 'solo' and request.team_control == 'current_account':
+                context.current_team_request = request
             if pipeline:
                 context.pipeline_request = request
                 context.pipeline_resume = bool(candidate)
+                if prior_arena:context.pipeline_previous_arena_scope=prior_arena
                 if candidate:
                     context.pipeline_original_request_key = candidate['request_key']
                     context.pipeline_deferred_tasks = tuple(candidate.get('deferred_tasks', ()))
@@ -502,7 +581,9 @@ class RuntimeController:
             context.begin()
             if training:save_cursor(context,request,status='preparing',resumable=True)
             self.emit('unified_run_started',state_directory=str(context.directory))
-            self.emit('unified_status', detail='检查当前羁绊准备页……' if request.mode == 'bond' else '检查所选账号并自动回木叶村……')
+            self.emit('unified_status', detail='检查当前羁绊准备页……' if request.mode == 'bond' else
+                      '检查所选三人队；已在3v3时保留活动页面……' if request.preformed_trio else
+                      '检查所选账号并自动回木叶村……')
             with context.activate():
                 from hyol_preparation import scope_for_request
                 from hyol_training_resume import restore_binding, verify_resume_window
@@ -518,7 +599,9 @@ class RuntimeController:
                 else:
                     check = preflight_live(prepare_scope=scope_for_request(request),stop_event=context.stop,
                                            event_sink=self.sink,on_scheduler=lambda s:setattr(self,'scheduler',s),
-                                           preserve_bond=request.mode == 'bond')
+                                           preserve_bond=(request.mode == 'bond' or request.mode == 'solo'
+                                                          and request.team_control == 'current_account'
+                                                          and bool(set(request.tasks) & {'bond','arena_3v3'})))
                 if training and context.binding and check.get('preparation'):
                     context.binding['training_prepared_accounts']=[row['account'] for row in check.get('accounts',())
                                                                   if row.get('leaf_verified') and row.get('account')]
@@ -530,7 +613,9 @@ class RuntimeController:
                         raise KeyboardInterrupt('准备检查已停止')
                     if check.get('status') not in ('ready', 'pending'):
                         raise hs.SafetyError('准备检查已中止：'+str(check.get('reason', check.get('status'))))
-                    if not any(row.get('leaf_verified') is True for row in check.get('accounts',())):
+                    if not any(row.get('leaf_verified') is True or
+                               request.preformed_trio and row.get('activity_ready')=='arena_3v3'
+                               for row in check.get('accounts',())):
                         raise hs.PendingError('所选账号尚未确认回木叶村：'+str(check.get('reason','请查看逐号原因')))
                     check = preflight_live(stop_event=context.stop)
             if not (check.get('status') == 'ready' and check.get('healthy') is True

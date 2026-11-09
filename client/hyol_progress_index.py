@@ -22,6 +22,7 @@ class Projection:
     def __init__(self, tasks, action_task):
         self.tasks, self.action_task = tasks, action_task
         self.runs, self.bindings, self.health, self.cells = {}, {}, {}, {}
+        self.health_status = {}
         self.ended_runs, self.last_events, self.active_tasks = set(), {}, {}
         self.count, self.centers, self.started, self.last_key = 0, [], None, ('', -1)
 
@@ -32,6 +33,9 @@ class Projection:
         if kind in ('multi_solo_run_started', 'daily_task_started',
                     'generic_current_window_bound', 'combat_interleaved_start') and identifier:
             self.runs.setdefault(identifier, str(event.get('ts', '')))
+        if kind in ('multi_solo_run_started','daily_task_started','multi_solo_task_started',
+                    'combat_interleaved_start','unified_run_started') and identifier:
+            self.ended_runs.discard(identifier)
         if kind in ('multi_solo_run_end', 'daily_summary', 'emergency_stop', 'scheduler_stopped'):
             self.ended_runs.add(identifier)
         if kind == 'multi_solo_tabs_counted':
@@ -49,9 +53,12 @@ class Projection:
         if kind in ('account_offline', 'combat_account_offline_skipped',
                     'multi_solo_account_disconnected', 'multi_solo_account_disconnected_skipped',
                     'combat_watchdog_timeout', 'multi_solo_account_stalled'):
-            self.health[name] = event.get('detail') or ('已掉线：提示确认' if kind != 'combat_watchdog_timeout' else '掉线：30秒无变化')
+            stalled = kind in ('combat_watchdog_timeout','multi_solo_account_stalled')
+            self.health[name] = event.get('detail') or ('页面30秒无变化，结果待核实' if stalled else '已掉线：提示确认')
+            self.health_status[name] = 'pending' if stalled else 'offline'
         elif kind in ('account_verified', 'identity_bound', 'account_bound', 'combat_account_bound', 'multi_solo_start_return_verified'):
             self.health.pop(name, None)
+            self.health_status.pop(name, None)
         task = event.get('task') or event.get('mode')
         if task in self.tasks and kind in ('multi_solo_task_started', 'daily_task_started'):
             self.active_tasks[name] = task
@@ -250,6 +257,10 @@ class ProgressLogIndex:
             yield json.loads(data)
 
     def arena_wins(self, account):
-        return self.connection.execute('''SELECT COUNT(DISTINCT json_quote(COALESCE(
-            json_extract(data,'$.target'),json_extract(data,'$.index'))))
+        return self.connection.execute('''SELECT COUNT(DISTINCT CASE
+            WHEN json_type(data,'$.index')='integer' AND json_extract(data,'$.index')>0
+                THEN 'round:' || json_extract(data,'$.index')
+            WHEN json_type(data,'$.target')='text' AND length(json_extract(data,'$.target'))>0
+                THEN 'action:' || json_extract(data,'$.target')
+            ELSE NULL END)
             FROM events WHERE account=? AND kind='arena_victory_confirmed' ''', (account,)).fetchone()[0]

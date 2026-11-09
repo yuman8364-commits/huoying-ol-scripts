@@ -236,6 +236,8 @@ def collect_current_identity(scheduler, account, frame=None):
 
 
 def is_captain(scheduler, frame):
+    from hyol_arena_3v3 import page_visible, captain
+    if page_visible(frame,scheduler.templates):return captain(frame,scheduler.templates)
     return any(scheduler.template(asset,(0,69,45,149),frame,threshold=.95)[0] for asset in (
         'team_personal_leader_core.bmp','team_personal_leader_white_core.bmp',
         'team_personal_leader_text_core_current.bmp'))
@@ -262,7 +264,7 @@ def _final_result(scheduler, frame):
         for ok, _score, x, y in [scheduler.template(asset, roi, frame, threshold=.95)] if ok), None)
     if banner is None:
         return None
-    for asset in ('team_result_confirm.bmp', 'arena_result_confirm.bmp'):
+    for asset in ('team_result_confirm.bmp', 'arena_result_confirm.bmp', 'ranking_result_confirm.bmp'):
         ok, _score, x, y = scheduler.template(asset, hs.TEAM_BATTLE_RESULT_ROI, frame, threshold=.98)
         if ok:
             return asset, x, y, banner
@@ -447,6 +449,17 @@ def dismiss_current_final_result(scheduler, account, frame=None, *, _layers=0,
             parent = inspect(scheduler,frame)
             if parent is not None and parent[0] == 'arena_lobby':
                 frame = dismiss_identity_overlays(scheduler,account,frame)
+                deadline = time.monotonic()+12
+                stable = 0
+        if expected[0] == 'ranking_result_confirm.bmp' and following is None:
+            # Ranking acknowledgements return to their own lobby first.
+            # Close only that positively recognized parent through the same
+            # guarded UI journal; no ranking result/count is credited here.
+            from hyol_identity_overlays import inspect, dismiss_identity_overlays
+            parent = inspect(scheduler,frame)
+            if parent is not None and parent[0] == 'preparation_panel_ranking_page':
+                frame = dismiss_identity_overlays(scheduler,account,frame,
+                    only_kind='preparation_panel_ranking_page')
                 deadline = time.monotonic()+12
                 stable = 0
         if scheduler.main_ready(frame) and _final_result(scheduler, frame) is None:

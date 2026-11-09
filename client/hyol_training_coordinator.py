@@ -10,7 +10,7 @@ import uuid
 import hyol_scheduler as hs
 import hyol_training_record as training
 from hyol_checkpoints import complete
-from hyol_training_policy import arena_policy, local_day
+from hyol_training_policy import arena_policy, local_day, selected_arena_policy
 
 
 @contextmanager
@@ -301,7 +301,12 @@ class TreasureDriver(Driver):
             rec.clear()
             rec.update(status='new', phase='ready', training_cycles=history,
                        training_action_suffix=request['id'])
-        rec['training_single_cycle'] = True
+        # Rewards, traps and transformations do not prove one completed map.
+        # Keep the original finite timer unless the activity supplies a real
+        # map-completion counter; then stop at the locked quantity boundary.
+        rec['training_single_cycle'] = False
+        if type(rec.get('verified_maps_completed')) is int:
+            request.setdefault('base_maps_completed', rec['verified_maps_completed'])
         self.driver = TreasureRun(runner)
 
     def step(self):
@@ -311,11 +316,19 @@ class TreasureDriver(Driver):
             self.s.switch_account(self.r.account)
         else:
             switch_to(self.r)
+        count = rec.get('verified_maps_completed')
+        if (type(count) is int and type(self.request.get('base_maps_completed')) is int
+                and rec.get('map_completion_evidence')):
+            self.request.update(settled=max(0,count-self.request['base_maps_completed']),
+                                quantity_state='verified',quota_unit='maps')
+            if self.request['settled'] >= self.request['required']:
+                rec['verified_map_goal_reached'] = True
         done = self.driver.step()
         self.waiting = not done
         if done:
-            self.request.update(available=None, quantity_state='requires_goal_rescan', settled=None)
-            return self.finish('最小挖宝周期已停止并回村；完成数量以修行录复扫为准')
+            if not rec.get('map_completion_evidence'):
+                self.request.update(available=None, quantity_state='requires_goal_rescan', settled=None)
+            return self.finish('本次挖宝有界周期已停止并回村，仅定向核实藏宝图目标；不将弹窗数当地图数')
         return False
 
 
@@ -361,7 +374,11 @@ class AccountPlan:
         self.errors = self.rec.setdefault('errors', {})
         self.rec.setdefault('jobs', [])
         self.rec.update(status='running', task_completed=False, all_goals_complete=False,
-                        scheduler_version=2, home_returned=False)
+                         scheduler_version=3, home_returned=False)
+        self.exhausted = self.rec.setdefault('exhausted_tasks', {})
+        if self.rec.get('exhausted_day') != self.day:
+            self.exhausted.clear()
+            self.rec['exhausted_day'] = self.day
         active = self.rec.get('active_job')
         pending = training.unresolved_supported_tasks(runner)
         if isinstance(active, dict) and active.get('status') in ('running','waiting','pending'):
@@ -406,6 +423,15 @@ class AccountPlan:
         self.generator = training.refresh_goal_steps(self.r, label)
         self.rec.update(phase='collecting_rewards', current_task='', rewards_complete=False)
 
+    def _scan_task(self, task):
+        snapshot = self.rec.get('latest', {})
+        if snapshot.get('scan_version') == 2 and snapshot.get('scan_complete') is True:
+            self.generator = training.scan_task_steps(self.r, task, 'after_'+task, snapshot)
+            self.rec.update(phase='checking_series_boundary',current_task=task,rewards_complete=False)
+        else:
+            # Old/incomplete snapshots must first obtain a complete baseline.
+            self._scan('after_'+task)
+
     def _plan(self, snapshot):
         from hyol_task_order import load
         from hyol_training_resume import pending_prior_sources
@@ -418,7 +444,8 @@ class AccountPlan:
         self.errors.pop('scan',None)
         if not self.errors:self.rec['last_error']=''
         self.rec.update(latest=snapshot, daily_plan=plan,
-                        remaining=[row for row in snapshot['rows'] if not row.get('completed')])
+                        remaining=[row for row in snapshot['rows'] if not training.goal_complete(row)],
+                        series=training.series_summary(snapshot['rows']))
         self.rec.setdefault('before', snapshot)
         self.rec['after'] = snapshot
         if self.day != local_day():
@@ -427,7 +454,10 @@ class AccountPlan:
             return
         for item in plan['tasks']:
             if item['status'] != 'ready':continue
-            policy = arena_policy(self.day)['mode'] if item['task'] == 'arena' else 'goal'
+            if item['task'] in self.exhausted:
+                item.update(status='deferred',stop_reason=self.exhausted[item['task']])
+                continue
+            policy = arena_policy(self.day,selected_arena_policy(self.r))['mode'] if item['task'] == 'arena' else 'goal'
             key = job_key(item['task'], item['goals'], self.day, policy, self.r.account.name)
             previous = next((job for job in self.rec['jobs'] if job['id'] == key), None)
             if previous:
@@ -453,10 +483,17 @@ class AccountPlan:
         self._finish()
 
     def _finish(self):
+        if self.rec.get('latest',{}).get('scope') == 'task' and 'date' not in self.errors:
+            # Scoped updates cannot certify that another tier/series was not
+            # unlocked elsewhere. Exactly one full scan closes this batch.
+            self._scan('final')
+            return
         remaining = self.rec.get('remaining', [])
         verified = not remaining and not self.errors
+        supported_remaining = [row for row in remaining if row.get('task')]
         self.rec.update(status='done' if verified else 'pending', phase='verified' if verified else 'pending',
-                        task_completed=verified, all_goals_complete=verified, supported_tasks_complete=not self.errors,
+                        task_completed=verified, all_goals_complete=verified,
+                        supported_tasks_complete=not self.errors and not supported_remaining,
                         current_task='', home_returned=True, finished_at=hs.now_iso())
         self.r.save()
         self.done = True
@@ -472,8 +509,23 @@ class AccountPlan:
                 self._plan(result.value)
         elif self.driver is not None:
             request = self.rec['active_job']
+            resuming = self.rec.get('phase') == 'resuming_supported'
             with task_context(self.r, request):
                 finished = self.driver.step()
+            if resuming:
+                # Clear stale stop text only after the original driver has
+                # successfully observed its page. Keep the old diagnostic and
+                # every action/budget; this is not a completion receipt.
+                previous = dict(at=hs.now_iso(), task=request['task'],
+                                stop_reason=request.get('stop_reason',''),
+                                error=self.errors.get(request['task'],self.rec.get('last_error','')))
+                self.rec.setdefault('resume_observations',[]).append(previous)
+                self.rec.update(phase='executing',current_task=request['task'])
+                self.errors.pop(request['task'],None)
+                if not self.errors:self.rec['last_error']=''
+                if not finished:request['stop_reason']=''
+                self.r.event('training_task_resumed',task=request['task'],
+                             detail='原任务已恢复观察，继续核实结果；原场与剩余额度保留')
             request['status'] = request.get('status') if finished else ('waiting' if self.driver.waiting else 'running')
             self.r.save()
             if finished:
@@ -481,8 +533,13 @@ class AccountPlan:
                 self.rec.pop('active_job', None)
                 task = request['task']
                 self.errors.pop(task,None)
+                quota_zero=(request.get('available') == 0 and (
+                    task in ('ranking','quiz','escort')
+                    or task == 'arena' and request.get('target_mode') == 'tickets'))
+                if request.get('status') in ('exhausted','deferred') or quota_zero:
+                    self.exhausted[task]=request.get('stop_reason') or '本号可用次数已用完，最终目标保留待续'
                 self.driver = None
-                self._scan('after_'+task)
+                self._scan_task(task)
         self.next_at = time.monotonic()+(self.driver.interval if self.driver else .05)
 
     def pending(self, error):

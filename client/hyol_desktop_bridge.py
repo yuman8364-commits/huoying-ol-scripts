@@ -19,10 +19,16 @@ import time
 
 from hyol_runtime import RuntimeController, RunRequest, VERSION
 from hyol_task_progress import ProgressReader, local_day, shared_state
+from hyol_log_messages import present_event, chinese_text, error_message, task_label, LEVEL_LABELS
 
 
 def plain(value):
     return json.loads(json.dumps(value, ensure_ascii=False, default=str),parse_constant=lambda _value: None)
+
+
+def user_error(exc, prefix=''):
+    message,suggestion=error_message(str(exc))
+    return dict(ok=False,error=prefix+message,suggestion=suggestion,diagnostic=str(exc))
 
 
 def parse_request(payload):
@@ -36,17 +42,20 @@ def parse_request(payload):
     for name in ('account_count', 'arena_wins', 'leader', 'bond_count', 'bond_kill_target', 'bond_score_target', 'escort_remaining'):
         if type(result[name]) is not int:
             raise ValueError('账号、标签及次数必须是整数')
-    for name in ('friend_shortcut', 'new_bond_round', 'final_managed', 'escort_prior_settled', 'preformed_duos'):
+    for name in ('friend_shortcut', 'new_bond_round', 'final_managed', 'escort_prior_settled', 'preformed_duos', 'arena_second_skill'):
         if type(result[name]) is not bool:
             raise ValueError('开关必须为布尔值')
-    for name in ('mode', 'formation', 'arena_target_mode', 'bond_target_mode', 'bond_stop_mode'):
+    for name in ('mode', 'formation', 'arena_target_mode', 'bond_target_mode', 'bond_stop_mode',
+                 'training_arena_stop_policy', 'team_control'):
+        if name not in result:
+            continue
         if not isinstance(result[name], str):
             raise ValueError('任务类型或选项无效')
-    for name in ('tasks', 'team_tasks', 'members', 'leaders'):
+    for name in ('tasks', 'team_tasks', 'members', 'leaders', 'preformed_trio', 'grocery_items'):
         values = result[name]
-        if not isinstance(values, (list, tuple)) or len(values) > 20:
+        if not isinstance(values, (list, tuple)) or len(values) > (32 if name in ('tasks','team_tasks') else 20):
             raise ValueError('任务或标签列表无效')
-        expected = str if name in ('tasks', 'team_tasks') else int
+        expected = str if name in ('tasks', 'team_tasks', 'grocery_items') else int
         if any(type(v) is not expected for v in values):
             raise ValueError('任务或标签列表类型无效')
         result[name] = tuple(values)
@@ -89,7 +98,7 @@ def evidence_paths(record):
             for item in value:
                 add(item)
     for key, value in record.items():
-        if 'evidence' in key or key.endswith('_path') or key in ('puzzle', 'before', 'after', 'claims', 'combat_controls', 'goal_observation', 'member_results'):
+        if 'evidence' in key or key.endswith('_path') or key in ('puzzle', 'before', 'after', 'claims', 'combat_controls', 'goal_observation', 'member_results', 'daily_observation', 'transactions'):
             add(value)
     return list(dict.fromkeys(found))[-24:]
 
@@ -122,17 +131,57 @@ class DesktopBridge:
         self._slot_health = {}
         self._extras = {}
         self._logs = deque(maxlen=1000)
+        self._debug_logs = deque(maxlen=1000)
+        self._repeat_rows = {}
+        self._active_log_tasks = {}
+        self._log_write_warning = ''
         self._sequence = 0
         self._next_read = 0.0
         self._warnings = []
         self._allowed_evidence = set()
         self._close_notice = ''
         self._closed = False
+        self._reader_thread = None
+        self._generation = 0
+        from hyol_active_timer import ActiveTimer
+        from hyol_onboarding import Onboarding
+        from hyol_desktop_journal import DesktopJournal
+        self._timer = ActiveTimer(self._root/'logs/timing')
+        self._onboarding = Onboarding(self._root)
+        self._journal = DesktopJournal(self._root, VERSION,enabled=(self._root/'web/index.html').is_file())
+        self._journal.recover_recent()
 
-    def _log(self, event, message, account='系统', level='info', stamp=None):
+    def _log(self, event, message, account='系统', level='info', stamp=None, *, task='',
+             repeatable=False, suggestion='', diagnostic='', elapsed=None, next_check=None, repeat_context=''):
+        queue = self._debug_logs if level == 'debug' else self._logs
+        stamp = (stamp or datetime.now().isoformat())[11:19]
+        key = (event, account, task, level, str(message), repeat_context if repeatable else diagnostic)
+        row = self._repeat_rows.get(key) if repeatable else None
+        if row is not None and not any(item is row for item in queue):
+            row = None
+        if row is None and queue and all(queue[-1].get(k)==v for k,v in (
+                ('event',event),('message',str(message)),('account',account),('level',level),('task',task),('diagnostic',diagnostic))):
+            row = queue[-1]
         self._sequence += 1
-        self._logs.append(dict(id=self._sequence, time=(stamp or datetime.now().isoformat())[11:19],
-                               level=level, account=account, event=event, message=str(message)))
+        if row is not None:
+            row.update(id=self._sequence, time=stamp, repeat=row.get('repeat',1)+1,
+                       elapsed=elapsed, next_check=next_check, diagnostic=diagnostic)
+            return row
+        row = dict(id=self._sequence, time=stamp, first_time=stamp, level=level, account=account,
+                   event=event, message=str(message), task=task, task_label=task_label(task),
+                   repeat=1, suggestion=suggestion, diagnostic=diagnostic,
+                   elapsed=elapsed, next_check=next_check)
+        queue.append(row)
+        if repeatable:
+            self._repeat_rows[key] = row
+        # Bound metadata as well as the two display queues.
+        if len(self._repeat_rows) > 2000:
+            retained = {id(item) for item in (*self._logs, *self._debug_logs)}
+            self._repeat_rows = {key:value for key,value in self._repeat_rows.items() if id(value) in retained}
+        return row
+
+    def _visible_logs(self):
+        return sorted((*self._logs, *self._debug_logs), key=lambda row: row['id'])
 
     def _observe(self, event):
         with self._lock:
@@ -143,6 +192,7 @@ class DesktopBridge:
                 # worker after start() captured the fresh id; the event itself
                 # carries the authoritative run directory id.
                 self._run_id = str(owner)
+                self._timer.rebind(self._run_id)
             if name.startswith('unified_') and owner and owner != self._controller.identifier:
                 return
             if (not name.startswith('unified_') and owner and self._request
@@ -151,6 +201,8 @@ class DesktopBridge:
             account, index = event.get('account'), event.get('tab_index')
             if name == 'account_disconnected_skipped' and type(index) is int:
                 self._slot_health[index] = dict(status='offline',reason='已确认掉线提示，账号身份未绑定')
+            if name=='arena3v3_member_pending' and type(index) is int:
+                self._slot_health[index]=dict(status='pending',reason=str(event.get('detail') or '3v3成员待核实'))
             if name == 'dynamic_accounts_bound':
                 for slot, reason in event.get('unavailable', {}).items():
                     if str(slot).isdigit() and 1 <= int(slot) <= 6:
@@ -161,11 +213,31 @@ class DesktopBridge:
                     if name in ('account_bound','account_verified','identity_bound'):
                         self._slot_health.pop(index,None)
             label = f'标签 {index}' if type(index) is int else '系统'
-            text = event.get('detail') or event.get('reason') or event.get('message') or name
-            level = ('error' if 'error' in name or 'offline' in name or 'disconnected' in name else
-                     'warning' if any(k in name for k in ('pending', 'skipped', 'stop', 'not_open')) else
-                     'success' if any(k in name for k in ('complete', '_done', '_verified')) else 'info')
-            self._log(name, text, label, level, str(event.get('ts') or datetime.now().isoformat()))
+            display = present_event(event)
+            self._journal.observe(event, owner or self._run_id)
+            text, debug = display['message'], display['debug']
+            task = display['task'] or self._active_log_tasks.get(label, '')
+            if name.endswith(('_task_started','_stage_started')) and task:
+                self._active_log_tasks[label] = task
+                self._repeat_rows = {key:value for key,value in self._repeat_rows.items() if key[1] != label}
+            self._log(name, text, label, display['level'], str(event.get('ts') or datetime.now().isoformat()),
+                      task=task, repeatable=display['repeatable'], suggestion=display['suggestion'],
+                      diagnostic=display['diagnostic'], elapsed=event.get('seconds'),
+                      next_check=event.get('seconds_remaining'),
+                      repeat_context=(event.get('phase'),event.get('running'),event.get('status')))
+            warning = str(event.get('log_warning') or event.get('save_error') or '')
+            if warning and warning != self._log_write_warning:
+                message, suggestion = error_message('日志写入异常：' + warning)
+                self._log('log_write_warning',message,level='warning',suggestion=suggestion,diagnostic=warning)
+                self._log_write_warning = warning
+            if (name.endswith(('_task_started','_stage_started','_waiting','_task_complete',
+                               '_task_pending','_task_unavailable'))
+                    or name in ('combat_battle_started','combat_battle_finished','combat_module_done',
+                                'daily_ranking_battle_complete','daily_ranking_end_sent_yield',
+                                'daily_ranking_waiting_result_yield','survival_reward_observed',
+                                'daily_quiz_submitted')
+                    or name.startswith('arena3v3_')) and not debug:
+                self._detail=label+' · '+str(text)
             self._updated = datetime.now().isoformat(timespec='seconds')
             if name == 'unified_status' or name == 'unified_error':
                 self._detail = str(text)
@@ -194,16 +266,19 @@ class DesktopBridge:
                 self._leaders = plain(event.get('check', {}))
                 self._detail = '队长识别已结束，请核对标签。'
             elif name == 'unified_finished':
+                self._timer.stop()
                 self._receipt = plain(event)
                 self._status = event.get('status') if event.get('status') in ('complete', 'stopped', 'pending') else 'pending'
-                self._detail = str(event.get('detail') or {'complete':'本轮任务与收尾已确认。',
-                                                        'stopped':'本轮已停止。', 'pending':'本轮仍有待处理项。'}[self._status])
+                self._detail = chinese_text(event.get('detail'), text) or {'complete':'本轮任务与收尾已确认。',
+                                                        'stopped':'本轮已停止。', 'pending':'本轮仍有待处理项。'}[self._status]
                 if self._status == 'pending' and '所选活动当前未开放' in self._detail:
                     self._status = 'not_open'
                 self._next_read = 0
                 self._finish_bond_rows(event)
             elif name == 'unified_idle' and self._operation in ('check','leaders'):
                 self._status = self._precheck_status
+            elif name == 'unified_idle':
+                self._timer.stop()
             # unified_idle marks the end of an operation, not a new empty run.
             # In particular it must never overwrite pending/stopped/completed.
             self._observe_team(event)
@@ -217,11 +292,11 @@ class DesktopBridge:
         if not isinstance(account, str) or code not in task_codes(self._request):
             return
         status = None
-        if kind in ('generic_team_task_started', 'generic_team_managed_started', 'pipeline_team_tick'):
+        if kind in ('generic_team_task_started', 'generic_team_managed_started', 'pipeline_team_tick', 'current_team_task_started'):
             status = 'running'
-        elif kind in ('generic_team_task_pending', 'generic_team_managed_pending'):
+        elif kind in ('generic_team_task_pending', 'generic_team_managed_pending', 'current_team_task_pending'):
             status = 'pending'
-        elif kind in ('generic_team_task_done', 'generic_team_managed_complete'):
+        elif kind in ('generic_team_task_done', 'generic_team_managed_complete', 'current_team_task_done'):
             status = 'done'
         if status is None:
             return
@@ -231,10 +306,15 @@ class DesktopBridge:
         for owner, proof in targets:
             rec = self._extras.setdefault((owner, code), empty_record())
             paths = evidence_paths({'evidence':proof})
-            verified = status == 'done' and bool(paths) and (code == 'managed' or event.get('home_returned') is True)
+            kept_ready = (kind == 'current_team_task_done' and code in ('bond','arena_3v3')
+                          and event.get('completion_scope') == 'current_account' and event.get('activity_ready') is True)
+            verified = status == 'done' and bool(paths) and (kept_ready or code == 'managed' or event.get('home_returned') is True)
             rec.update(status='done' if verified else 'pending' if status == 'done' else status,
-                       task_completed=verified,home_returned=bool(verified and code != 'managed'),
+                       task_completed=verified,home_returned=bool(verified and code != 'managed' and not kept_ready),
                        evidence_paths=paths,last_error=str(event.get('detail') or ''))
+            if kind.startswith('current_team_'):
+                rec.update(completion_scope='current_account', activity_ready=kept_ready,
+                           ready_returned=kept_ready)
             if code == 'managed' and verified:
                 rec['evidence'] = paths[-1]
 
@@ -271,6 +351,8 @@ class DesktopBridge:
             with self._lock:
                 if self._closed or self._controller.busy:
                     return dict(ok=False, error='当前操作尚未结束，请先停止并等待结束。')
+                if (self._root/'web/index.html').is_file() and self._onboarding.load()['required']:
+                    return dict(ok=False,error='首次使用请先完成六组设置引导。',onboarding_required=True)
                 if not self._controller.start(request):
                     return dict(ok=False,error='运行层正在忙，请稍后重试。')
                 self._request, self._status, self._operation = request, 'running', 'run'
@@ -279,15 +361,21 @@ class DesktopBridge:
                 self._rows, self._bindings, self._extras = [], {}, {}
                 self._slot_health.clear()
                 self._logs.clear()
+                self._debug_logs.clear()
+                self._repeat_rows.clear()
+                self._active_log_tasks.clear()
+                self._log_write_warning = ''
                 self._receipt = self._last_check = self._leaders = None
                 self._allowed_evidence.clear()
                 self._warnings, self._close_notice = [], ''
                 self._detail = '正在创建新运行并核实游戏窗口。'
                 self._next_read = 0
                 self._run_id = self._controller.identifier
+                self._timer.begin(self._run_id)
+                self._generation += 1
                 return dict(ok=True,run_id=self._run_id)
         except (ValueError, TypeError) as exc:
-            return dict(ok=False,error=str(exc))
+            return user_error(exc)
 
     def stop(self):
         with self._lock:
@@ -298,8 +386,9 @@ class DesktopBridge:
                 return dict(ok=bool(stopped),error='' if stopped else '当前没有正在执行的操作。')
             except Exception as exc:
                 self._status = 'stopping'
-                self._detail = '停止已请求；暂停记录保存异常：'+str(exc)
-                return dict(ok=True,warning=self._detail)
+                message, suggestion = error_message(str(exc), '暂停记录保存异常。')
+                self._detail = '停止已请求；'+message
+                return dict(ok=True,warning=self._detail,suggestion=suggestion,diagnostic=str(exc))
 
     def _launch_check(self, operation, scope=None):
         with self._lock:
@@ -321,38 +410,74 @@ class DesktopBridge:
         try:
             return self._launch_check('check',validate_scope(scope) if scope is not None else None)
         except (TypeError,ValueError) as exc:
-            return dict(ok=False,error=str(exc))
+            return user_error(exc)
 
     def detect_leaders(self):
         return self._launch_check('leaders')
 
     def get_task_order(self):
         from hyol_task_order import load
+        result = load(self._root)
+        # A missing/broken standalone order must not replace a valid order
+        # restored from desktop_settings.json with generated defaults.
+        result['saved'] = (self._root/'desktop_task_order.json').is_file() and not bool(result.get('warning'))
+        return result
+
+    def get_client_settings(self):
+        from hyol_desktop_settings import load
         return load(self._root)
+
+    def get_onboarding(self):
+        return self._onboarding.load()
+
+    def acknowledge_onboarding(self, step):
+        try:
+            return self._onboarding.acknowledge(step)
+        except (OSError,ValueError) as exc:
+            return user_error(exc)
+
+    def complete_onboarding(self, config):
+        if self._controller.busy:
+            return dict(ok=False,error='请先等待当前操作结束')
+        if len(self._onboarding.load()['steps']) != 6:
+            return dict(ok=False,error='请先看完六组设置')
+        saved = self.save_client_settings(config)
+        if not saved.get('ok'):
+            return saved
+        try:
+            return self._onboarding.finish()
+        except (OSError,ValueError) as exc:
+            return user_error(exc)
+
+    def save_client_settings(self,config):
+        from hyol_desktop_settings import save
+        with self._lock:
+            if self._closed or self._controller.busy:
+                return dict(ok=False,error='请在本轮停止后保存下一次使用的设置。')
+        try:
+            return save(self._root,config)
+        except (OSError,ValueError,TypeError) as exc:
+            return user_error(exc,'设置未保存：')
 
     def save_task_order(self, order):
         from hyol_task_order import save
-        with self._lock:
-            try:
-                return save(self._root, order)
-            except (OSError, ValueError, TypeError) as exc:
-                return dict(ok=False, error=str(exc))
+        try:
+            return save(self._root, order)
+        except (OSError, ValueError, TypeError) as exc:
+            return user_error(exc)
 
-    def _read_pipeline(self):
+    def _read_pipeline(self, record=None):
         if not self._request or self._request.mode != 'team_then_multi':
             return
         path = shared_state(self._root)/'runs'/self._run_id/'team_pipeline_latest.json'
-        try:
-            record = json.loads(path.read_text('utf-8-sig'))
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError) as exc:
-            self._warnings.append('组队进度待刷新：'+str(exc))
-            return
+        if record is None:return
         if record.get('id') != self._run_id:
             return
-        keys = {'group':'group_instance','strong':'strong_approach','wanted':'wanted','bond':'bond'}
+        keys = {'group':'group_instance','strong':'strong_approach','wanted':'wanted','bond':'bond','arena_3v3':'arena_3v3'}
         for team in record.get('teams', {}).values():
+            if self._request.preformed_trio and len(team.get('members',[]))==3:
+                for index,owner in zip(self._request.preformed_trio,team['members']):
+                    self._bindings[index]=owner
             for key, item in team.get('tasks', {}).items():
                 code = keys.get(key)
                 if code not in task_codes(self._request) or not isinstance(item, dict):
@@ -370,7 +495,10 @@ class DesktopBridge:
                 if rec.get('status') == 'done' and not verified:
                     rec['status'], rec['task_completed'] = 'pending', False
                 if not verified and rec.get('availability',{}).get('status') == 'not_open':
-                    rec.update(status='skipped',last_error='该活动当前未开放，未计完成。')
+                    if code=='arena_3v3' and rec.get('phase')=='waiting_open':
+                        rec.update(status='running',phase_label='等待匹配开放',
+                            last_error='等待3v3匹配开放：10:00–14:00、18:00–22:00；队伍与原凭据保留。')
+                    else:rec.update(status='skipped',last_error='该活动当前未开放，未计完成。')
                 rec['evidence_paths'] = paths
                 for account in team.get('members', []):
                     current = deepcopy(rec)
@@ -382,21 +510,28 @@ class DesktopBridge:
                         if observed:
                             current['bond_current_score'] = observed['score']
                             current['bond_current_kills'] = f'已领至{observed.get("claimed_tier",0)}人档；累计{observed["kills"]}；本档{observed.get("tier_kills",observed["kills"])}/{observed["kill_cap"]}'
+                    if code=='arena_3v3':
+                        member=rec.get('members',{}).get(account,{})
+                        current['arena3v3']=deepcopy(member)
+                        current['completed']=sum(v.get('state')=='claimed' for v in member.get('rewards',{}).values())
+                        current['requested']=6
                     self._extras[(account,code)] = current
+                    if code=='arena_3v3' and self._request.preformed_trio:
+                        try:slot_index=self._request.preformed_trio[team.get('members',[]).index(account)]
+                        except (ValueError,IndexError):continue
+                        for row in self._rows:
+                            if row['index']==slot_index and row.get('account'):
+                                self._extras[(row['account'],code)]=deepcopy(current)
 
     def _snapshot(self):
         if not self._request or not self._run_id:
             return None
-        if time.monotonic() >= self._next_read:
-            self._next_read = time.monotonic()+2
-            try:
-                observed = self._reader.load(self._day,self._run_id)
-                self._rows = deepcopy(observed['rows'])
-                self._warnings = list(observed.get('warnings', []))
-                self._read_pipeline()
-            except (OSError, ValueError, TypeError, KeyError) as exc:
-                self._warnings = ['进度待刷新，保留已有核实结果：'+str(exc)]
+        self._queue_refresh()
         rows = {r['index']: deepcopy(r) for r in self._rows}
+        if self._request.preformed_trio:
+            rows={i:r for i,r in rows.items() if i in self._request.preformed_trio}
+            for index in self._request.preformed_trio:
+                rows.setdefault(index,dict(index=index,account=None,health='身份待核实',tasks={}))
         for index, name in self._bindings.items():
             rows.setdefault(index,dict(index=index,account=name,health='已绑定',tasks={}))
         for index in self._slot_health:
@@ -404,6 +539,12 @@ class DesktopBridge:
         if self._request.mode in ('multi','anniversary'):
             for index in range(1,self._request.account_count+1):
                 rows.setdefault(index,dict(index=index,account=None,health='身份待核实',tasks={}))
+        elif self._request.mode not in ('team','team_then_multi') and not self._request.preformed_trio:
+            # A current-window run may be on physical tab 4. The history
+            # projection pads 1..4, but those preceding slots were never
+            # selected. Keep observed identities and explicit offline slots.
+            observed=set(self._bindings)|set(self._slot_health)
+            rows={index:row for index,row in rows.items() if row.get('account') or index in observed}
         codes = task_codes(self._request)
         accounts = []
         allowed = set()
@@ -427,22 +568,57 @@ class DesktopBridge:
                     rec.update(status='pending',task_completed=False,last_error=rec.get('last_error') or self._detail)
                 for path in rec['evidence_paths']:
                     allowed.add(str(Path(path).resolve()))
+                if rec.get('last_error'):
+                    rec['error_diagnostic'] = str(rec['last_error'])
+                    rec['last_error'], rec['error_suggestion'] = error_message(rec['last_error'])
+                if rec.get('phase'):
+                    rec['phase_label'] = chinese_text(rec['phase'], task_label(rec['phase']) or '状态待核实')
                 tasks[code] = rec
             accounts.append(dict(slot=index,label=f'标签 {index}',account=name,
                                  identity='本轮账号已关联' if name else '身份待核实',
-                                 health=row.get('health') or '身份待核实',tasks=tasks))
+                                 health=chinese_text(row.get('health'),'账号状态待核实') or '身份待核实',tasks=tasks))
         self._allowed_evidence = allowed
-        return dict(runId=self._run_id,day=self._day,startedAt=self._started,updatedAt=self._updated,
-                    status=self._status,taskCodes=codes,accounts=accounts,warning='；'.join(self._warnings),
-                    logs=list(self._logs),detail=self._detail)
+        return dict(runId=self._run_id,day=self._day,startedAt=self._started,updatedAt=self._updated,**self._timer.snapshot(),
+                    status=self._status,taskCodes=codes,accounts=accounts,warning='；'.join(chinese_text(item,'进度读取暂不可用，保留上次已核实记录。') for item in self._warnings),
+                    logs=self._visible_logs(),detail=chinese_text(self._detail))
 
     def get_state(self):
         with self._lock:
+            if not self._controller.busy:
+                self._timer.stop()
             return plain(dict(version=VERSION,mode='native',busy=self._controller.busy,
-                              operation=self._operation,status=self._status,detail=self._detail,
+                              operation=self._operation,status=self._status,detail=chinese_text(self._detail),
                               snapshot=self._snapshot(),last_check=self._last_check,
-                              leaders=self._leaders,close_notice=self._close_notice,
+                              leaders=self._leaders,close_notice=self._close_notice,log_directory=str(self._journal.base),
+                              log_warning=self._journal.warning,
+                              logs=self._visible_logs() if not self._request else [],
                               request=asdict(self._request) if self._request else None))
+
+    def _queue_refresh(self):
+        if self._closed or self._reader_thread is not None or time.monotonic()<self._next_read:
+            return
+        day, run_id, generation = self._day, self._run_id, self._generation
+        def refresh():
+            try:
+                observed=self._reader.load(day,run_id)
+                path=shared_state(self._root)/'runs'/run_id/'team_pipeline_latest.json'
+                record=json.loads(path.read_text('utf-8-sig')) if path.is_file() else {}
+                with self._lock:
+                    if not self._closed and generation==self._generation and run_id==self._run_id:
+                        self._rows=deepcopy(observed['rows'])
+                        self._warnings=list(observed.get('warnings',[]))
+                        self._read_pipeline(record)
+            except (OSError,ValueError,TypeError,KeyError) as exc:
+                with self._lock:
+                    if generation==self._generation:
+                        self._warnings=['进度待刷新，保留已有核实结果：'+str(exc)]
+            finally:
+                with self._lock:
+                    self._next_read=time.monotonic()+2
+                    self._reader_thread=None
+                if self._closed:self._reader.close()
+        self._reader_thread=threading.Thread(target=refresh,name='hyol-progress-reader',daemon=True)
+        self._reader_thread.start()
 
     def read_evidence(self, value):
         with self._lock:
@@ -466,29 +642,47 @@ class DesktopBridge:
                 return dict(ok=True,data_url='data:'+mimetypes.guess_type(path.name)[0]+';base64,'+
                             base64.b64encode(data).decode('ascii'),path=str(path))
             except (OSError,ValueError,TypeError) as exc:
-                return dict(ok=False,error=str(exc))
+                return user_error(exc)
 
-    def export_logs(self):
+    def export_logs(self, filters=None):
         with self._lock:
             try:
-                folder = self._root/'logs'/'exports'
+                filters = filters if isinstance(filters, dict) else {}
+                level, account, task = (str(filters.get(key) or 'all') for key in ('level','account','task'))
+                query = str(filters.get('query') or '').lower().strip()
+                after = filters.get('after_id', 0)
+                if type(after) is not int or after < 0:
+                    raise ValueError('日志筛选位置无效')
+                rows = [row for row in self._visible_logs() if row['id'] > after
+                        and (row['level'] != 'debug' if level == 'all' else row['level'] == level)
+                        and (account == 'all' or row['account'] == account)
+                        and (task == 'all' or row.get('task') == task)
+                        and (not query or query in ' '.join(str(row.get(key,'')) for key in
+                             ('account','event','message','suggestion','task_label')).lower())]
+                folder = self._journal.folder(self._run_id)/'筛选导出' if self._run_id else self._journal.base/'筛选导出'
                 folder.mkdir(parents=True,exist_ok=True)
-                path = folder/f'visible-log-{time.time_ns()}.txt'
-                lines = ['火影OL 本轮界面日志（最近1000条；完整运行记录见logs）']
-                lines.extend('\t'.join(str(row[k]) for k in ('time','level','account','event','message')) for row in self._logs)
+                path = folder/f'筛选日志_{datetime.now():%Y年%m月%d日_%H点%M分%S秒}_{time.time_ns()}.txt'
+                lines = ['火影OL 当前筛选日志（业务与诊断分别保留最近1000条；完整记录见日志目录）']
+                for row in rows:
+                    repeat = f"（累计{row.get('repeat',1)}次，首次{row.get('first_time',row['time'])}）" if row.get('repeat',1)>1 else ''
+                    lines.append('\t'.join((row['time'], LEVEL_LABELS.get(row['level'],'信息'),row['account'],
+                                           row.get('task_label',''),row['message']+repeat,row.get('suggestion',''))))
+                    if level == 'debug':
+                        lines.append('原始诊断：'+row.get('diagnostic',row['event']))
                 path.write_text('\n'.join(lines)+'\n','utf-8-sig')
-                return dict(ok=True,path=str(path))
-            except OSError as exc:
-                return dict(ok=False,error=str(exc))
+                return dict(ok=True,path=str(path),count=len(rows))
+            except (OSError,ValueError) as exc:
+                message, suggestion = error_message(str(exc), '日志导出失败。')
+                return dict(ok=False,error=message,suggestion=suggestion,diagnostic=str(exc))
 
     def open_logs(self):
         try:
-            path = self._root/'logs'
+            path = self._journal.folder(self._run_id) if self._run_id else self._journal.base
             path.mkdir(parents=True,exist_ok=True)
             os.startfile(str(path))
             return dict(ok=True)
         except OSError as exc:
-            return dict(ok=False,error=str(exc))
+            return user_error(exc)
 
     def _can_close(self):
         with self._lock:
@@ -499,8 +693,10 @@ class DesktopBridge:
 
     def _close(self):
         with self._lock:
+            self._timer.stop()
+            self._journal.close()
             self._closed = True
-            self._reader.close()
+            if self._reader_thread is None:self._reader.close()
             self._rows.clear()
             self._extras.clear()
             self._allowed_evidence.clear()

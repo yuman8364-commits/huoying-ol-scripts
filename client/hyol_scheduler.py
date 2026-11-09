@@ -95,6 +95,25 @@ ARENA_SLOT_PENDING_LIMIT = 3
 SURVIVAL_SLOT_PENDING_LIMIT = 6
 ARENA_STALE_PENDING_SECONDS = 900
 IDENTITY_ROI = (105, 72, 250, 104)
+# 20261106 ZCode: identity strip masks are pure functions of the enrolled
+# bitmap.  Re-opening and re-masking every enrolled file on every verification
+# call dominated multi-account switching, so results are cached per
+# (path, mtime_ns, size); any file change misses the cache and re-masks.
+_IDENTITY_REFERENCE_CACHE: dict[tuple[str, int, int], object] = {}
+
+
+def _identity_reference_mask(path):
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    cached = _IDENTITY_REFERENCE_CACHE.get(key)
+    if cached is None:
+        with Image.open(path) as reference_image:
+            cached = identity_text_mask(reference_image.crop(
+                (0, 0, IDENTITY_ROI[2] - IDENTITY_ROI[0], IDENTITY_ROI[3] - IDENTITY_ROI[1])))
+        if len(_IDENTITY_REFERENCE_CACHE) >= 64:
+            _IDENTITY_REFERENCE_CACHE.clear()
+        _IDENTITY_REFERENCE_CACHE[key] = cached
+    return cached
 POWER_ROI = (92, 112, 315, 153)
 
 # The online-gift page renders three independent claim cards.  The old
@@ -560,12 +579,16 @@ def arena_poll_interval(slot: CombatSlot) -> float:
                 slot.poll_phase, ARENA_POLL_INTERVAL_SECONDS)
 
 
-def check_combat_slot_watchdog(scheduler, slot, frame, *, now=None):
+def check_combat_slot_watchdog(scheduler, slot, frame, *, now=None, sampling_phase=None):
     watchdog = getattr(slot, 'battle_watchdog', None)
     if watchdog is None or getattr(slot, 'battle_watchdog_index', 0) != slot.next_index:
         watchdog = BattleWatchdog.from_config(getattr(scheduler, 'config', {}), started_at=now)
         slot.battle_watchdog = watchdog
         slot.battle_watchdog_index = slot.next_index
+    if sampling_phase is not None and watchdog.sampling_phase != sampling_phase:
+        watchdog.sampling_phase = sampling_phase
+        # All arena samples have the same shape. A phase label alone must
+        # never reset the clock; the newly sampled pixels must actually change.
     check_battle_watchdog(scheduler, watchdog, slot.account, frame,
                          f'{slot.mode}_battle_{slot.next_index}', mode=slot.mode, now=now)
 
@@ -590,6 +613,10 @@ GUARD_ANCHOR_ROIS = {
 class Scheduler:
     def release_resources(self):
         """Release disposable recognition buffers, without touching ledgers."""
+        if not getattr(self, 'run_context', None):
+            shutdown = getattr(self, '_f12_monitor_shutdown', None)
+            if shutdown is not None:
+                shutdown.set()
         self._last_frame = None
         templates = getattr(self, 'templates', None)
         if templates is not None:
@@ -599,6 +626,15 @@ class Scheduler:
             detector.cached_frame = None
             detector.cached_predictions = []
             detector.session = None
+        # 20261106 ZCode: persistent JSONL handles must not outlive the run on
+        # Windows — an open handle blocks temp-dir cleanup and log rotation.
+        # Any event logged after this point simply reopens its handle.
+        log = getattr(self, 'log', None)
+        if log is not None and hasattr(log, 'close'):
+            log.close()
+        for account_log in getattr(self, 'account_logs', {}).values():
+            if hasattr(account_log, 'close'):
+                account_log.close()
 
     def __init__(
         self,
@@ -793,9 +829,11 @@ class Scheduler:
             if context.monitor_started:
                 return
             context.monitor_started = True
+        shutdown = threading.Event()
+        self._f12_monitor_shutdown = shutdown
         def monitor() -> None:
             was_down = False
-            while not self.stop.is_set():
+            while not self.stop.is_set() and not shutdown.is_set():
                 down = Win32.f12_down()
                 if down and not was_down:
                     if context:
@@ -806,7 +844,8 @@ class Scheduler:
                 was_down = down
                 time.sleep(0.05)
 
-        threading.Thread(target=monitor, name="F12Monitor", daemon=True).start()
+        self._f12_monitor_thread = threading.Thread(target=monitor, name="F12Monitor", daemon=True)
+        self._f12_monitor_thread.start()
 
     def check_stop(self) -> None:
         if self.stop.is_set():
@@ -1137,6 +1176,43 @@ class Scheduler:
         if getattr(frame, '_hyol_chrome_only', False):
             raise SafetyError('browser-only discovery frame cannot authorize a content template')
         result = self.templates.match(frame, ASSETS / name, roi, threshold)
+        if name == TEAM_REWARD_RESULT_TEMPLATE and self._strong_score_result_visible(frame):
+            # The following score page has a separate acknowledgement.
+            result = (False, 0., -1, -1)
+        elif name == TEAM_REWARD_RESULT_TEMPLATE and not result[0]:
+            # This reward skin says 查看分数. Require the independent cleared
+            # reward header and the opaque button text, preserving its center.
+            core = ASSETS / 'strong_reward_score_core_20261109.bmp'
+            if core.is_file():
+                title = self.templates.match(frame, ASSETS / 'team_reward_result_header_current.bmp',
+                                             (780,340,1140,470), .98)
+                found = self.templates.match(frame, core, (850,610,1060,700), .98) if title[0] else (False,0.,0,0)
+                if found[0]:
+                    shape = self.templates.load(ASSETS / name).shape[:2]
+                    x, y = found[2] - 23, found[3] - 8
+                    if roi[0] <= x and roi[1] <= y and x + shape[1] <= roi[2] and y + shape[0] <= roi[3]:
+                        result = (True, found[1], x, y)
+                        self.templates.last_match_size = shape
+        if name == 'ranking_toolbar.bmp' and not result[0]:
+            # The outer ring is translucent over the village. The approved
+            # opaque building interior preserves the old target coordinates.
+            core=ASSETS/'ranking_toolbar_core_20261109.bmp'
+            if core.is_file():
+                matched,score,x,y=self.templates.match(frame,core,roi,threshold=.98)
+                shape=self.templates.load(ASSETS/name).shape[:2]
+                if matched and roi[0]<=x-6 and roi[1]<=y-6 and x-6+shape[1]<=roi[2] and y-6+shape[0]<=roi[3]:
+                    result=(True,score,x-6,y-6)
+                    self.templates.last_match_size=shape
+        if name == 'grocery_toolbar.bmp' and not result[0]:
+            # The horse artwork animates; its opaque 杂货屋 caption is stable.
+            core = ASSETS/'grocery_toolbar_label_core_20261109.bmp'
+            if core.is_file():
+                matched,score,x,y = self.templates.match(frame,core,roi,threshold=.98)
+                shape = self.templates.load(ASSETS/name).shape[:2]
+                x,y = x-6,y-48
+                if matched and roi[0]<=x and roi[1]<=y and x+shape[1]<=roi[2] and y+shape[0]<=roi[3]:
+                    result = (True,score,x,y)
+                    self.templates.last_match_size = shape
         # The reconnect dialog has multiple live skins with identical safety
         # meaning.  Either positive template classifies the tab as offline;
         # neither path authorizes clicking the dialog.
@@ -1231,8 +1307,7 @@ class Scheduler:
             if not account.identity_path.exists():
                 scores[account.name] = -1.0
                 continue
-            with Image.open(account.identity_path) as reference_image:
-                reference = identity_text_mask(reference_image.crop((0, 0, IDENTITY_ROI[2] - IDENTITY_ROI[0], IDENTITY_ROI[3] - IDENTITY_ROI[1])))
+            reference = _identity_reference_mask(account.identity_path)
             # Weight the server prefix so accounts with similar suffixes are
             # not confused by a changing map background.
             full_score = mask_f1(reference, current)
@@ -1465,7 +1540,11 @@ class Scheduler:
         # tab's close button during that reflow.
         self._validate_tab_binding(account)
         self.chrome_click(account.tab_x, 10, f"switch_tab:{account.name}", account)
-        time.sleep(1.0)
+        # 20261106 ZCode: the fixed 1.0s repaint wait was the largest
+        # per-switch cost (553 switches per 5 metered runs).  0.4s covers the
+        # common repaint; a stale frame is re-sampled by the read-only verify
+        # loop below instead of paying the full sleep before any check.
+        time.sleep(0.4)
         frame = self.capture()
         if not self.healthy(frame):
             frame = self.recover_white_tab(account)
@@ -1535,15 +1614,17 @@ class Scheduler:
             # check; never repeat a content click or an irreversible action.
             # Give a shared Flash tab a bounded repaint window before declaring
             # the identity ambiguous. This is a read-only check and cannot
-            # duplicate a content action.
-            for _ in range(10):
+            # duplicate a content action.  20261106 ZCode: the first re-sample
+            # comes sooner (0.3s) since the leading sleep shrank to 0.4s; the
+            # remaining steps keep the original 0.8s window.
+            for attempt in range(10):
                 # A low but non-zero score is often a stale repaint and can
                 # even favour another same-server account.  Wait for the
                 # requested account's strict margin, rather than accepting any
                 # non-empty text as proof of identity.
                 if ok:
                     break
-                self.wait_interruptible(0.8)
+                self.wait_interruptible(0.3 if attempt == 0 else 0.8)
                 frame = self.capture()
                 if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
                     raise PendingError("account is offline and requires manual login; content clicks disabled")
@@ -1640,6 +1721,9 @@ class Scheduler:
         # are not sufficient and can drag the client when the page is absent.
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
             raise PendingError("offline login prompt requires manual login")
+        from hyol_navigation import group_card_result_visible
+        if group_card_result_visible(self, frame):
+            return False  # Only the original group handler may acknowledge it.
         from hyol_managed import first_card_prompt_visible
         if first_card_prompt_visible(self, frame):
             # Spending a card belongs to the audited managed start, even when
@@ -2353,6 +2437,16 @@ class Scheduler:
                 return self._content_guard_once(account, anchors, anchor_threshold)
             except SafetyError as exc:
                 message = str(exc)
+                if (set(anchors) & {'treasure_battle_victory.bmp', 'treasure_result_anchor.bmp',
+                                    'treasure_reward_title_20261030.bmp'}
+                        and (message.startswith('page anchor guard failed:')
+                             or message.startswith('identity and page-anchor guard failed: scores={} '))):
+                    # This result auto-closes. Its owner reconciles a still-new
+                    # action against the fresh world/battle frame; waiting here
+                    # for the old banner to return strands all other accounts.
+                    self.event('treasure_result_guard_changed',account,
+                               detail='挖宝结算画面已变化，交回原流程核对；未发送确认')
+                    raise
                 retry = message.startswith('page anchor guard failed:')
                 if message.startswith('identity and page-anchor guard failed: scores={} '):
                     # Modal pages hide the role strip. Observe a repaint only
@@ -2405,6 +2499,10 @@ class Scheduler:
         if self.template("offline_login_prompt.bmp", (780, 450, 1140, 660), frame, threshold=0.98)[0]:
             raise PendingError("account is offline and requires manual login; content clicks disabled")
         anchors = list(page_anchors)
+        from hyol_treasure_recognition import trap_layout, ROIS as TRAP_ANCHOR_ROIS
+        trap = trap_layout(frame, getattr(self, 'templates', None))
+        if any(name in TRAP_ANCHOR_ROIS for name in anchors) and trap is None:
+            raise SafetyError('挖宝埋伏文字、按钮及两侧边框未同时核实，禁止点击')
         if any(name.startswith(('puzzle_','training_record_','anniversary_')) for name in anchors):
             from hyol_puzzle_backend import require_account_tab
             activity=('限时签到' if any(name.startswith('anniversary_') for name in anchors)
@@ -2428,7 +2526,7 @@ class Scheduler:
             # full-client NCC search dilutes its score with dynamic map
             # pixels, so keep the safety check in the same bounded ROI used by
             # prepare/recovery rather than widening the click area.
-            roi = (1800, 930, 1920, 1032) if name == "home_leave.bmp" else GUARD_ANCHOR_ROIS.get(name, VIEW)
+            roi = (1800, 930, 1920, 1032) if name == "home_leave.bmp" else TRAP_ANCHOR_ROIS.get(name, GUARD_ANCHOR_ROIS.get(name, VIEW))
             if self.template(name, roi, frame, threshold=anchor_threshold)[0]:
                 anchor_ok = True
                 break
@@ -2446,17 +2544,26 @@ class Scheduler:
         if self.generic_current_tab_x is not None:
             ok, scores = True, {account.name: 1.0}
             reference = getattr(self, '_verified_current_mask', None)
-            if reference is not None and self.main_ready(frame):
-                from hyol_checkpoints import current_identity_mask
-                # Binding excludes animated map pixels and compensates only
-                # positively anchored dimmed modals. Reuse that exact layout
-                # here so a quiz overlay cannot masquerade as a role change.
-                current = current_identity_mask(frame, self.templates)
-                score = mask_f1(reference, current)
-                if score < .92:
+            if reference is not None and (trap is not None or self.main_ready(frame)):
+                if isinstance(getattr(self, '_dynamic_identity_materials', None), dict):
+                    # Automatic binding already checks server and role glyphs
+                    # separately, the .92 floor, .08 ambiguity gap and exact
+                    # selected tab. Use that same rule at dispatch: a second
+                    # whole-strip F1 incorrectly includes changing map pixels
+                    # to the right of a short role name on escort delivery.
+                    ok, scores = self.verify_identity(account, frame)
+                else:
+                    from hyol_checkpoints import current_identity_mask
+                    current = current_identity_mask(frame, self.templates)
+                    ok = mask_f1(reference, current) >= .92
+                if not ok:
                     raise SafetyError('当前入口已关联账号的身份发生变化，禁止点击')
+            elif trap is not None:
+                ok, scores = self.verify_identity(account, frame)
         else:
             ok, scores = self.verify_identity(account, frame)
+        if trap is not None and not ok:
+            raise SafetyError('挖宝埋伏页账号身份未核实，页面边框不能替代身份校验')
         if not ok and not anchor_ok:
             raise SafetyError(f"identity and page-anchor guard failed: scores={scores} anchors={anchors}")
         if anchors and not anchor_ok:
@@ -2558,10 +2665,12 @@ class Scheduler:
         frame_predicate: Callable[[Image.Image], bool] | None = None,
     ) -> bool:
         anchors = tuple(anchors)
+        self.last_click_rejection=None
         deadline = time.monotonic() + max(0., min(5., float(self.config.get("RecognitionRetrySeconds", "1.2"))))
         while True:
             frame = self.content_guard(account, anchors, anchor_threshold=anchor_threshold)
             if frame_predicate is not None and not frame_predicate(frame):
+                self.last_click_rejection=dict(target=name,reason='precondition_changed')
                 return False
             ok, score, x, y = self.active_template(name, roi, frame, threshold=threshold)
             if ok or time.monotonic() >= deadline:
@@ -2569,6 +2678,7 @@ class Scheduler:
             self.event("recognition_retry", account, target=name, score=score, detail="重新采样，未发送点击")
             self.wait_interruptible(.2)
         if not ok:
+            self.last_click_rejection=dict(target=name,reason='not_found')
             return False
         detection = getattr(self, "last_detection", None)
         if detection is not None and detection.source != "template" and detection.box is not None:
@@ -2596,6 +2706,7 @@ class Scheduler:
             self.click_point(account, x + dx, y + dy, label, anchors, irreversible,
                              anchor_threshold=anchor_threshold, frame_predicate=target_still_current)
         except TargetPreconditionChanged:
+            self.last_click_rejection=dict(target=name,reason='precondition_changed')
             return False
         return True
 
@@ -2637,6 +2748,9 @@ class Scheduler:
 
     def main_ready(self, frame: Image.Image | None = None) -> bool:
         frame = frame or self.capture()
+        from hyol_treasure_recognition import trap_layout
+        if trap_layout(frame, getattr(self, 'templates', None)) is not None:
+            return False
         from hyol_navigation import content_loading_visible
         if content_loading_visible(self, frame):
             return False
@@ -2648,6 +2762,9 @@ class Scheduler:
         top = self.template("anchor_top_menu.bmp", (500, 69, 1500, 189), frame)[0]
         right = self.template("anchor_right_panel.bmp", (1569, 289, 1919, 489), frame)[0]
         if not top or not right:
+            return False
+        from hyol_navigation import group_card_result_visible
+        if group_card_result_visible(self, frame):
             return False
         overlays = [
             ("quiz_page.bmp", (820, 380, 1060, 450)),
@@ -2670,12 +2787,15 @@ class Scheduler:
             ("survival_anchor.bmp", (201, 69, 601, 419)),
             ("wanted_team_anchor.bmp", (500, 200, 1450, 850)),
             ("strong_approach_anchor.bmp", (250, 80, 1720, 950)),
+            ('strong_reward_label_core_current.bmp', (650,790,980,850)),
             ("rescue_jinchuriki_anchor.bmp", (250, 80, 1720, 950)),
             ("team_pvp_anchor.bmp", (250, 80, 1720, 950)),
             ("team_activity_close.bmp", (1350, 180, 1750, 350)),
             ("limited_activity_close.bmp", (1300, 180, 1500, 330)),
             ("team_result_confirm.bmp", (650, 400, 1250, 850)),
             (TEAM_REWARD_RESULT_TEMPLATE, TEAM_REWARD_RESULT_ROI),
+            ('team_reward_result_header_current.bmp', (780,340,1140,470)),
+            ('strong_score_title_20261109.bmp', (780,230,1140,370)),
             ("team_return_anchor.bmp", (250, 80, 1720, 950)),
             (TEAM_BATTLE_START_TEMPLATE, TEAM_BATTLE_START_ROI),
             ("team_room_close.bmp", (1200, 260, 1280, 340)),
@@ -3114,6 +3234,23 @@ class Scheduler:
         for attempt in range(1, 4):
             self.check_stop()
             frame = self.capture()
+            if module == 'survival':
+                actions = getattr(getattr(self, 'state', None), 'accounts', {}).get(
+                    account.name, {}).get('actions', {})
+                if any(key.startswith('survival_claim_rewards') and isinstance(row, dict)
+                       and row.get('status') == 'pending' for key, row in actions.items()):
+                    # The claim has already been sent. A delayed loot dialog
+                    # belongs to its original handler, not the background X.
+                    # Reentry observes/acknowledges only that pending receipt;
+                    # claim_survival_rewards refuses a duplicate claim.
+                    try:
+                        self.claim_survival_rewards(account)
+                    except PendingError as exc:
+                        self.event('lease_survival_reward_wait', account, module=module,
+                                   attempt=attempt, detail=str(exc))
+                        self.wait_interruptible(3)
+                        continue
+                    frame = self.capture()
             if self.main_ready(frame):
                 self.event("lease_release_ready", account, module=module, attempt=attempt)
                 return True
@@ -3466,15 +3603,33 @@ class Scheduler:
         caps[account.name] = dict(maximum=maximum, carried=carried, origin_run=origin_run)
         self.state.save_global()
 
+    def _arena_calendar_policy(self, account=None):
+        from hyol_training_policy import arena_policy
+        navigator = getattr(self,'_combat_navigators',{}).get(account.name) if account is not None else None
+        navigator = navigator or getattr(self,'navigator',None)
+        request = getattr(navigator,'training_request',None)
+        selection = (request.get('stop_policy','auto') if isinstance(request,dict) and request.get('task')=='arena'
+                     else getattr(self,'training_arena_stop_policy','auto'))
+        return arena_policy(self.state.day,selection)
+
     def ensure_arena_run_cap(self, account: Account) -> None:
         """All arena goals share this account's three starts in the original run."""
         if getattr(self, 'arena_calendar_policy_enabled', False):
             from hyol_training_policy import arena_policy
             policies = self.state.global_state.setdefault('arena_date_policies', {})
-            policy = arena_policy(self.state.day)
+            policy = self._arena_calendar_policy(account)
             previous = policies.get(account.name)
             if previous is not None and previous != policy:
-                raise PendingError('竞技场原执行日期策略变化，先恢复原动作再开始当天计划')
+                compatible_legacy = (isinstance(previous,dict) and previous.get('version') == 2
+                    and previous.get('execution_day') == policy['execution_day']
+                    and previous.get('mode') == policy['mode']
+                    and previous.get('fixed_battle_cap') is None)
+                if not compatible_legacy:
+                    raise PendingError('竞技场原执行日期策略变化，先恢复原动作再开始当天计划')
+                # New display/selection metadata must not replace an existing
+                # run's battle budget or block its unchanged original mode.
+                self.event('arena_original_policy_preserved',account,
+                           detail='沿用原运行同日竞技场结束条件，保留原目标与未决动作')
             if previous is None:
                 policies[account.name] = policy
                 self.state.save_global()
@@ -3631,6 +3786,11 @@ class Scheduler:
                         for roi in ((330,480,485,585), (330,600,485,710)))
                 and not self._combat_active_visible('arena', frame)
                 and not self._arena_victory_visible(frame) and not self._arena_defeat_visible(frame))
+
+    def _arena_unfinished_tasks_visible(self, frame: Image.Image) -> bool:
+        return (self._arena_reward_page_unobscured(frame)
+                and self.template('arena_condition_unmet.bmp',(301,469,541,829),frame,threshold=.98)[0]
+                and not self.template('arena_reward_claim.bmp',(301,469,521,879),frame,threshold=.98)[0])
 
     def _arena_difficulties_lowered_complete(self, account: Account) -> bool:
         return all(
@@ -4580,12 +4740,19 @@ class Scheduler:
         return None
 
     def _combat_progress_watchdog(self, slot: CombatSlot, frame: Image.Image) -> None:
-        """One 30s image-change rule for matching, loading and active battles."""
+        """Keep the 30s freeze rule; include the matching/loading clocks."""
         if slot.mode == 'arena' and (
                 self._arena_victory_visible(frame) or self._arena_defeat_visible(frame)
                 or self.template('arena_result_confirm.bmp', (651,449,1151,829), frame)[0]):
             return  # Settle positive results before observing a completed static page.
-        check_combat_slot_watchdog(self, slot, frame)
+        phase = ('matching' if slot.mode == 'arena' and (
+            self.template('arena_matching_anchor.bmp', (601,349,1201,751), frame, threshold=.98)[0]
+            or self.template('arena_waiting_title_current.bmp', (790,455,1100,545), frame, threshold=.98)[0])
+            else 'battle')
+        if phase == 'battle' and slot.mode == 'arena' and self.template(
+                'arena_loading_anchor.bmp', ARENA_LOADING_ROI, frame, threshold=.98)[0]:
+            phase = 'loading'
+        check_combat_slot_watchdog(self, slot, frame, sampling_phase=phase)
 
     def _start_arena_slot(self, slot: CombatSlot) -> None:
         account = slot.account
@@ -4666,8 +4833,9 @@ class Scheduler:
 
     def _arena_opening_inputs_recorded(self, account, index):
         skill, auto, _operation = Scheduler._arena_opening_actions(self, account, index)
+        required = (skill, auto) if getattr(self, 'arena_second_skill', False) else (auto,)
         return all(self.state.action_status(account.name, action) in ('pending', 'done')
-                   for action in (skill, auto))
+                   for action in required)
 
     def _arena_opening_once(self, account, index, frame):
         """Write ahead before each opening input; a pending input is never resent."""
@@ -4701,7 +4869,7 @@ class Scheduler:
             return False
         skill, auto, operation = Scheduler._arena_opening_actions(self, account, index)
         changed = False
-        if self.state.action_status(account.name, skill) == 'new':
+        if getattr(self, 'arena_second_skill', False) and self.state.action_status(account.name, skill) == 'new':
             if not self.template('arena_skill2_key.bmp', (890,920,920,950), frame, threshold=.96)[0]:
                 return False  # Wait for the skill HUD to paint; no fallback clicks.
             self.click_point(account, 904, 909, skill, ['arena_battle_frame_anchor.bmp'],
@@ -4942,6 +5110,20 @@ class Scheduler:
                 raise PendingError("竞技场尚未确认胜利，保持待处理")
         # Always inspect the current rows, even when older claims #1/#2 are done.
         self._claim_arena_tasks(account)
+        if target_mode == 'tickets' and not self._arena_daily_rewards_complete(account):
+            quota_frame = self.capture()
+            if self._arena_unfinished_tasks_visible(quota_frame):
+                self.wait_interruptible(.2)
+                quota_frame = self.capture()
+                if self._arena_unfinished_tasks_visible(quota_frame):
+                    proof = self.save_raw_evidence(quota_frame,account,'arena_zero_tickets_unfinished_tasks','verified')
+                    self.state.accounts[account.name]['arena_quota_pending_rewards'] = dict(
+                        tickets_exhausted=True,unfinished_tasks_observed=True,evidence=str(proof),
+                        day=self.state.day,observed_at=now_iso())
+                    self.state.save_account(account.name)
+                    self._defer_arena_slot_at_limit(slot,tickets_exhausted=True,rewards_checked=True,
+                        reason='战令已用尽，但仍有每日任务条件未满足；本号停止战斗并回村，未计领奖')
+                    return
         reward_deadline = time.monotonic() + 10
         while time.monotonic() < reward_deadline and not self._arena_daily_rewards_complete(account):
             self._claim_arena_tasks(account)
@@ -4981,7 +5163,8 @@ class Scheduler:
                    tickets_exhausted=target_mode == 'tickets', claims=claims,
                    daily_rows_exhausted=claims < ARENA_DAILY_REWARD_CLAIMS)
 
-    def _defer_arena_slot_at_limit(self, slot: CombatSlot) -> None:
+    def _defer_arena_slot_at_limit(self, slot: CombatSlot, *, tickets_exhausted=False,
+                                  rewards_checked=False, reason=None) -> None:
         """Close a settled round without reporting an unmet win/ticket goal done."""
         account = slot.account
         actions = self.state.accounts.get(account.name, {}).get('actions', {})
@@ -4989,26 +5172,35 @@ class Scheduler:
                                and isinstance(value, dict) and value.get('status') == 'pending'
                                for key, value in actions.items()):
             raise PendingError('竞技场原战斗尚未结算，保留凭据并禁止新开')
+        if tickets_exhausted and any(key.startswith('arena_') and isinstance(value,dict)
+                                    and value.get('status')=='pending' for key,value in actions.items()):
+            raise PendingError('竞技场仍有原操作未决，战令归零不能代替结果核实')
         if not self.template('arena_ready_anchor.bmp', (851, 199, 1451, 449))[0]:
             raise PendingError('竞技场限额收尾页面尚未核实')
-        self._claim_arena_tasks(account)
+        if not rewards_checked:
+            self._claim_arena_tasks(account)
         if not self.click_template(
                 account, 'survival_close.bmp', (1550, 60, 1700, 200), 20, 20,
-                'arena_run_limit_close', ['arena_ready_anchor.bmp', 'survival_close.bmp'],
+                'arena_tickets_exhausted_pending_close' if tickets_exhausted else 'arena_run_limit_close',
+                ['arena_ready_anchor.bmp', 'survival_close.bmp'],
                 threshold=0.84, anchor_threshold=0.84):
             raise PendingError('竞技场限额收尾关闭控件未核实')
         if not self.wait_until_main(12):
             raise PendingError('竞技场限额收尾尚未核实回村')
-        detail = '竞技场每账号每轮最多3场，未完成目标保留下次继续'
+        home_evidence=str(self.save_raw_evidence(self.capture(),account,'arena_quota_home','verified'))
+        detail = reason or '竞技场每账号每轮最多3场，未完成目标保留下次继续'
         request = self.state.global_state.get('arena_requests', {}).get(account.name)
         if isinstance(request, dict):
-            request.update(status='limited', round_limited_at=now_iso(), home_returned=True)
+            request.update(status='quota_exhausted' if tickets_exhausted else 'limited',
+                           round_limited_at=now_iso(), home_returned=True,home_evidence=home_evidence)
+            if tickets_exhausted:request.update(tickets_exhausted=True,ticket_count_at_completion=0,rewards_pending=True)
             self.state.save_global()
         self.state.set_module(account.name, 'arena', 'pending', detail)
         self.state.add_pending(account.name, 'arena', detail)
         slot.complete = True
-        self.event('arena_run_limit_reached', account, maximum=ARENA_MAX_BATTLES_PER_RUN,
-                   wins=self._arena_victory_count(account), home_returned=True, detail=detail)
+        self.event('arena_tickets_exhausted_rewards_pending' if tickets_exhausted else 'arena_run_limit_reached',
+                   account, maximum=None if getattr(self,'arena_calendar_policy_enabled',False) else ARENA_MAX_BATTLES_PER_RUN,
+                   wins=self._arena_victory_count(account), home_returned=True, evidence=home_evidence, detail=detail)
 
     def _observe_survival_pending_page(self, slot: CombatSlot, frame: Image.Image) -> bool:
         """A ready page is progress evidence, never an invented battle outcome."""
@@ -5384,6 +5576,23 @@ class Scheduler:
                    detail='只对账原重置，不补记任何战斗次数或胜负')
         return True
 
+    def _survival_reset_remaining(self, frame):
+        roi = (851,769,1251,1031)
+        zero = any(self.template(name,roi,frame,threshold=.98)[0] for name in
+                   ('survival_reset_zero_text.bmp','survival_reset_zero_current.bmp'))
+        one = self.template('survival_reset.bmp',roi,frame,threshold=.98)[0]
+        if zero == one:
+            return None
+        return 0 if zero else 1
+
+    def _stable_survival_reset_remaining(self):
+        first = self._survival_reset_remaining(self.capture())
+        self.wait_interruptible(.2)
+        second = self._survival_reset_remaining(self.capture())
+        if first is None or first != second:
+            raise PendingError('生存免费重置剩余次数未连续确认，保留原进度，不重置或按零次完成')
+        return second
+
     def _ensure_survival_reset(self, account: Account) -> None:
         reset_action = "survival_reset"
         confirm_action = "survival_reset_confirm_yes"
@@ -5396,9 +5605,7 @@ class Scheduler:
             if self.state.action_status(account.name, reset_action) != 'pending':
                 self.state.set_action(account.name, reset_action, "pending", "等待确认重置生存演习")
             if self.state.action_status(account.name, confirm_action) == "pending":
-                # A still-visible confirmation button proves the previous
-                # click did not transition, so this exact click is retryable.
-                self.state.set_action(account.name, confirm_action, "new", "确认按钮仍可见，允许安全重试")
+                raise PendingError('生存重置确认已发送但结果仍未知，保留原确认，不重复点击')
             if not self.click_template(
                 account,
                 "survival_reset_confirm_yes.bmp",
@@ -5425,6 +5632,8 @@ class Scheduler:
         if self.state.action_status(account.name, reset_action) == "done":
             return
         if self.state.action_status(account.name, reset_action) == "new":
+            if self._stable_survival_reset_remaining() != 1:
+                raise PendingError('生存免费重置次数不是1，未发送重置')
             if not self.click_template(
                 account,
                 "survival_reset.bmp",
@@ -5901,9 +6110,7 @@ class Scheduler:
         self.claim_survival_rewards(account)
         self.reconcile_survival_result_confirmations(account)
         if self.state.action_status(account.name, "survival_second_run_started") != "done":
-            frame = self.capture()
-            reset_exhausted = any(self.template(name, (851,769,1251,1031), frame)[0]
-                                  for name in ('survival_reset_zero_text.bmp', 'survival_reset_zero_digit.bmp'))
+            reset_exhausted = self._stable_survival_reset_remaining() == 0
             if reset_exhausted:
                 self.close_survival(account)
                 slot.complete = True
@@ -5935,6 +6142,8 @@ class Scheduler:
             slot.start_requested_at = None
             self.event("survival_second_run_started", account)
             return
+        if self._stable_survival_reset_remaining() != 0:
+            raise PendingError('生存第二轮完成后免费重置次数与原记录不一致，保留待核实')
         self.close_survival(account)
         slot.complete = True
         self.state.set_module(account.name, "survival", "done")
@@ -6135,6 +6344,11 @@ class Scheduler:
                 delay = min(.4, max(.01, min(due)-time.monotonic())) if due else .4
                 self.wait_interruptible(delay)
         if not all(self._account_module_complete(slot.account, mode) for slot in slots):
+            if mode == 'arena':
+                from hyol_arena_outcome import exhausted_record
+                from hyol_errors import ArenaQuotaExhausted
+                if all(self._account_module_complete(slot.account,mode) or exhausted_record(self,slot.account) for slot in slots):
+                    raise ArenaQuotaExhausted('战令已用尽并回村；每日奖励条件未达成，继续后续任务')
             raise PendingError(f"{mode} interleaved stage unresolved")
         self.state.resolve_pending("global", mode)
         self.event("combat_interleaved_complete", mode=mode)
@@ -6364,7 +6578,23 @@ class Scheduler:
         if slot.running:
             raise PendingError("survival battle timeout; battle action remains pending")
 
-    def claim_survival_rewards(self, account: Account) -> None:
+    def _record_survival_reward_observation(self, account, run_index, origin):
+        rows = self.state.accounts[account.name].setdefault('survival_reward_observations', {})
+        key = f'run_{run_index}'
+        prior = rows.get(key,{})
+        if prior.get('claimed') and (prior.get('origin') in ('actual','reconciled')
+                                     or prior.get('origin') == origin):
+            return prior
+        evidence = str(self.save_raw_evidence(self.capture(),account,'survival_reward_'+origin,'verified'))
+        rows[key] = dict(claimed=True,origin=origin,evidence=evidence,observed_at=now_iso())
+        self.state.save_account(account.name)
+        self.event('survival_reward_observed',account,round=run_index,origin=origin,evidence=evidence,
+                   detail={'preexisting':'进入时奖励已经领取，不计本轮领取',
+                           'reconciled':'原领取结果已核实，没有再次领取',
+                           'actual':'本轮新领取及最终领取状态已核实'}[origin])
+        return rows[key]
+
+    def claim_survival_rewards(self, account: Account):
         run_index = 2 if self.state.action_status(account.name, "survival_second_run_started") == "done" else 1
         action = f"survival_claim_rewards_run_{run_index}"
         # A later slot poll can revisit this function after the reward dialog
@@ -6373,16 +6603,19 @@ class Scheduler:
         if self.state.action_status(account.name, action) == "done":
             self.event("survival_rewards_already_verified", account, target=action,
                        detail="本轮奖励已正向确认领取，重复调度只复用完成记录")
-            return
+            return self._record_survival_reward_observation(account,run_index,'reconciled')
         reward_result_visible = self.template("survival_reward_result_confirm.bmp", (701, 569, 1151, 819))[0]
         if not reward_result_visible and self.template("survival_final_claimed.bmp", (1151, 769, 1451, 1031), threshold=0.92)[0]:
-            if self.state.action_status(account.name, action) != "done":
+            if self.state.action_status(account.name, action) == "pending":
                 self.commit_action(account, action, "220分奖励箱已确认领取；当前220分页已显示最终领取态")
-            return
+                return self._record_survival_reward_observation(account,run_index,'reconciled')
+            return self._record_survival_reward_observation(account,run_index,'preexisting')
+        origin = ('reconciled' if self.state.action_status(account.name,action)=='pending'
+                  else 'preexisting' if reward_result_visible else 'actual')
         if self.state.action_status(account.name, action) == "pending":
             if not reward_result_visible:
                 raise PendingError("survival reward outcome unknown; refusing duplicate claim")
-        else:
+        elif not reward_result_visible:
             if not self.click_template(account, "survival_claim_all.bmp", (1251, 819, 1501, 1031), 43, 14, action, ["survival_complete_220.bmp"], irreversible=True, threshold=0.90, anchor_threshold=0.98):
                 raise PendingError("survival claim-all missing")
             if self.wait_template("survival_claim_confirm_yes.bmp", (701, 469, 1151, 719), 5):
@@ -6390,13 +6623,15 @@ class Scheduler:
                     raise PendingError("survival claim confirmation disappeared")
             elif not self.template("survival_reward_result_confirm.bmp", (701, 569, 1151, 819))[0]:
                 raise PendingError("survival claim produced neither confirmation nor reward result")
-        if not self.wait_template("survival_reward_result_confirm.bmp", (701, 569, 1151, 819), 8):
+        if not self.wait_template("survival_reward_result_confirm.bmp", (701, 569, 1151, 819), 20):
             raise PendingError("survival reward result missing")
         if not self.click_template(account, "survival_reward_result_confirm.bmp", (701, 569, 1151, 819), 51, 17, f"survival_reward_result_confirm_run_{run_index}", ["survival_reward_result_confirm.bmp"]):
             raise PendingError("survival reward result confirmation disappeared")
         if not self.wait_template("survival_final_claimed.bmp", (1151, 769, 1451, 1031), 8, threshold=0.92):
             raise PendingError("survival claimed state missing")
-        self.commit_action(account, action, "final claimed state verified")
+        if origin != 'preexisting':
+            self.commit_action(account, action, "final claimed state verified")
+        return self._record_survival_reward_observation(account,run_index,origin)
 
     def close_survival(self, account: Account) -> None:
         if not self.click_template(account, "survival_close.bmp", (1585, 77, 1685, 177), 20, 20, "survival_close", ["survival_anchor.bmp", "survival_close.bmp"]):
@@ -6405,7 +6640,7 @@ class Scheduler:
             raise PendingError("survival page did not close through its verified X")
 
     def wait_main_after_close(self, account: Account, page: str, roi, seconds: float = 12) -> bool:
-        """Observe a closed panel and three stable main frames without another click."""
+        """Observe a closed panel and two stable main frames without another click."""
         Win32.move(*self.screen_point(1100, 50))
         deadline = time.monotonic() + seconds
         stable = 0
@@ -6421,7 +6656,10 @@ class Scheduler:
                 "main": self.main_ready(frame),
             }
             stable = stable + 1 if observations["closed"] and observations["main"] else 0
-            if stable >= 3:
+            # 20261106 ZCode: two consecutive verified frames (0.3s apart)
+            # replace three; a late popup is still caught by every following
+            # content_guard and anchor gate, which were unchanged.
+            if stable >= 2:
                 self.event("panel_closed_main_verified", account, panel=page, frames=stable)
                 return True
             self.wait_interruptible(.3)
@@ -6437,6 +6675,16 @@ class Scheduler:
             if self.main_ready():
                 return True
             time.sleep(0.2)
+
+    def model_page_view(self, frame: Image.Image | None = None) -> dict:
+        """One-inference page observation for the YOLO fast edition.
+
+        Read-only: the returned view never gates a click and never overrides
+        a template decision; promotion of model-driven decisions still goes
+        through the existing per-class validation gate (enabled_for).
+        """
+        from hyol_page_recognition import identify
+        return identify(getattr(self, 'detector', None), frame or self.capture())
         return False
 
     def run_independent(self) -> None:
@@ -7010,6 +7258,92 @@ class Scheduler:
             threshold=0.90,
         )[0]
 
+    def _strong_score_result_visible(self, frame: Image.Image | None = None) -> bool:
+        frame = frame if frame is not None else self.capture()
+        return (self.template('strong_score_title_20261109.bmp', (780,230,1140,370), frame, threshold=.98)[0]
+                and self.template('strong_score_confirm_core_20261109.bmp', (850,650,1060,730), frame, threshold=.98)[0])
+
+    def _ack_strong_score_result(self, team, leader, spec, attempt_index, frame):
+        if spec.key != 'strong_approach':
+            return False
+        base = self._team_attempt_base(team, spec, attempt_index)
+        reward, result = base + '_reward_confirm', base + '_result_confirm'
+        action = base + '_score_confirm'
+        status = self.state.action_status(leader.name, action)
+        if status == 'pending':
+            raise PendingError('原强者评分确认已发送但结果未核实，不重复点击')
+        if not self._strong_score_result_visible(frame):
+            return False
+        if self.state.action_status(leader.name, result) != 'done':
+            raise PendingError('评分页面缺少原胜利确认凭据，未点击')
+        reward_status = self.state.action_status(leader.name, reward)
+        if reward_status == 'pending':
+            record = self.state.action_record(leader.name, reward)
+            if not Path(record.get('before_evidence', '')).is_file():
+                raise PendingError('原查看分数缺少发送前证据，不补记结果')
+            evidence = self.save_raw_evidence(frame, leader, base + '_score_transition', 'verified')
+            self.commit_action(leader, reward, '原查看分数已发送；其后独立评分标题与确定按钮已核实：' + str(evidence))
+        elif reward_status != 'done':
+            raise PendingError('评分页面缺少原查看分数凭据，未点击')
+        if status == 'done':
+            raise PendingError('评分确认已完成但原页面仍在，未重复点击')
+        if not self.click_template(leader, 'strong_score_confirm_core_20261109.bmp',
+                (850,650,1060,730), 24,8, action,
+                ['strong_score_title_20261109.bmp','strong_score_confirm_core_20261109.bmp'],
+                irreversible=True,threshold=.98,anchor_threshold=.98,
+                frame_predicate=lambda current: self._strong_score_result_visible(current)):
+            raise PendingError('强者评分确认前页面变化，保留原动作')
+        if not self.wait_absent('strong_score_title_20261109.bmp',(780,230,1140,370),8,threshold=.98):
+            raise PendingError('强者评分确认已发送，评分页面仍未消失')
+        self.commit_action(leader,action,'原强者评分标题已确认消失')
+        return True
+
+    def _ensure_strong_battle_x2(self, team, leader, spec, attempt_index, frame):
+        """Set the owned strong battle to x2 once; uncertain toggles never repeat."""
+        if spec.key != 'strong_approach' or not self._battle_hud_visible(frame):
+            return False
+        base = self._team_attempt_base(team, spec, attempt_index)
+        if self.state.action_status(leader.name, base + '_start') not in ('pending','done'):
+            raise PendingError('强者二倍速缺少本场原开战凭据，未点击')
+        roi = (1260,890,1335,975)
+        action = base + '_speed_x2'
+        status = self.state.action_status(leader.name, action)
+        if self.template('battle_speed_x2.png',roi,frame,threshold=.84)[0]:
+            if status != 'done':
+                proof = self.save_raw_evidence(frame,leader,action,'verified')
+                if status == 'pending':
+                    self.commit_action(leader,action,'原二倍速切换已正向核实x2：'+str(proof))
+                else:
+                    self.state.set_action(leader.name,action,'done','本场已显示x2，未点击速度按钮：'+str(proof))
+                self.event('strong_battle_speed_x2_verified',leader,activity=spec.key,attempt=attempt_index,
+                           evidence=str(proof),detail=f'强者第{attempt_index}场已确认二倍速x2')
+            return False
+        if not self.template('battle_speed_x1.png',roi,frame,threshold=.84)[0]:
+            return False
+        if status in ('pending','done'):
+            raise PendingError('本场强者二倍速已有切换或完成凭据，但当前为x1；保留记录，不重复切换')
+        if not self._battle_auto_on_visible(frame):
+            return False
+        if not self.click_template(leader,'battle_speed_x1.png',roi,14,14,action,
+                ['battle_auto_on.bmp','battle_auto_on_current.bmp','battle_auto_on_current_core.bmp','battle_speed_x1.png'],
+                irreversible=True,threshold=.84,anchor_threshold=.90,
+                frame_predicate=lambda current: (self._battle_hud_visible(current)
+                    and self._battle_auto_on_visible(current)
+                    and self.template('battle_speed_x1.png',roi,current,threshold=.84)[0])):
+            raise PendingError('强者二倍速按钮点击前变化，未确认切换')
+        if not self.wait_template('battle_speed_x2.png',roi,3,threshold=.84):
+            raise PendingError('强者二倍速切换已发送，但x2结果未核实，禁止重复切换')
+        observed = getattr(self,'_last_frame',None)
+        if observed is None or not self.template('battle_speed_x2.png',roi,observed,threshold=.84)[0]:
+            observed = self.capture()
+        if not self.template('battle_speed_x2.png',roi,observed,threshold=.84)[0]:
+            raise PendingError('强者二倍速确认帧已变化，保留原切换凭据')
+        proof = self.save_raw_evidence(observed,leader,action,'verified')
+        self.commit_action(leader,action,'本场速度由x1切换并正向确认x2：'+str(proof))
+        self.event('strong_battle_speed_x2_verified',leader,activity=spec.key,attempt=attempt_index,
+                   evidence=str(proof),detail=f'强者第{attempt_index}场已开启二倍速x2')
+        return True
+
     def _team_reward_zero_action(self, team: Team, spec: TeamActivitySpec) -> str:
         return f"team{team.index}_{spec.key}_reward_zero"
 
@@ -7430,6 +7764,10 @@ class Scheduler:
         while True:
             self.check_stop()
             frame = self.capture()
+            if self._ack_strong_score_result(team, leader, spec, attempt_index, frame):
+                continue
+            if self._ensure_strong_battle_x2(team, leader, spec, attempt_index, frame):
+                continue
             if not (self._team_result_template(frame)
                     and self.state.action_status(leader.name, result_action) != "done"
                     or self._team_reward_result_visible(frame)
@@ -7598,6 +7936,10 @@ class Scheduler:
         while True:
             self.check_stop()
             frame = self.capture()
+            if self._ack_strong_score_result(team, leader, spec, attempt_index, frame):
+                continue
+            if self._ensure_strong_battle_x2(team, leader, spec, attempt_index, frame):
+                continue
             if not (self._team_result_template(frame)
                     and self.state.action_status(leader.name, result_action) != "done"
                     or self._team_reward_result_visible(frame)
@@ -9482,7 +9824,7 @@ class Scheduler:
     def run_managed_gate(self, account: Account) -> None:
         from hyol_managed import (CARD_ACTION, first_card_prompt_visible,
                                   confirm_first_card, reconcile_card_confirmation,
-                                  stopped_panel_visible)
+                                  stopped_panel_visible, active_observation)
         from hyol_network_retry import run as retry_network
         self.switch_account(account)
         if not (ASSETS / "managed_active.bmp").exists() or not (ASSETS / "managed_exit.bmp").exists():
@@ -9494,7 +9836,7 @@ class Scheduler:
         stable_samples = 0
         seen_active = False
         for sample in range(10):
-            if self.managed_active_score(frame) >= 0.70:
+            if active_observation(self,frame)['active']:
                 stable_samples += 1
                 seen_active = True
             if sample < 9:
@@ -9526,8 +9868,9 @@ class Scheduler:
             raise PendingError('原操作结果尚未核实，不能开始托管：'+', '.join(unresolved))
         self.ensure_assets(["managed_mode_button.bmp", "managed_start_button.bmp"])
         if not first_card_prompt_visible(self, frame):
-            self.prepare_main(account)
-            self.open_managed_panel_with_retry(account)
+            if not stopped_panel_visible(self,frame):
+                self.prepare_main(account)
+                self.open_managed_panel_with_retry(account)
             from hyol_managed import preserve_existing_options
             preserve_existing_options(self, account)
         hits = 0
@@ -9538,12 +9881,12 @@ class Scheduler:
                 confirm_first_card(self, account, current)
                 hits = 0
                 return False
-            hits = hits + 1 if self.managed_active_score(current) >= .70 else 0
+            hits = hits + 1 if active_observation(self,current)['active'] else 0
             return hits >= 10
         def start_ready():
             current = self.capture()
             return (not first_card_prompt_visible(self, current)
-                    and self.managed_active_score(current) < .70
+                    and not active_observation(self,current)['active']
                     and stopped_panel_visible(self, current))
         retry_network(self, account, 'start_managed', '开始托管', active_verified,
                       start_ready,
@@ -9911,7 +10254,8 @@ class Scheduler:
                           and isinstance(value, dict)
                           and value.get('status') == 'done'
                           for key, value in actions.items())
-            return claimed
+            observed = self.state.accounts.get(account.name,{}).get('survival_reward_observations',{})
+            return claimed or any(row.get('claimed') is True for row in observed.values() if isinstance(row,dict))
         return module != "welfare" or self.welfare_claims_complete(account)
 
     def command_is_complete(self, command: SchedulerCommand) -> bool:
@@ -10199,7 +10543,7 @@ class Scheduler:
                   else f"目标新增{record['requested_wins']}场胜利，尚需{remaining}场")
         if getattr(self, 'arena_calendar_policy_enabled', False):
             from hyol_training_policy import arena_policy
-            detail += '；'+arena_policy(self.state.day)['label']
+            detail += '；'+self._arena_calendar_policy(account)['label']
         else:
             detail += '；每账号每轮最多3场，未完成目标下次继续'
         self.event("arena_request_ready", account, target_mode=target_mode, target=self.arena_victory_target,

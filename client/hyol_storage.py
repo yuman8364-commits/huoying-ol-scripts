@@ -22,40 +22,63 @@ class JsonlLogger:
         self.path = path
         self.lock = threading.Lock()
         self.last_error = ""
+        self._handle = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.last_error = str(exc)
 
+    def close(self) -> None:
+        # 20261106 ZCode: a persistent append handle replaces the per-event
+        # open/flush/close chain.  Windows sharing flags still allow external
+        # readers to tail the file; the retry path below covers external
+        # exclusive locks, and any write error drops back to reopening.
+        with self.lock:
+            if self._handle is not None and not self._handle.closed:
+                try:
+                    self._handle.close()
+                except OSError:
+                    pass
+            self._handle = None
+
+    def _fallback(self, payload: str, exc: OSError) -> None:
+        self.last_error = str(exc)
+        fallback = Path(tempfile.gettempdir()) / "HYOL_diagnostics" / self.path.name
+        try:
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            with fallback.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+            self.last_error += f"; fallback={fallback}"
+        except OSError as fallback_exc:
+            self.last_error += f"; fallback failed={fallback_exc}"
+        try:
+            warnings.warn(self.last_error, RuntimeWarning)
+        except Exception:
+            pass
+
     def write(self, event: str, **fields: object) -> None:
         row = {"ts": _scheduler().now_iso(), "event": event, **fields}
         payload = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-        # Windows readers such as PowerShell ``Get-Content`` can briefly hold
-        # an exclusive sharing lock while a file is being tailed.  Logging is
-        # observational and must never abort a scheduler ``finally`` block
-        # (which would otherwise skip lease release and its final summary).
+        # Logging is observational and must never abort a scheduler ``finally``
+        # block (which would otherwise skip lease release and its final summary).
         with self.lock:
             for attempt in range(3):
                 try:
-                    with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                        handle.write(payload)
-                        handle.flush()
+                    if self._handle is None or self._handle.closed:
+                        self._handle = self.path.open("a", encoding="utf-8", newline="\n")
+                    self._handle.write(payload)
+                    self._handle.flush()
                     return
                 except OSError as exc:
                     self.last_error = str(exc)
+                    try:
+                        if self._handle is not None and not self._handle.closed:
+                            self._handle.close()
+                    except OSError:
+                        pass
+                    self._handle = None
                     if attempt == 2:
-                        fallback = Path(tempfile.gettempdir()) / "HYOL_diagnostics" / self.path.name
-                        try:
-                            fallback.parent.mkdir(parents=True, exist_ok=True)
-                            with fallback.open("a", encoding="utf-8") as handle:
-                                handle.write(payload)
-                            self.last_error += f"; fallback={fallback}"
-                        except OSError as fallback_exc:
-                            self.last_error += f"; fallback failed={fallback_exc}"
-                        try:
-                            warnings.warn(self.last_error, RuntimeWarning)
-                        except Exception:
-                            pass
+                        self._fallback(payload, exc)
                         return
                     time.sleep(0.05)
 

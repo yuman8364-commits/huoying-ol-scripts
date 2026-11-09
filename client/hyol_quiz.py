@@ -92,16 +92,48 @@ def run(r):
         except StopIteration as result:return result.value
 
 
+def prepare_entry(r, initial):
+    from hyol_errors import TaskUnavailable
+    s,rec=r.scheduler,r.record('quiz')
+    if solo_verified(r,initial):return 'ready'
+    if not isinstance(initial,hs.Image.Image):
+        raise TaskUnavailable('忍者测验单人状态尚未核实')
+    if claimed_result_visible(s,initial) or result_visible(s,initial):return 'ready'
+    actions=s.state.accounts.get(r.account.name,{}).get('actions',{})
+    if not isinstance(actions,dict):
+        raise hs.PendingError('忍者测验单人入口与原动作账本未确认，暂不进入')
+    if any(str(key).startswith('daily_quiz_') and isinstance(row,dict) and row.get('status')=='pending'
+           for key,row in actions.items()):
+        raise hs.PendingError('原测验操作结果未核实，日常完成标记不能代替原操作对账')
+    from hyol_daily_observation import scan
+    observed=rec.get('daily_observation',{})
+    if (observed.get('run_id')!=getattr(getattr(s,'diagnostics',None),'identifier',None)
+            or observed.get('account')!=r.account.name or observed.get('daily_complete') is None):
+        observed=scan(r,('quiz',),force=True).get('quiz',{})
+    initial=s.capture()
+    if observed.get('daily_complete') is True and s.main_ready(initial):
+        rec.update(task_completed=True,preexisting_complete=True,completed=rec.get('completed',0),
+                   outcome_label='日常已完成',last_error='',phase='ready')
+        r.save()
+        r.event('quiz_preexisting_complete',task='quiz',detail='日常面板已确认忍者测验完成，本次未重新答题或计领奖',evidence=observed.get('evidence'))
+        return 'observed_done'
+    if not solo_verified(r, initial):
+        from hyol_errors import TaskUnavailable
+        reason=solo_pending_reason(r,initial)
+        rec.update(status='pending',last_error=reason,outcome_label='已组队，测验需单人' if '组队控件' in reason else '测验入口未确认')
+        r.save()
+        raise TaskUnavailable(reason)
+    return 'ready'
+
+
 def run_steps(r):
     s, rec = r.scheduler, r.record('quiz')
     initial = s.capture()
     if claimed_result_visible(s, initial):
         finish_claimed_result(r, initial)
         return
-    if not solo_verified(r, initial):
-        rec.update(status='pending', last_error=solo_pending_reason(r,initial))
-        r.save()
-        raise hs.PendingError(rec['last_error'])
+    if prepare_entry(r,initial)=='observed_done':return
+    initial=s.capture()
     initial_result=result_visible(s,initial)
     initial_question=r.visible('quiz_page.bmp',PAGE,initial)
     actions=s.state.accounts.get(r.account.name,{}).get('actions',{})
@@ -198,9 +230,23 @@ def run_steps(r):
                     detail='选项后题目刷新，未提交原题；继续观察本场测验')
             s.wait_interruptible(.3)
             continue
-        r.click('quiz_submit.bmp',(850,710,1000,785),45,20,'daily_quiz_submit_'+key,['quiz_page.bmp'],True,
-                frame_predicate=lambda fresh: question_key(fresh) == key
-                    and r.visible('quiz_page.bmp',PAGE,fresh))
+        action='daily_quiz_submit_'+key
+        try:
+            r.click('quiz_submit.bmp',(850,710,1000,785),45,20,action,['quiz_page.bmp'],True,
+                    frame_predicate=lambda fresh: question_key(fresh) == key
+                        and r.visible('quiz_page.bmp',PAGE,fresh))
+        except (hs.AccountOffline,hs.BattleStalled):
+            raise
+        except hs.PendingError:
+            if s.state.action_status(r.account.name,action)!='new':raise
+            fresh=s.capture()
+            changed=(r.visible('quiz_page.bmp',PAGE,fresh) and question_key(fresh)!=key)
+            if not changed and not result_visible(s,fresh):raise
+            submissions[key]='advanced_without_submit'
+            r.save()
+            r.event('daily_quiz_question_changed',question=key,submission_inputs=0,
+                    detail='提交前题目已切换或结束，未重复提交上一题；继续核实本场测验')
+            continue
         submissions[key] = 'submitted'
         r.save()
         r.event('daily_quiz_submitted', detail='已选第一项并提交，等待下一题', question=key)

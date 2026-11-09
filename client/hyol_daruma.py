@@ -120,7 +120,8 @@ atexit.register(_close_bar_capture)
 
 
 def is_weekend(at: datetime | None = None) -> bool:
-    return (at or datetime.now()).weekday() >= 5
+    from hyol_puzzle import activity_day
+    return datetime.fromisoformat(activity_day(at or datetime.now())).weekday() >= 5
 
 
 def _visible(r, name: str, roi: tuple[int, int, int, int], frame: Image.Image | None = None,
@@ -161,7 +162,57 @@ def _stable_count(read, r) -> int:
     return second
 
 
+def _catalogue_arrow_enabled(s, key, roi, frame):
+    from hyol_anniversary import name,color_fraction
+    asset=name(key)
+    ok,_score,x,y=s.template(asset,roi,frame,threshold=.98)
+    if not ok:return False
+    with Image.open(hs.ASSETS/asset) as marker:
+        width,height=marker.size
+    return color_fraction(frame,(x,y,x+width,y+height),'gold')>.04
+
+
+def _find_weekend_catalogue(r, menu_asset):
+    """Search the verified rotating catalogue with bounded, guarded paging."""
+    from hyol_anniversary import shell_visible, matches, color_fraction, name, _move_clear
+    s, visited = r.scheduler, set()
+    frame = s.capture()
+    for page in range(4):
+        if _visible(r, menu_asset, MENU, frame, .95 if menu_asset.endswith('_core.bmp') else .91):
+            return True
+        if not shell_visible(s, frame):
+            return False
+        signature = hs.image_hash(frame.crop(MENU))
+        selected = None
+        for key, roi in (('list_down', (595,753,645,800)), ('list_up', (515,753,565,800))):
+            if ((signature,key) not in visited and _catalogue_arrow_enabled(s,key,roi,frame)):
+                selected = key, roi
+                break
+        if selected is None:
+            return False
+        key, roi = selected
+        visited.add((signature,key))
+        if not s.click_template(r.account,name(key),roi,12,12,
+                'daruma_catalogue_'+key+'_'+str(page+1),[name('shell')],
+                threshold=.98,anchor_threshold=.98,
+                frame_predicate=lambda fresh:shell_visible(s,fresh)
+                    and hs.image_hash(fresh.crop(MENU))==signature
+                    and _catalogue_arrow_enabled(s,key,roi,fresh)):
+            raise hs.PendingError('周末活动目录翻页前发生变化，未重复点击')
+        _move_clear(s)
+        s.wait_interruptible(.3)
+        frame=s.capture()
+        if not shell_visible(s,frame):
+            raise hs.PendingError('周末活动目录翻页后页面未核实，保留原页面')
+        if hs.image_hash(frame.crop(MENU)) == signature:
+            raise hs.PendingError('周末活动目录翻页未推进，停止重复点击并保留页面')
+        r.event('daruma_catalogue_page_observed',page=page+2,
+                detail='已核实活动目录翻页，继续查找周末活动文字')
+    return _visible(r,menu_asset,MENU,frame,.95 if menu_asset.endswith('_core.bmp') else .91)
+
+
 def _open_weekend(r) -> None:
+    from hyol_anniversary import shell_visible
     s = r.scheduler
     frame = s.capture()
     if _visible(r, 'daruma_game_page.bmp', GAME_PAGE, frame, .93):
@@ -172,17 +223,30 @@ def _open_weekend(r) -> None:
     if home_visible(s, frame):
         r.return_to_main()
         frame = s.capture()
-    if not s.main_ready(frame):
-        raise hs.PendingError('达摩入口要求当前账号在木叶主界面或已核实的达摩页面')
-    r.click('daruma_hotspot.bmp', HOTSPOT, 27, 27, 'daruma_open_hotspot',
-            ['anchor_top_menu.bmp'], threshold=.91)
+    if not shell_visible(s,frame):
+        if not s.main_ready(frame):
+            raise hs.PendingError('达摩入口要求当前账号在木叶主界面或已核实的达摩页面')
+        r.click('daruma_hotspot.bmp', HOTSPOT, 27, 27, 'daruma_open_hotspot',
+                ['anchor_top_menu.bmp'], threshold=.91)
     # The catalogue animates in after the hotspot click. Wait for the stable
     # text core, rather than choosing a legacy full-row asset from that first
     # transitional frame (the timed badge can cover its right edge).
     menu_asset=('daruma_weekend_menu_core.bmp' if (hs.ASSETS/'daruma_weekend_menu_core.bmp').is_file()
                 else 'daruma_weekend_menu.bmp')
     try:
-        r.wait(menu_asset, MENU, 8)
+        from hyol_anniversary import shell_visible
+        deadline = time.monotonic() + 8
+        while True:
+            frame = s.capture()
+            if _visible(r,menu_asset,MENU,frame,.95 if menu_asset.endswith('_core.bmp') else .91):
+                break
+            if shell_visible(s,frame):
+                if not _find_weekend_catalogue(r,menu_asset):
+                    raise hs.PendingError('已核实活动目录，但其中未找到周末活动')
+                break
+            if time.monotonic() >= deadline:
+                raise hs.PendingError('活动目录加载后仍未确认，保留原页面')
+            s.wait_interruptible(.2)
     except hs.PendingError as exc:
         # Opening the hotspot can leave its initial activity over the role
         # strip when the requested entry is absent. Close only the independent
@@ -191,15 +255,20 @@ def _open_weekend(r) -> None:
         from hyol_identity_overlays import inspect, dismiss_identity_overlays
         frame = getattr(s, '_last_frame', None)
         frame = frame if frame is not None else s.capture()
+        from hyol_anniversary import shell_visible, _close
+        catalogue = shell_visible(s,frame)
         overlay = inspect(s, frame)
-        if overlay is None or overlay[0] != 'recharge_activity':
+        if not catalogue and (overlay is None or overlay[0] != 'recharge_activity'):
             raise
         evidence = s.save_raw_evidence(frame, r.account,
                                        'daruma_visible_menu_unconfirmed', 'pending')
         r.event('daruma_entry_unconfirmed', evidence=str(evidence),
                 menu_roi=MENU, task_credit=False, reward_credit=False,
                 detail='当前可见活动菜单未确认周末活动；不推断全天未开放')
-        dismiss_identity_overlays(s, r.account, frame, only_kind='recharge_activity')
+        if catalogue:
+            _close(s,r.account)
+        else:
+            dismiss_identity_overlays(s, r.account, frame, only_kind='recharge_activity')
         if not s.wait_until_main(8):
             raise hs.PendingError('达摩入口未确认，关闭已核实活动页后仍未确认木叶；'
                                   f'原任务保留pending；截图={evidence}') from exc
@@ -771,7 +840,7 @@ def _play_once(r, before_reward: int, before_chance: int, *, resume: bool = Fals
 
 def run(r) -> None:
     if not is_weekend():
-        r.event('weekend_calendar_skip', detail='系统本地时间不是周六或周日；未识别游戏')
+        r.event('weekend_calendar_skip', detail='周末活动已按公告五点结束；未识别游戏')
         return
     s, rec = r.scheduler, r.record('weekend')
     if int(rec.get('hits_verified', 0)) == 5:

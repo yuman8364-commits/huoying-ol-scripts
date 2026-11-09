@@ -284,6 +284,21 @@ class PuzzleRun:
         frame = self.capture()
         matched, _, x, y = _match(self.r, 'puzzle_entry_title.bmp', frame)
         if not matched:
+            from hyol_weekend import WeekendUnavailable, puzzle_replaced_by_known_activities
+            actions = self.s.state.accounts.get(self.account.name, {}).get('actions', {})
+            pending = (any(row.get('phase') not in ('ready','done')
+                           for row in self.record['difficulties'].values())
+                       or any(key.startswith('puzzle_') and isinstance(row,dict)
+                              and row.get('status') == 'pending' for key,row in actions.items()))
+            if not pending and puzzle_replaced_by_known_activities(self.r, frame):
+                self.s.wait_interruptible(.25)
+                frame = self.capture()
+                if puzzle_replaced_by_known_activities(self.r, frame):
+                    proof = self.evidence(frame, 'puzzle_not_in_current_rotation', 'verified')
+                    reason = '本期展示忍者任务、骰子手气王和达摩，未提供忍者拼图；本轮跳过拼图'
+                    self.record['availability'] = dict(status='not_offered', evidence=proof, reason=reason)
+                    self.save()
+                    raise WeekendUnavailable(reason)
             raise hs.PendingError('周末福利中未确认忍者拼图入口；可能尚未开放')
         self.click('daruma_go.bmp', (x+425,y+45,x+555,y+99), 47,18,
                      'puzzle_open_selection', ['puzzle_entry_title.bmp'], threshold=.94)
@@ -575,7 +590,7 @@ class PuzzleRun:
                         self.solve(diff, row, prepared, game)
                         frame, layout = self.reconcile(diff, row)
                 self.claim(diff, row, frame, layout)
-            finished = progress_complete(self.record, self.day)
+            finished = progress_complete(dict(self.record, status='done'), self.day)
             self.record.update(status='done' if finished else 'pending', finished_at=hs.now_iso(),last_error='')
             if request is not None:
                 request['settled'] = sum(diff.key not in claimed_before and self.record['difficulties'][diff.key].get('claimed')

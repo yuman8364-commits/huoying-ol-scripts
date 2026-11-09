@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -14,12 +15,13 @@ from tkinter import ttk
 import numpy as np
 
 import hyol_scheduler as hs
+from hyol_errors import TaskUnavailable
 from hyol_daruma_task import verified as daruma_verified
 
 VERSION = '2026.10.24.1'
 TASKS = ("group", "survival", "wanted")
 TEAM_OPTIONS = ("group", "wanted", "strong", "sealed")
-SOLO_OPTIONS = ('mail', 'welfare', 'daruma', 'ranking', 'survival', 'quiz', 'arena', 'puzzle', 'weekend', 'treasure', 'training_record', 'escort', 'anniversary')
+SOLO_OPTIONS = ('mail', 'welfare', 'daruma', 'ranking', 'survival', 'quiz', 'arena', 'puzzle', 'weekend', 'treasure', 'training_record', 'escort', 'anniversary', 'grocery')
 DEFAULT_SOLO_OPTIONS = ('mail', 'escort', 'ranking', 'survival', 'quiz', 'arena', 'welfare')
 TASK_SEQUENCES = {"all": DEFAULT_SOLO_OPTIONS, "team": ("group", "wanted")}
 LABELS = {"group": "组队副本", "survival": "生存演习", "wanted": "通缉任务", "all": "日常三合一", "team": "组队副本＋通缉任务"}
@@ -34,6 +36,9 @@ LABELS['puzzle'] = '忍者拼图（三个难度）'
 LABELS['training_record'] = '修行录目标'
 LABELS['escort'] = '押镖（三次，优先免费SS，无SS改铜币）'
 LABELS['anniversary'] = '周年庆薪火签到'
+LABELS['grocery'] = '杂货屋'
+LABELS.update(group_instance='组队副本',strong_approach='强者降临',
+              rescue_jinchuriki='营救人柱力',team_pvp='组队竞技',bond='羁绊',arena_3v3='竞技场3v3')
 FORMATION_LABELS = {"保持不变": "keep", "主力阵容": "main", "速刷阵容（鲨鱼／速刷阵容）": "fast"}
 SPEED_ROI = (1260, 890, 1335, 975)
 GROUP_RETURN_ROI = (1110, 750, 1380, 890)
@@ -151,44 +156,26 @@ class DailyScheduler(hs.Scheduler):
         runners = getattr(self, "_combat_navigators", {})
         if slot.account.name in runners:
             self.navigator = runners[slot.account.name]
-        # The single-person daily target is one 220-point reward, not a reset.
         if slot.complete:
             return
         account = slot.account
-        if not self.template('survival_anchor.bmp', (201,69,601,419))[0]:
-            raise hs.PendingError('生存完成页未确认')
-        if not self.wait_template('survival_complete_220.bmp', (751,769,1151,1031), 8, threshold=.98):
-            raise hs.PendingError('生存积分尚未确认220/220')
-        if not self._survival_full_score_visible():
-            evidence = self.save_raw_evidence(self.capture(), account, 'survival_full_digits_unverified', 'pending')
-            raise hs.PendingError(f'生存220分数字未严格确认；画面={evidence}')
-        actions = self.state.accounts[account.name].get('actions', {})
-        if any(key.startswith(('survival_battle_step_', 'survival_result_confirm_'))
-               and isinstance(row, dict) and row.get('status') == 'pending'
-               for key, row in actions.items()):
-            raise hs.PendingError('生存仍有未决开战或结算，禁止领奖、重置或覆盖原动作')
-        self.claim_survival_rewards(account)
-        self.reconcile_survival_result_confirmations(account)
-        if getattr(self, 'survival_inline_two_runs', False) is True:
-            runner = self.navigator
-            rec = runner.record('survival')
-            if self.state.action_status(account.name, 'survival_second_run_started') != 'done':
-                rec.update(completed=1, task_completed=True, home_returned=False,
-                           followup_check_due=True)
-                runner.save()
-            # Reuse the audited reset/second-run flow on the same open page.
+        runner = getattr(self,'navigator',None)
+        rec = runner.record('survival') if runner is not None else None
+        # Normal daily runs finish every positively available free round.
+        # The shared state machine owns the one claim/reset transition; do
+        # not run a second claim/finish pass in this wrapper.
+        try:
             hs.Scheduler._finish_survival_slot(self, slot)
-            if slot.complete:
-                runner.survival_inline_complete = True
-                rec.update(followup_check_due=False,
-                           completed=2 if self.state.action_status(
-                               account.name, 'survival_second_run_started') == 'done' else 1)
+        finally:
+            if rec is not None:
+                from hyol_task_progress import survival_execution_counts
+                rec.update(survival_execution_counts(self.state.accounts[account.name]))
+                rec.update(followup_check_due=not slot.complete,
+                           task_completed=slot.complete,
+                           home_returned=slot.complete)
+                if slot.complete:
+                    runner.survival_inline_complete = True
                 runner.save()
-            return
-        self.close_survival(account)
-        slot.complete = True
-        self.state.set_module(account.name, 'survival', 'done')
-        self.event('combat_module_done', account, mode='survival')
 
     def _poll_survival_slot(self, slot):
         frame = self.capture()
@@ -206,20 +193,30 @@ def selected_sequence(task, selected_tasks=None):
     return selected
 
 
-def calendar_task_plan(tasks, execution_day=None):
+def calendar_task_plan(tasks, execution_day=None, *, at=None):
     """Keep the request intact; calendar skips never settle a task ledger."""
-    day = datetime.now().date().isoformat() if execution_day is None else execution_day
+    current = at if at is not None else datetime.now()
+    day = current.date().isoformat() if execution_day is None else execution_day
     if type(day) is not str or date.fromisoformat(day).isoformat() != day:
         raise ValueError('执行日期必须是YYYY-MM-DD，不能按当前日期重解旧运行')
     calendar_day = date.fromisoformat(day)
-    # A dated request uses that civil day, independent of the current clock or
-    # the puzzle page's separate 05:00 deadline. Noon avoids carrying Monday's
-    # early-hours puzzle grace period into a non-weekend batch request.
+    if at is not None and current.date().isoformat() != day:
+        raise ValueError('指定观察时间与执行日期不一致')
+    # Today's explicit day is passed by multi-account and training callers.
+    # Keep its real time so Sunday's puzzle window survives until Monday 05:00.
+    # Historical plans remain attached to their own date, using noon unless
+    # the caller supplies that date's exact observation time.
+    observed_at = (current if day == current.date().isoformat() else
+                   datetime.combine(calendar_day, datetime.min.time()).replace(hour=12))
     from hyol_weekend import is_weekend
-    opened = is_weekend(datetime.combine(calendar_day, datetime.min.time()).replace(hour=12))
+    from hyol_daruma import is_weekend as daruma_weekend
+    from hyol_puzzle import activity_day
+    opened = {'daruma':daruma_weekend(observed_at),
+              'puzzle':date.fromisoformat(activity_day(observed_at)).weekday()>=5,
+              'weekend':is_weekend(observed_at)}
     requested = list(tasks)
     skipped = {task: dict(reason='non_weekend', execution_day=day, weekday=calendar_day.weekday())
-               for task in requested if task in ('daruma', 'puzzle', 'weekend') and not opened}
+               for task in requested if task in opened and not opened[task]}
     return dict(execution_day=day, requested_tasks=requested,
                 effective_tasks=[task for task in requested if task not in skipped],
                 calendar_skipped=skipped)
@@ -302,6 +299,9 @@ class DailyRunner:
             options['frame_predicate'] = frame_predicate
         if not self.scheduler.click_template(self.account, name, roi, dx, dy, label, anchors,
                                               **options):
+            rejected=getattr(self.scheduler,'last_click_rejection',None)
+            if isinstance(rejected,dict) and rejected.get('target')==name and rejected.get('reason')=='precondition_changed':
+                raise hs.PendingError(f'操作前页面或按钮已变化，未发送点击：{name}')
             raise hs.PendingError(f"未识别按钮：{name}")
 
     def wait(self, name, roi, seconds=12):
@@ -416,14 +416,17 @@ class DailyRunner:
             normalize_weekend_record(record)
         return record
 
-    def once(self, name, roi, dx, dy, action, seconds=12):
+    def once(self, name, roi, dx, dy, action, seconds=12, *, frame_predicate=None):
         s = self.scheduler
         status = s.state.action_status(self.account.name, action)
         if status == "pending":
             raise hs.PendingError(f"{action}结果未知，禁止重复点击")
         if status == "done":
             raise hs.PendingError(f"{action}已点击但按钮仍可见，停止重复操作")
-        self.click(name, roi, dx,dy,action,[name],True)
+        if frame_predicate is None:
+            self.click(name, roi, dx,dy,action,[name],True)
+        else:
+            self.click(name, roi, dx,dy,action,[name],True,frame_predicate=frame_predicate)
         if not s.wait_absent(name,roi,seconds,threshold=.90):
             raise hs.PendingError(f"{name}点击后未消失，结果待确认")
         s.commit_action(self.account,action,"按钮消失，动作已确认")
@@ -488,7 +491,16 @@ class DailyRunner:
                 raise hs.PendingError("组队续接后奖励次数不符")
             rec.update(completed=battle,phase="ready")
             self.save()
-        self.enter("group")
+        # Prepare the preset before the first entry. The former flow entered
+        # only to read a counter, closed it, then entered again even for keep.
+        formation_prepared='group' in self.__dict__.get('_activity_formations',{})
+        if rec['phase']=='ready':
+            if self.visible(PAGE_ANCHORS['group'],PAGE_ROIS['group']):
+                self.close_page('group')
+            self.ensure_activity_formation('group')
+            formation_prepared=True
+        if not self.visible(PAGE_ANCHORS['group'],PAGE_ROIS['group']):
+            self.enter("group")
         if rec["phase"] in ("running","result_confirmed"):
             after = s._read_team_reward_remaining(self.account,hs.TEAM_ACTIVITY_BY_KEY["group_instance"],s.capture())
             reward_before = rec.get("reward_before",-1)
@@ -544,9 +556,9 @@ class DailyRunner:
             if remaining_now == 0:
                 rec["reward_exhausted"] = True
                 self.save()
-            else:
+            elif not formation_prepared:
                 self.close_page("group")
-                self.ensure_formation_once()
+                self.ensure_activity_formation('group')
                 self.enter("group")
         while self.group_needs_more(rec):
             remaining = s._read_team_reward_remaining(self.account, hs.TEAM_ACTIVITY_BY_KEY["group_instance"],s.capture())
@@ -572,6 +584,21 @@ class DailyRunner:
             self.event("daily_battle_complete", task="group", completed=battle, requested=self.group_count)
         self.close_page("group")
 
+    def owned_group_card_result(self, frame, battle):
+        from hyol_navigation import group_card_result_visible
+        s, rec = self.scheduler, self.record('group')
+        if (rec.get('phase') not in ('running', 'result_confirmed')
+                or rec.get('completed', 0) + 1 != battle
+                or s.state.action_status(self.account.name, f'daily_group_{battle}_select') != 'done'
+                or not group_card_result_visible(s, frame)
+                or s._generic_active_tab_x(frame) != self.account.tab_x):
+            return False
+        if s.verify_identity(self.account, frame)[0]:
+            return True
+        context = getattr(s, 'run_context', None)
+        return (isinstance(getattr(context, 'binding', None), dict)
+                and context.hidden_identity_observation(s, self.account, frame))
+
     def poll_group(self, battle):
         s = self.scheduler
         result_seen = self.record("group")["phase"] == "result_confirmed"
@@ -581,6 +608,18 @@ class DailyRunner:
         while True:
             s.check_stop()
             f = s.capture()
+            from hyol_navigation import group_card_result_visible
+            if group_card_result_visible(s, f):
+                self.event('daily_group_return_detected', task='group', battle=battle,
+                           detail='结算标题与返回游戏按钮已确认，优先处理原场返回')
+                self.once('group_return_game_current.bmp', GROUP_RETURN_ROI, 45, 20,
+                          f'daily_group_{battle}_return_game', seconds=8,
+                          frame_predicate=lambda current: self.owned_group_card_result(current, battle))
+                result_seen = True
+                self.record('group')['phase'] = 'result_confirmed'
+                self.save()
+                self.event('daily_group_return_game', detail='结算页已点击返回游戏')
+                continue
             if s._battle_auto_on_visible(f):
                 unknown_since = time.monotonic()
             elif time.monotonic()-unknown_since >= 60:
@@ -595,13 +634,7 @@ class DailyRunner:
             result = s._team_result_template(f)
             reward = s._team_reward_result_visible(f)
             if self.visible("group_return_game_current.bmp",GROUP_RETURN_ROI,f,.90):
-                self.once("group_return_game_current.bmp",GROUP_RETURN_ROI,45,20,
-                          f"daily_group_{battle}_return_game",seconds=8)
-                result_seen = True
-                self.record("group")["phase"] = "result_confirmed"
-                self.save()
-                self.event("daily_group_return_game",detail="结算页已点击返回游戏")
-                continue
+                raise hs.PendingError('返回游戏按钮存在，但结算标题尚未核实，保留原场')
             if self.visible("group_solo_warning_current.bmp",(760,480,1150,540),f,.95):
                 self.dismiss_login_warning()
                 self.once("group_solo_confirm_current.bmp",(810,530,960,600),50,17,f"daily_group_{battle}_solo_confirm")
@@ -677,8 +710,10 @@ class DailyRunner:
             self.return_to_main()
         if not self.scheduler.main_ready():
             raise hs.PendingError("生存演习结束后未确认主界面")
-        if not getattr(self, 'survival_inline_complete', False):
-            self.record("survival")["completed"] = 1
+        from hyol_task_progress import survival_execution_counts
+        self.record('survival').update(survival_execution_counts(
+            self.scheduler.state.accounts[self.account.name]))
+        self.record('survival')['home_returned'] = True
 
     def wanted(self):
         s, rec = self.scheduler, self.record("wanted")
@@ -764,6 +799,76 @@ class DailyRunner:
             return
         self.verify_main_formation()
         self.formation_checked = True
+
+    def ensure_activity_formation(self, activity):
+        """Strong: main; group: named fast, then main; missing presets keep the lineup."""
+        checked=self.__dict__.setdefault('_activity_formations',{})
+        if activity in checked:return checked[activity]
+        s=self.scheduler
+        priority=('fast','main') if activity=='group' else ('main',)
+        page_roi=(300,270,490,345);presets=(490,295,595,760)
+        selected=None;switched=False
+        def fast_selected(frame):
+            # A selected 速刷 preset has no historical gold bitmap. Require
+            # its exact name and gold button together; 鲨鱼 is a different name.
+            from hyol_ocr import recognize
+            rows=[]
+            data=recognize(frame.crop(presets))
+            for line in data.get('lines',[]):
+                if re.sub(r'\s+','',line.get('text',''))!='速刷' or not line.get('words'):continue
+                y=presets[1]+min(word['y'] for word in line['words'])
+                box=(presets[0],max(presets[1],y-5),presets[2],min(presets[3],y+24))
+                rgb=np.asarray(frame.crop(box).convert('RGB'),dtype=np.int16)
+                gold=(rgb[:,:,0]>115)&(rgb[:,:,1]>75)&(rgb[:,:,2]<90)&(rgb[:,:,0]>rgb[:,:,2]+50)
+                if float(gold.mean())>=.15:rows.append(box)
+            return len(rows)==1
+        def save_result(preset,reason,evidence):
+            value=dict(preset=preset,priority=list(priority),switched=switched,reason=reason,evidence=str(evidence))
+            self.record(activity)['formation_selection']=value
+            checked[activity]=value;self.save()
+            self.event('daily_activity_formation_selected' if preset!='keep' else 'daily_activity_formation_preserved',
+                task=activity,detail=reason,evidence=str(evidence))
+            return value
+        frame=s.capture()
+        if not self.visible('ninja_page_current.bmp',page_roi,frame):
+            if not s.main_ready(frame) or not self.visible('ninja_toolbar_current.bmp',(1380,950,1490,1030),frame,.90):
+                return save_result('keep','未识别到安全的阵容入口，保持当前阵容',
+                    s.save_raw_evidence(frame,self.account,activity+'_formation_kept','observed'))
+            self.click('ninja_toolbar_current.bmp',(1380,950,1490,1030),20,14,
+                       'daily_'+activity+'_open_formation',['anchor_top_menu.bmp'])
+            if not s.wait_template('ninja_page_current.bmp',page_roi,3,threshold=.90):
+                frame=s.capture()
+                if s.main_ready(frame):
+                    return save_result('keep','阵容入口未打开，保持当前阵容',
+                        s.save_raw_evidence(frame,self.account,activity+'_formation_kept','observed'))
+                raise hs.PendingError('阵容入口后的页面未确认，保留当前页面')
+        frame=s.capture()
+        if not self.visible('ninja_close_current.bmp',(1570,100,1640,175),frame,.95):
+            raise hs.PendingError('阵容页关闭按钮未确认，未切换预设')
+        for mode in priority:
+            already=(self.visible('ninja_main_selected_current.bmp',presets,frame,.98)
+                     if mode=='main' else fast_selected(frame))
+            if already:selected=mode;break
+            name='ninja_'+mode+'_unselected_current.bmp'
+            if not self.visible(name,presets,frame,.98):continue
+            self.click(name,presets,27,13,'daily_'+activity+'_select_'+mode+'_formation',
+                       ['ninja_page_current.bmp'],threshold=.98)
+            selected=mode;switched=True;break
+        if selected is not None:
+            for _ in range(3):
+                s.wait_interruptible(.35);frame=s.capture()
+                active=(self.visible('ninja_main_selected_current.bmp',presets,frame,.98)
+                        if selected=='main' else fast_selected(frame))
+                if not active or not self.visible('ninja_four_deployed_current.bmp',(870,310,1020,360),frame,.95):
+                    raise hs.PendingError('阵容切换后所选预设及上阵4/4尚未核实，保留待处理')
+        evidence=s.save_raw_evidence(s.capture(),self.account,activity+'_formation_'+(selected or 'kept'),'verified')
+        self.click('ninja_close_current.bmp',(1570,100,1640,175),20,20,
+                   'daily_'+activity+'_close_formation',['ninja_page_current.bmp'],threshold=.95)
+        if not s.wait_main_after_close(self.account,'ninja_page_current.bmp',page_roi):
+            raise hs.PendingError('阵容检查后未核实返回主界面')
+        label={'fast':'速刷','main':'主力'}.get(selected)
+        return save_result(selected or 'keep',
+            (label+'预设已核实，上阵4/4' if selected else '未识别到'+('速刷或主力' if activity=='group' else '主力')+'预设，保持当前阵容'),evidence)
 
     def verify_main_formation(self):
         if self.formation == 'keep':
@@ -969,6 +1074,10 @@ class DailyRunner:
         from hyol_quiz import run
         return run(self)
 
+    def grocery(self):
+        from hyol_grocery import run
+        return run(self)
+
     def ranking(self):
         from hyol_ranking import run
         return run(self)
@@ -1027,13 +1136,22 @@ class DailyRunner:
         self.scheduler.accounts = [self.account]
         self.scheduler.prepare_additional_arena_request(
             self.account, self.arena_wins, target_mode=self.arena_target_mode)
-        self.scheduler.run_combat_interleaved('arena')
+        from hyol_errors import ArenaQuotaExhausted
+        from hyol_arena_outcome import exhausted_record
+        try:
+            self.scheduler.run_combat_interleaved('arena')
+        except ArenaQuotaExhausted:
+            outcome=exhausted_record(self.scheduler,self.account)
+            if outcome:
+                self.record('arena').update(outcome)
+                self.save()
+            raise
         if self.scheduler.state.module_status(self.account.name, 'arena') != 'done':
             raise hs.PendingError('竞技场尚未核实每日目标')
 
     def strong(self):
         from dataclasses import replace
-        self.ensure_formation_once()
+        self.ensure_activity_formation('strong')
         # Reuse the established start/result/counter state machine. This
         # current-window client controls only the selected account's auto UI.
         spec = replace(hs.TEAM_ACTIVITY_BY_KEY['strong_approach'], require_all_member_auto=True,
@@ -1074,11 +1192,15 @@ class DailyRunner:
                     from hyol_player_display import ensure_hidden
                     ensure_hidden(self.scheduler, self.account)
             self.prepare_request()
+            from hyol_daily_observation import before_tasks
+            before_tasks(self)
             for task in getattr(self, 'selected_tasks', TASK_SEQUENCES.get(self.task, (self.task,))):
                 self.current = task
                 rec = self.record(task)
                 from hyol_checkpoints import complete
-                if (complete(rec) and (task != "group" or not self.group_needs_more(rec))
+                complete_hook = getattr(self,'current_task_complete',None)
+                task_complete = complete_hook(task,rec) if callable(complete_hook) else complete(rec)
+                if (task_complete and task != 'grocery' and (task != "group" or not self.group_needs_more(rec))
                         and (task != 'ranking' or rec.get('zero_verified'))
                         and (task != 'daruma' or daruma_verified(rec))
                         and (task != 'escort' or escort_verified(rec))):
@@ -1086,14 +1208,13 @@ class DailyRunner:
                     self.save()
                     self.event("daily_task_skipped",task=task,detail="本日已有完整完成记录")
                     continue
-                if task == 'quiz':
-                    from hyol_quiz import solo_verified,solo_pending_reason
-                    quiz_frame=self.scheduler.capture()
-                    if not solo_verified(self, quiz_frame):
-                        rec.update(status='pending',last_error=solo_pending_reason(self,quiz_frame))
-                        skipped.append('忍者测验需要单人状态')
-                        self.save()
-                        self.event('daily_task_pending',task=task,detail=rec['last_error'])
+                if task=='quiz':
+                    from hyol_quiz import prepare_entry
+                    try:prepare_entry(self,self.scheduler.capture())
+                    except TaskUnavailable as exc:
+                        rec.update(status='pending',last_error=str(exc))
+                        skipped.append(str(exc));self.save()
+                        self.event('daily_task_pending',task=task,detail=str(exc))
                         continue
                 rec["status"] = "running"
                 self.save()
@@ -1101,13 +1222,19 @@ class DailyRunner:
                 task_already_finished = rec.get("task_completed", False) and (
                     task != "group" or not self.group_needs_more(rec)) and (task != 'ranking' or rec.get('zero_verified')) and (
                     task != 'daruma' or daruma_verified(rec)) and (task != 'escort' or escort_verified(rec))
+                recheck = getattr(self, 'force_handler_recheck', None)
+                if task == 'grocery' or callable(recheck) and recheck(task):
+                    task_already_finished = False
                 if task == "survival" and task_already_finished:
                     self.scheduler.reconcile_survival_result_confirmations(self.account)
                 if not task_already_finished:
+                    # A new handler must prove its own return. Handlers that
+                    # already return and set this flag retain that fresh proof.
+                    rec['home_returned'] = False
                     try:
                         observation = self.scheduler.begin_task_observation(self.account, task)
                         getattr(self,task)()
-                    except (hs.WelfareNotReady,hs.MailBackpackFull,EscortNotOpen) as exc:
+                    except (hs.WelfareNotReady,hs.MailBackpackFull,EscortNotOpen,TaskUnavailable) as exc:
                         rec.update(status='pending',task_completed=False,last_error=str(exc))
                         skipped.append(str(exc))
                         self.save()
@@ -1115,6 +1242,9 @@ class DailyRunner:
                         self.return_to_main()
                         rec['home_returned']=True
                         self.save()
+                        if task=='arena' and rec.get('outcome')=='quota_exhausted':
+                            from hyol_daily_observation import after_task
+                            after_task(self,task)
                         continue
                     finally:
                         self.scheduler.end_task_observation(observation, complete=rec.get('task_completed', False))
@@ -1138,9 +1268,18 @@ class DailyRunner:
                         self.save()
                         continue
                     rec.update(task_completed=True)
-                    if task != 'treasure':
-                        rec['home_returned'] = False
                     self.save()
+                preserve = getattr(self,'preserve_activity_page',None)
+                if callable(preserve) and preserve(task):
+                    rec.update(status='done',activity_ready=True,team_preserved=True,
+                               home_returned=False,finished_at=hs.now_iso(),last_error='')
+                    self.save()
+                    evidence=self.scheduler.save_raw_evidence(self.scheduler.capture(),self.account,
+                                                             'daily_'+task+'_current_complete','verified')
+                    self.event('daily_task_complete',task=task,completion_scope='current_account',
+                               detail=LABELS[task]+'本号已完成，保留当前活动页及队伍；队友状态未核实',
+                               evidence=str(evidence))
+                    continue
                 if not rec.get('home_returned'):
                     self.return_to_main()
                 rec["home_returned"] = True
@@ -1148,20 +1287,37 @@ class DailyRunner:
                 self.save()
                 evidence = self.scheduler.save_raw_evidence(self.scheduler.capture(),self.account,"daily_"+task+"_complete","verified")
                 self.event("daily_task_complete",task=task,detail=LABELS[task]+"完成并返回主界面",evidence=str(evidence))
+                if task in ('quiz','arena','ranking','survival','escort') and not rec.get('preexisting_complete'):
+                    from hyol_daily_observation import after_task
+                    after_task(self,task)
             # Even an all-skipped request must verify the current physical
             # page.  Do not invoke the navigation reconciler when the account
             # is already positively on the village main page: an unrelated
             # unresolved action (for example an arena result awaiting audit)
             # must not turn a safe quiz skip into a false return error.
+            preserve = getattr(self,'preserve_activity_page',None)
+            keep_activity = callable(preserve) and preserve(self.current)
             final_frame = self.scheduler.capture()
-            if self.scheduler.main_ready(final_frame):
+            if keep_activity:
+                self.event('daily_request_activity_preserved',detail='本号活动处理结束，保留当前准备页与队伍')
+            elif self.scheduler.main_ready(final_frame):
                 self.event("daily_request_main_verified", detail="当前已在木叶主界面，无需重复回村")
             else:
                 self.return_to_main()
-            if self.task == 'all' and not skipped and getattr(self, 'managed_enabled', True):
-                self.finish_solo_managed()
+            if self.task == 'all' and not keep_activity and getattr(self, 'managed_enabled', True):
+                from hyol_managed import blocking_tasks
+                blockers = blocking_tasks(self, self.selected_tasks)
+                if not skipped or not blockers:
+                    self.finish_solo_managed()
+                else:
+                    reason = '最后托管暂未执行，以下任务仍未核实结束或回村：' + '、'.join(LABELS[t] for t in blockers)
+                    self.record('managed').update(status='pending', task_completed=False, last_error=reason)
+                    self.save()
+                    self.event('daily_task_pending', task='managed', detail=reason)
             code = 2 if skipped else 0
-            detail = '；'.join(skipped)
+            detail = '；'.join(dict.fromkeys(skipped))
+            if skipped and self.records.get('managed', {}).get('status') == 'done':
+                detail += '；最后托管已核实，未达成的奖励仍保留'
         except KeyboardInterrupt:
             code, detail = 130,"F12紧急停止，进度已保留"
         except Exception as exc:
@@ -1197,24 +1353,19 @@ class DailyRunner:
 
     def finish_solo_managed(self):
         """Leave the account managed only after every selected task settled."""
-        from hyol_escort import verified as escort_verified
+        from hyol_managed import blocking_tasks
         tasks = self.selected_tasks
-        if not tasks or any(
-            self.record(task).get('status') != 'done'
-            or not self.record(task).get('task_completed')
-            or not self.record(task).get('home_returned')
-            or task == 'daruma' and not daruma_verified(self.record(task))
-            or task == 'escort' and not escort_verified(self.record(task))
-            or task == 'training_record' and self.record(task).get('all_goals_complete') is not True
-            for task in tasks
-        ):
+        if not tasks or blocking_tasks(self, tasks):
             raise hs.PendingError('单人日常仍有未完成或未回村任务，不能开始托管')
         self.scheduler.check_stop()
         self.current = 'managed'
         rec = self.record('managed')
         rec.update(status='running', task_completed=False, last_error='')
         self.save()
-        self.event('daily_task_started', task='managed', detail='单人日常完成，开始托管')
+        incomplete = [task for task in tasks if not self.record(task).get('task_completed')]
+        detail = ('竞技场战令已用尽并回村，未达成奖励保留，开始最后托管'
+                  if incomplete else '单人日常完成，开始托管')
+        self.event('daily_task_started', task='managed', detail=detail)
         self.scheduler.run_managed_gate(self.account)
         evidence = self.scheduler.save_raw_evidence(
             self.scheduler.capture(), self.account, 'solo_managed_complete', 'verified')
@@ -1258,6 +1409,7 @@ class DailyClient(tk.Tk):
                 value = tk.BooleanVar(value=option in TASK_SEQUENCES[task])
                 self.task_options[option] = value
                 check = ttk.Checkbutton(box, text=LABELS[option]+(' · 队长执行，试运行' if option == 'sealed' else ''), variable=value)
+                if option=='grocery':check.configure(state='disabled',text='杂货屋（请在新版桌面设置）')
                 check.pack(anchor="w")
                 self.task_checks.append(check)
         if task in ("group","team"):

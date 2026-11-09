@@ -12,9 +12,15 @@ def is_training(request):
 
 
 def request_key(request):
-    return dict(mode='multi' if request.mode == 'multi' else 'solo',
+    key = dict(mode='multi' if request.mode == 'multi' else 'solo',
                 account_count=request.account_count if request.mode == 'multi' else 1,
                 formation=request.formation)
+    policy=getattr(request,'training_arena_stop_policy','auto')
+    if policy not in ('auto','final_goal','tickets'):
+        raise ValueError('修行录竞技场结束条件无效')
+    if policy != 'auto':key['training_arena_stop_policy']=policy
+    if getattr(request,'arena_second_skill',False):key['arena_second_skill']=True
+    return key
 
 
 def read_candidate(directory, request):
@@ -34,7 +40,7 @@ def read_candidate(directory, request):
     try:date.fromisoformat(data['execution_day'])
     except ValueError as exc:raise hs.PendingError('修行录原执行日期无效') from exc
     if data.get('request_key') != request_key(request):
-        raise hs.PendingError('原修行录轮次仍有未决步骤；保持原账号范围和阵容设置后继续，未覆盖原预算')
+        raise hs.PendingError('原修行录轮次仍有未决步骤；保持原账号范围、阵容和竞技场结束条件后继续，未覆盖原预算')
     run=Path(directory)/'runs'/identifier
     if not run.is_dir():raise hs.PendingError('修行录原运行目录缺失，未重建任务')
     return data
@@ -122,7 +128,14 @@ def restore_binding(context, candidate):
             raise hs.PendingError('修行录原截图路径越出运行目录')
         with Image.open(frame_path) as image:frames[slot]=image.convert('RGB')
         if hs.mask_f1(current_identity_mask(frames[slot],store),observations[slot][-1])<.92:
-            raise hs.PendingError('修行录原身份截图与三帧凭据不一致')
+            request=getattr(context,'pipeline_request',None)
+            legacy=None
+            if request and getattr(request,'preformed_trio',()):
+                from hyol_arena_3v3 import legacy_identity_mask,page_offset
+                if page_offset(frames[slot],store) not in (None,(0,0)):
+                    legacy=legacy_identity_mask(frames[slot],store)
+            if legacy is None or any(hs.mask_f1(legacy,value)<.98 for value in observations[slot]):
+                raise hs.PendingError('修行录原身份截图与三帧凭据不一致')
     for sample in range(3):
         if joint_identity_assignment({slot:values[sample] for slot,values in observations.items()},refs)[0] != mapping:
             raise hs.PendingError('修行录原三帧无法重现唯一账号映射')
@@ -131,6 +144,34 @@ def restore_binding(context, candidate):
     context.remember(centers,mapping,observations,frames,refs,{int(k):v for k,v in data.get('unavailable',{}).items()})
     context.binding.update(resumed_original_binding=True,training_prepared_accounts=list(prepared))
     return True
+
+
+def appended_solo_layout(context, scheduler, frames):
+    """Recognize appended tabs without widening an original single-role job."""
+    import hyol_scheduler as hs
+    from hyol_multi_solo import active_tab_centers, tab_close_positions
+    from hyol_checkpoints import current_identity_mask, decode_mask
+    row=context.binding
+    if len(frames)!=3 or len(row['mapping'])!=1:return None
+    slot,owner=next(iter(row['mapping'].items()))
+    original=tuple(row['centers']);layouts=[]
+    reference=row['refs'][owner]
+    mask=decode_mask(reference['mask'],tuple(reference['shape']))
+    original_config=scheduler.config.get('TabXs')
+    try:
+        for frame in frames:
+            centers=tuple(active_tab_centers(tab_close_positions(frame)))
+            if not (len(original)<len(centers)<=6 and centers[:len(original)]==original):return None
+            scheduler.config['TabXs']=','.join(map(str,centers))
+            if (scheduler._generic_active_tab_x(frame)!=original[slot-1]
+                    or scheduler.offline_dialog_visible(frame)
+                    or not scheduler.healthy(frame)
+                    or hs.mask_f1(current_identity_mask(frame,scheduler.templates),mask)<.98):return None
+            layouts.append(centers)
+        return layouts[0] if len(set(layouts))==1 else None
+    finally:
+        if original_config is None:scheduler.config.pop('TabXs',None)
+        else:scheduler.config['TabXs']=original_config
 
 
 def verify_resume_window(root, context, event_sink, on_scheduler):
@@ -143,11 +184,18 @@ def verify_resume_window(root, context, event_sink, on_scheduler):
     # This is the same explicit Start handoff, followed by observation only.
     handoff_start_window(scheduler)
     scheduler.bind_window(wait=True,timeout_seconds=10)
+    frames=[]
     for sample in range(3):
         frame=scheduler.capture_account_observation()
         context.check_window(scheduler)
-        if not context.layout_matches(frame):raise hs.PendingError('修行录原浏览器标签布局变化，未恢复原场')
+        frames.append(frame)
         if sample<2:scheduler.wait_interruptible(.2)
+    if not all(context.layout_matches(frame) for frame in frames):
+        centers=appended_solo_layout(context,scheduler,frames)
+        if centers is None:raise hs.PendingError('修行录原浏览器标签布局变化，未恢复原场；请切回原账号并保持原标签位置')
+        # Update observation geometry only. Original mapping, task, timestamps,
+        # screenshots and on-disk binding remain unchanged.
+        context.binding=dict(context.binding,centers=centers)
     scheduler.event('training_original_binding_revalidated',observations=3,content_clicks=0,
                     detail='同一游戏会话、原三帧账号与当前标签布局核实，沿原任务恢复')
     return dict(status='ready',healthy=True,content_clicks=0,training_resumed=True,main_ready=scheduler.main_ready(frame))

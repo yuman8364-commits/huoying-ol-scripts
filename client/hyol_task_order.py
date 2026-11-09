@@ -10,8 +10,8 @@ def defaults():
     from hyol_team_six import TASKS
     from hyol_team_pipeline import SUPPORTED_TEAM_TASKS
     solo = [t for t in DEFAULT_SOLO_OPTIONS if t != 'welfare']
-    solo += [t for t in SOLO_OPTIONS if t not in solo and t not in ('welfare','anniversary')]
-    return dict(solo=solo + ['welfare'], team=list(TASKS), pipeline=list(SUPPORTED_TEAM_TASKS))
+    solo += [t for t in SOLO_OPTIONS if t not in solo and t not in ('welfare','anniversary','grocery')]
+    return dict(solo=solo + ['grocery','welfare'], team=list(TASKS), pipeline=list(SUPPORTED_TEAM_TASKS))
 
 
 def validate(value):
@@ -22,7 +22,10 @@ def validate(value):
         if (not isinstance(tasks, list) or any(type(t) is not str for t in tasks)
                 or len(tasks) != len(set(tasks)) or set(tasks) != set(allowed[group])):
             raise ValueError('任务顺序包含重复、缺失或不支持的任务：' + group)
-    return {group: list(value[group]) for group in allowed}
+    result={group:list(value[group]) for group in allowed}
+    from hyol_arena_3v3 import normalize_tasks
+    result['pipeline']=list(normalize_tasks(result['pipeline']))
+    return result
 
 
 def load(root):
@@ -40,6 +43,9 @@ def load(root):
                     or len(tasks) != len(set(tasks)) or set(tasks) - set(expected[key])):
                 raise ValueError('任务顺序文件包含无效任务')
             value[key] = tasks + [t for t in expected[key] if t not in tasks]
+            if key=='solo' and 'grocery' not in tasks:
+                value[key].remove('grocery')
+                value[key].insert(value[key].index('welfare'),'grocery')
         return dict(ok=True, order=validate(value), warning='')
     except (OSError, ValueError, TypeError) as exc:
         return dict(ok=True, order=defaults(), warning='任务顺序读取失败，已使用默认顺序：' + str(exc))
