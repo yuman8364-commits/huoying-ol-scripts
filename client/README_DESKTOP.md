@@ -31,7 +31,7 @@ Windows 10/11 64 位 · OpenCV · 当前版本 **2026.11.09.24-opencv**
 
 1. 游戏标签按从左到右的位置编号，无需把角色名改为数字。当前账号模式只控制当前标签；多账号范围只处理所选标签。
 2. 新用户查看并保存六组设置后开始；“检查并回木叶村”只检查，开始任务需点击“开始本轮”。保持游戏窗口可见，同一桌面只运行一个游戏控制脚本。
-3. 两版分别使用当前 Windows 用户的 `%LOCALAPPDATA%/HYOLFolderClient` 与 `%LOCALAPPDATA%/HYOLShareClient` 保存配置、账号素材和断点。两者不会自动互相迁移；升级时保留原数据。
+3. 标准版的 INI、`desktop_settings.json` 与程序同目录，共享断点位于 `%LOCALAPPDATA%/HYOLFolderClient/state`；EXE版的程序资源和设置位于 `%LOCALAPPDATA%/HYOLShareClient/client`，共享断点位于同级 `state`。两版状态目录独立，升级时保留原设置与状态。
 4. 下载包不含制作者账号、个人配置、登录缓存、实机截图、运行账本或日志。使用后生成的数据属于使用者；再次分享请使用原始下载包。
 
 ## 从源码修改和运行

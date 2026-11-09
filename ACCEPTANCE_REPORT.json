@@ -64,8 +64,8 @@
   "artifacts": [
     {
       "file": "huoying-ol-standard-2026.11.09.24-opencv.zip",
-      "bytes": 111632151,
-      "sha256": "a5207cb0cb9324b30197f3add0ce04fcb2a85d5ae034abc0b1e9e9395ec6152a"
+      "bytes": 111632219,
+      "sha256": "271c7ff6a60973bc7611ac457d5253c063209375293be644dba2b630be6d9912"
     },
     {
       "file": "huoying-ol-2026.11.09.24-opencv.exe",
@@ -73,5 +73,6 @@
       "sha256": "6322bacd49c6caf38a58c4687cdbb6747d4b535d8153c077a446e51770b8a6ec"
     }
   ],
-  "at": "2026-11-10T00:08:13.902154+08:00"
+  "at": "2026-11-10T00:08:13.902154+08:00",
+  "publication_docs_checked": "Per-edition settings and checkpoint locations verified against runtime; source and executable bytes unchanged"
 }
