@@ -371,7 +371,7 @@ class DailyRunner:
             if found:
                 break
         if not found:
-            raise hs.PendingError(f"日常秘炼未找到{LABELS[task]}，未点击参与")
+            raise TaskUnavailable(f"日常秘炼未找到{LABELS[task]}，本轮跳过此项，未点击参与")
         self.click(row, ROW_ROI,45,15,"daily_select_"+task,["daily_practice_anchor.bmp"])
         if task == "wanted":
             # The right-hand wanted detail header is painted over rotating
@@ -386,8 +386,8 @@ class DailyRunner:
         participate_roi = (1051,569,1351,819)
         if self.visible("daily_participate_disabled_current.bmp", participate_roi, threshold=.98):
             if task == "group":
-                raise hs.PendingError("组队副本当前未开放（开放时间08:00—24:00），未点击灰色参与按钮")
-            raise hs.PendingError(f"{LABELS[task]}当前不可参与，未点击灰色参与按钮")
+                raise TaskUnavailable("组队副本当前未开放（开放时间08:00—24:00），未点击灰色参与按钮")
+            raise TaskUnavailable(f"{LABELS[task]}当前不可参与，未点击灰色参与按钮")
         self.click("daily_participate.bmp", participate_roi,51,18,
                    "daily_participate_"+task,["daily_practice_anchor.bmp",detail],
                    threshold=.97)

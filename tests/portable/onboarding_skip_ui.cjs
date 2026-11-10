@@ -14,8 +14,12 @@ function harness(call, nativeMode=true) {
 }
 (async()=>{
   let calls=0;
-  const success=harness(async method=>{calls++;assert.equal(method,'skip_onboarding');return {ok:true,required:false,steps:['accounts']};});
-  await success.context.skip();assert.equal(success.state.tour,null);assert.equal(success.state.config.keep,'choices');assert.equal(calls,1);
+  for(let step=0;step<6;step++) {
+    calls=0;
+    const success=harness(async method=>{calls++;assert.equal(method,'skip_onboarding');return {ok:true,required:false,steps:['accounts']};});
+    success.state.tour.index=step;
+    await success.context.skip();assert.equal(success.state.tour,null);assert.equal(success.state.config.keep,'choices');assert.equal(calls,1);
+  }
   for (const response of [undefined,{ok:false,error:'disk failed'},{ok:true,required:true}]) {
     const h=harness(async()=>response);await h.context.skip();assert.equal(h.state.tour.busy,false);assert.equal(h.state.onboarding.required,true);
   }
@@ -30,5 +34,6 @@ function harness(call, nativeMode=true) {
   }
   const demo=harness(()=>{throw Error('unexpected native call');},false);await demo.context.skip();assert.equal(demo.state.tour,null);
   assert(source.includes('data-action="tour-skip"'));
+  assert(source.includes('一键跳过全部引导'));
   console.log('Onboarding UI: skip, failure, timeout, duplicate click, late response, retry, demo passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

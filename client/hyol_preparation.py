@@ -87,6 +87,10 @@ def hide_first_world(s,account,frame,row):
     result=ensure_hidden(s,account,require_leaf=False,timeout=10)
     row['player_display_first']=result
     row['player_display']=dict(s.state.accounts[account.name]['player_display'])
+    if result.get('skipped'):
+        s.event('preparation_player_display_skipped',account,evidence=result['evidence'],
+                clicks=0,detail='其他忍者显示开关未确认，保持原显示状态继续准备')
+        return
     s.event('preparation_player_display_first',account,evidence=result['evidence'],
             samples=result['samples'],clicks=result['clicks'],
             detail='首次可用主界面已先关闭其他忍者显示；此后才处理其他标签、回村和任务')
