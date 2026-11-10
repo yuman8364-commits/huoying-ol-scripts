@@ -352,7 +352,7 @@ class DesktopBridge:
                 if self._closed or self._controller.busy:
                     return dict(ok=False, error='当前操作尚未结束，请先停止并等待结束。')
                 if (self._root/'web/index.html').is_file() and self._onboarding.load()['required']:
-                    return dict(ok=False,error='首次使用请先完成六组设置引导。',onboarding_required=True)
+                    return dict(ok=False,error='首次使用请先查看或跳过设置引导。',onboarding_required=True)
                 if not self._controller.start(request):
                     return dict(ok=False,error='运行层正在忙，请稍后重试。')
                 self._request, self._status, self._operation = request, 'running', 'run'
@@ -431,10 +431,20 @@ class DesktopBridge:
         return self._onboarding.load()
 
     def acknowledge_onboarding(self, step):
-        try:
-            return self._onboarding.acknowledge(step)
-        except (OSError,ValueError) as exc:
-            return user_error(exc)
+        with self._lock:
+            try:
+                return self._onboarding.acknowledge(step)
+            except (OSError,ValueError) as exc:
+                return user_error(exc)
+
+    def skip_onboarding(self):
+        with self._lock:
+            if self._closed or self._controller.busy:
+                return dict(ok=False,error='请先等待当前操作结束')
+            try:
+                return self._onboarding.skip()
+            except (OSError,ValueError) as exc:
+                return user_error(exc)
 
     def complete_onboarding(self, config):
         if self._controller.busy:
