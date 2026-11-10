@@ -217,7 +217,7 @@
       : `${state.page !== 'plan' ? '<button class="button button-secondary" data-page="plan">调整任务</button>' : ''}<button class="button button-primary button-large" data-action="start">${icon('play')}${['stopped', 'pending', 'complete', 'not_open'].includes(status) ? '开始新运行' : '开始本轮'}</button>`;
     if (nativeMode && !N.ready) controls = '<button class="button button-primary button-large" disabled>连接运行层中…</button>';
     else if (nativeMode && (!state.settingsLoaded || state.settingsSaving)) controls = '<button class="button button-primary button-large" disabled>'+ (state.settingsSaving ? '正在保存设置…' : '正在读取保存设置…')+'</button>';
-    if(!active && (state.tour || state.onboarding?.required))controls='<button class="button button-primary button-large" data-action="onboarding">先查看六组设置</button>';
+    if(!active && (state.tour || state.onboarding?.required))controls='<button class="button button-primary button-large" data-action="onboarding">查看或跳过设置引导</button>';
     dock.innerHTML = `<div class="dock-status"><span class="dock-status-icon tone-${meta.tone}">${icon(active ? 'clock' : status === 'complete' ? 'check' : status === 'idle' ? 'plan' : 'alert')}</span><div class="dock-copy"><strong>${esc(title)}</strong><span>${esc(subtitle)}</span></div></div><div class="dock-actions">${controls}</div>`;
   }
 
@@ -322,7 +322,7 @@
       if (!result.ok) throw new Error(result.error || '保存设置暂未读取。');
       if (result.saved) state.config={...D.freshConfig(),...D.clone(result.config),newBondRound:false,escortPriorSettled:false};
       if (result.warning) toast(result.warning,'warning');
-      return N.call('get_onboarding').then(guide=>{
+      return tourCall('get_onboarding').then(guide=>{
         if(!guide?.ok)throw new Error(guide?.error||'新人引导记录未读取');
         state.onboarding=guide;
         if(guide.required)state.tour={index:Math.min(5,guide.steps.length)};
@@ -460,6 +460,7 @@
   const tourSteps=[['accounts','账号范围'],['tasks','任务选择与顺序'],['parameters','任务参数'],['team','组队与独立任务'],['grocery','杂货屋购买设置'],['finish','收尾、保存与日志']];
   function openOnboarding() {
     if(nativeMode&&N.info?.busy){toast('当前任务结束后可查看新人引导。','warning');return;}
+    if(state.tour?.busy)return;
     closeDialog();state.page='plan';state.advancedOpen=true;
     state.tour={index:state.onboarding?.required?Math.min(5,state.onboarding.steps?.length||0):0};
     render();main.scrollTop=0;
@@ -480,15 +481,28 @@
       if(step===4)body=groceryControls();
       if(step===5)body=commonControls()+`<h3>保存后再开始</h3><p>请核对阵容和最后托管开关。点击下方“保存并完成引导”只保存设置；任务由你随后点击开始。</p><p>运行中可点击停止或按 F12，等待操作结束后关闭。运行时间会在任务结束后停止增加。</p><h3>桌面中文日志</h3><p>完整记录自动保存到桌面“火影OL日志”，按日期和运行批次整理。运行日志页可直接打开目录或导出筛选结果。</p>`;
     } finally {state.config=original;}
-    return `<section class="card onboarding-card"><div class="tour-heading"><span class="eyebrow">首次设置导览 · ${step+1} / 6</span><h2>${tourSteps[step][1]}</h2><p>先看完各组设置，再开始运行。不会自动选择任务或商品。</p><div class="tour-progress">${tourSteps.map((s,i)=>`<span class="${i<=step?'is-viewed':''}">${i+1}. ${s[1]}</span>`).join('')}</div></div><div class="card-body">${body}</div><div class="tour-actions"><button class="button button-secondary" data-action="tour-back" ${step===0||state.tour.busy?'disabled':''}>上一组</button><button class="button button-primary" data-action="tour-next" ${state.tour.busy?'disabled':''}>${state.tour.busy?'正在保存…':step===5?'保存并完成引导':'已查看，下一组'}</button></div></section>`;
+    return `<section class="card onboarding-card"><div class="tour-heading"><span class="eyebrow">首次设置导览 · ${step+1} / 6</span><h2>${tourSteps[step][1]}</h2><p>可逐组查看，也可跳过后直接使用。跳过不覆盖已有配置，不会自动开始任务；可在使用说明中重新查看。</p><div class="tour-progress">${tourSteps.map((s,i)=>`<span class="${i<=step?'is-viewed':''}">${i+1}. ${s[1]}</span>`).join('')}</div></div><div class="card-body">${body}</div><div class="tour-actions"><button class="button button-secondary" data-action="tour-skip" ${state.tour.busy?'disabled':''}>一键跳过全部引导</button><button class="button button-secondary" data-action="tour-back" ${step===0||state.tour.busy?'disabled':''}>上一组</button><button class="button button-primary" data-action="tour-next" ${state.tour.busy?'disabled':''}>${state.tour.busy?'正在保存…':step===5?'保存并完成引导':'已查看，下一组'}</button></div></section>`;
+  }
+  const tourCall=(method,...args)=>withTimeout(N.call(method,...args),5000,'引导操作响应超时，结果尚未确认。可重试或点击“跳过引导”。');
+  async function skipTour() {
+    if(!state.tour||state.tour.busy)return;
+    const tour=state.tour; tour.busy=true;render();
+    try {
+      const row=nativeMode?await tourCall('skip_onboarding'):{ok:true,required:false,steps:state.onboarding?.steps||[]};
+      if(!row?.ok||row.required!==false)throw new Error(row?.error||'跳过引导未确认，请重试。');
+      if(state.tour!==tour)return;
+      state.onboarding=row;state.tour=null;
+      toast('已跳过引导，未覆盖已有配置。请核对执行清单后手动开始。');
+    }catch(error){if(state.tour===tour){tour.busy=false;toast(error.message,'warning');}}
+    render();main.scrollTop=0;
   }
   async function advanceTour() {
     if(!state.tour||state.tour.busy)return;
     const step=state.tour.index;state.tour.busy=true;render();
     try {
-      if(nativeMode){const row=await N.call('acknowledge_onboarding',tourSteps[step][0]);if(!row?.ok)throw new Error(row?.error||'引导进度未保存');state.onboarding=row;}
+      if(nativeMode){const row=await tourCall('acknowledge_onboarding',tourSteps[step][0]);if(!row?.ok)throw new Error(row?.error||'引导进度未保存');state.onboarding=row;}
       if(step===5){
-        if(nativeMode){const row=await N.call('complete_onboarding',D.clone(state.config));if(!row?.ok)throw new Error(row?.error||'设置未保存');state.onboarding=row;}
+        if(nativeMode){const row=await tourCall('complete_onboarding',D.clone(state.config));if(!row?.ok)throw new Error(row?.error||'设置未保存');state.onboarding=row;}
         else {localStorage.setItem('hyol-desktop-settings',JSON.stringify(state.config));state.onboarding={required:false,steps:tourSteps.map(s=>s[0])};}
         state.tour=null;toast('设置已保存，可以核对执行清单后开始。');
       } else state.tour={index:step+1};
@@ -1198,8 +1212,9 @@
     if(action==='select-task'){state.taskSettings=button.dataset.taskCode;state.advancedOpen=true;render();requestAnimationFrame(()=>main.querySelector('[data-advanced]')?.scrollIntoView({block:'start'}));return;}
     if(action==='copy-logs'){navigator.clipboard.writeText(filteredLogs().map(logLine).join('\n')).then(()=>toast('日志已复制')).catch(()=>toast('复制失败，请使用导出日志','warning'));return;}
     if (action === 'onboarding') {openOnboarding();return;}
+    if (action === 'tour-skip') {skipTour();return;}
     if (action === 'tour-next') {advanceTour();return;}
-    if (action === 'tour-back') {state.tour.index=Math.max(0,state.tour.index-1);render();return;}
+    if (action === 'tour-back') {if(!state.tour||state.tour.busy)return;state.tour.index=Math.max(0,state.tour.index-1);render();return;}
     if (action === 'help') showHelp();
     if (action === 'check-window') showWindowCheck();
     if (action === 'save-settings') saveSettings();

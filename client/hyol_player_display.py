@@ -36,7 +36,7 @@ def _guard(s, account, frame, *, allow_leaf_occlusion=False,require_leaf=True):
 
 
 def ensure_hidden(s, account, *, timeout=4,require_leaf=True):
-    """Observe three frames, send at most one guarded click, then prove closed."""
+    """Bounded observation; optional missing toggle never authorizes a click."""
     from hyol_navigation import move_cursor_clear
     row = s.state.accounts[account.name].setdefault('player_display', {})
     clicks_before = s.content_click_count
@@ -67,18 +67,36 @@ def ensure_hidden(s, account, *, timeout=4,require_leaf=True):
         move_cursor_clear(s)
         original = None
         samples = []
-        for sample in range(3):
+        stable = 0
+        for attempt in range(5):
             frame = s.capture()
             _guard(s, account, frame,require_leaf=require_leaf)
             current = observe(s, frame)
             if current is None or (original is not None and current != original):
-                raise hs.PendingError('玩家显示开关缺失、冲突或三帧不一致，未点击')
+                stable = 0
+                samples.clear()
             original = current
-            if current[0] == 'closed':
-                samples.append(str(s.save_raw_evidence(
-                    frame, account, 'player_display_hidden_'+str(sample+1), 'verified')))
-            if sample < 2:
+            if current is not None:
+                stable += 1
+                if current[0] == 'closed':
+                    samples.append(str(s.save_raw_evidence(
+                        frame, account, 'player_display_hidden_'+str(stable), 'verified')))
+                if stable == 3:
+                    break
+            if attempt < 4:
                 s.wait_interruptible(.2)
+        if stable < 3:
+            # This cosmetic option is not a prerequisite for running tasks.
+            # Never erase an earlier unconfirmed toggle or relax account/page guards.
+            if row.get('status') == 'pending' and row.get('phase') == 'click_requested':
+                raise hs.PendingError('上次关闭玩家显示的点击尚未确认，不重复切换')
+            detail = '玩家显示开关五次观察仍未确认，跳过隐藏玩家，不发送点击；继续任务'
+            evidence = str(s.save_raw_evidence(frame, account, 'player_display', 'skipped'))
+            row.update(status='skipped', phase='not_sent', hidden=False, last_error=detail,
+                       pending_evidence=evidence, last_check_clicks=0, updated_at=hs.now_iso())
+            s.state.save_account(account.name)
+            s.event('other_players_hide_skipped', account, detail=detail, evidence=evidence, clicks=0)
+            return dict(hidden=False, skipped=True, evidence=evidence, samples=[], clicks=0)
 
         if original[0] == 'open':
             if row.get('status') == 'pending' and row.get('phase') == 'click_requested':

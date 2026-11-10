@@ -44,7 +44,7 @@ class Onboarding:
             if (row.get('version') != 1 or not isinstance(steps, list)
                     or steps != list(STEPS[:len(steps)]) or len(steps) > len(STEPS)):
                 raise ValueError('新人引导记录无效')
-            row['required'] = not bool(row.get('completed_at'))
+            row['required'] = not bool(row.get('completed_at') or row.get('skipped_at'))
             return dict(ok=True, **row)
         except FileNotFoundError:
             existing = self._existing_user()
@@ -71,6 +71,14 @@ class Onboarding:
         if row['steps'] != list(STEPS):
             raise ValueError('请先看完六组设置')
         row.update(required=False, completed_at=now_iso())
+        self._save(row)
+        return row
+
+    def skip(self):
+        """Dismiss the guide without pretending all steps were viewed or saving settings."""
+        from hyol_scheduler import now_iso
+        row = self.load()
+        row.update(required=False, skipped_at=now_iso())
         self._save(row)
         return row
 
